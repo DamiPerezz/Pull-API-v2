@@ -48,6 +48,7 @@ type TicketPDFData struct {
 	OrderNumber   string
 	TicketID      string
 	QRCode        string // QR token
+	QRPNG         []byte // pre-rendered QR PNG; if set, the PDF reuses it instead of re-encoding
 }
 
 // GenerateTicketPDF generates a single ticket PDF
@@ -266,13 +267,17 @@ func (p *PDFService) drawTicketOnPage(pdf *gofpdf.Fpdf, ticket TicketPDFData, yO
 	pdf.SetTextColor(30, 30, 30)
 	pdf.CellFormat(60, 5, ticket.OwnerName, "", 0, "L", false, 0, "")
 
-	// QR Code
-	qrImg, err := p.generateQRCode(ticket.QRCode, 150)
-	if err == nil {
-		var imgBuf bytes.Buffer
-		png.Encode(&imgBuf, qrImg)
+	// QR Code — reuse the caller's pre-rendered PNG when available (the email
+	// path already renders one per ticket) instead of encoding it twice.
+	qrPNG := ticket.QRPNG
+	if qrPNG == nil {
+		if b, err := p.QRCodePNG(ticket.QRCode, 200); err == nil {
+			qrPNG = b
+		}
+	}
+	if qrPNG != nil {
 		imgName := fmt.Sprintf("qr_%s_%f", ticket.TicketID, yOffset)
-		pdf.RegisterImageOptionsReader(imgName, gofpdf.ImageOptions{ImageType: "PNG"}, bytes.NewReader(imgBuf.Bytes()))
+		pdf.RegisterImageOptionsReader(imgName, gofpdf.ImageOptions{ImageType: "PNG"}, bytes.NewReader(qrPNG))
 		pdf.ImageOptions(imgName, 145, yOffset+35, 40, 40, false, gofpdf.ImageOptions{}, 0, "")
 	}
 
@@ -327,17 +332,25 @@ func (p *PDFService) generateQRCode(content string, size int) (image.Image, erro
 // UTILITY FUNCTIONS
 // =============================================
 
+// QRCodePNG generates a QR code and returns the encoded PNG bytes, so one
+// render can be shared between the email (base64 inline) and the PDF.
+func (p *PDFService) QRCodePNG(content string, size int) ([]byte, error) {
+	img, err := p.generateQRCode(content, size)
+	if err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
 // QRCodeToBase64 generates QR code and returns as base64 string
 func (p *PDFService) QRCodeToBase64(content string, size int) (string, error) {
-	img, err := p.generateQRCode(content, size)
+	b, err := p.QRCodePNG(content, size)
 	if err != nil {
 		return "", err
 	}
-
-	var buf bytes.Buffer
-	if err := png.Encode(&buf, img); err != nil {
-		return "", err
-	}
-
-	return base64.StdEncoding.EncodeToString(buf.Bytes()), nil
+	return base64.StdEncoding.EncodeToString(b), nil
 }

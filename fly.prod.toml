@@ -1,0 +1,57 @@
+# =============================================
+# Fly.io app config — Pull API v2 PRODUCTION
+# Deploy with:  flyctl deploy -c fly.prod.toml --remote-only
+# This is a SEPARATE app from pull-api-v2-demo (the public demo).
+# Secrets (JWT_SECRET, APP_KEY, SUPABASE keys, BREVO key) are NOT here —
+# set them with:  flyctl secrets set -a pull-api-v2-prod KEY=value
+# =============================================
+app = "pull-api-v2-prod"
+primary_region = "dfw"   # Dallas — closest active region to Guatemala (mia deprecated)
+
+[build]
+
+[env]
+  PORT = "8080"
+  ENVIRONMENT = "production"
+  # Real gateway: NeoNet/Cybersource sandbox (credentials per-venue in
+  # central payment_gateway_credentials, environment=test). Switch that row
+  # to environment=production + prod keys for the live cutover.
+  DEMO_MODE = "false"
+  COOKIE_SAMESITE = "None"
+  RESEND_FROM_EMAIL = "Pull Events <noreply@tickets.pullevents.com>"
+  # Browsers send an Origin header on the purchase POST; the proxy forwards
+  # it, so the backend must whitelist the real web origins or it 403s with
+  # "Origin not allowed". Include the pages.dev host and future custom domains.
+  ALLOWED_ORIGINS = "https://pull-511-events.pages.dev,https://511events.pullevents.com,https://pullevents.com,https://www.pullevents.com"
+  FRONTEND_URL = "https://pull-511-events.pages.dev"
+  # Soft memory ceiling so the Go GC gets aggressive before Fly's OOM
+  # killer does (PDF generation runs in unbounded goroutines).
+  GOMEMLIMIT = "460MiB"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  # 2 machines: no downtime during deploys (rolling) and no single point of
+  # failure during the event. Safe — neonetVerified is request-scoped and the
+  # critical idempotency lives in the DB (atomic status flips).
+  min_machines_running = 2
+
+  # Lower than the demo config on purpose: better to queue requests at the
+  # edge than to accept 250 concurrent PDF-generating requests into 512MB.
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 50
+    hard_limit = 80
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "15s"
+    method = "GET"
+    path = "/health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

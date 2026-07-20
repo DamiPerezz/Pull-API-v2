@@ -283,24 +283,22 @@ func (p *NeoNetProcessor) GetGateway() models.PaymentGateway {
 	return models.GatewayNeoNet
 }
 
+// CreateCheckout is intentionally unsupported: the NeoNet flow is
+// direct-card via controllers.PayOrder (see neonet_processor_impl.go).
 func (p *NeoNetProcessor) CreateCheckout(ctx context.Context, params models.CheckoutParams) (*models.CheckoutResult, error) {
-	if p.config.Credentials == nil {
-		return nil, fmt.Errorf("neonet credentials not configured")
-	}
-	// TODO: Implement NeoNet/Cybersource checkout
-	return nil, fmt.Errorf("neonet checkout: pending implementation")
+	return nil, fmt.Errorf("neonet uses the direct card flow (/orders/pay), not hosted checkout")
 }
 
 func (p *NeoNetProcessor) ConfirmPayment(ctx context.Context, transactionID string) (*models.PaymentResult, error) {
-	return nil, fmt.Errorf("neonet confirm: pending implementation")
+	return p.neonetConfirmPayment(transactionID)
 }
 
 func (p *NeoNetProcessor) ProcessRefund(ctx context.Context, transactionID string, amount float64) error {
-	return fmt.Errorf("neonet refund: pending implementation")
+	return p.neonetProcessRefund(ctx, transactionID, amount)
 }
 
 func (p *NeoNetProcessor) ValidateWebhook(payload []byte, signature string) (bool, error) {
-	return false, fmt.Errorf("neonet webhook: pending implementation")
+	return p.neonetValidateWebhook(payload, signature)
 }
 
 // =============================================

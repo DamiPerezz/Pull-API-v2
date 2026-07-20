@@ -280,16 +280,20 @@ func CreateEmployee(c *gin.Context) {
 	})
 }
 
-// UpdateEmployeeRequest represents the update employee request
+// UpdateEmployeeRequest represents the update employee request. The mobile
+// app (EmpleadoEditar) sends camelCase names, so we accept both.
 type UpdateEmployeeRequest struct {
-	Email     string `json:"email"`
-	FirstName string `json:"first_name"`
-	LastName  string `json:"last_name"`
-	Phone     string `json:"phone"`
-	DPI       string `json:"dpi"`
-	RoleID    string `json:"role_id"`
-	IsActive  *bool  `json:"is_active"`
-	Password  string `json:"password"`
+	Email        string `json:"email"`
+	FirstName    string `json:"first_name"`
+	LastName     string `json:"last_name"`
+	FirstNameAlt string `json:"firstName"`
+	LastNameAlt  string `json:"lastName"`
+	Phone        string `json:"phone"`
+	DPI          string `json:"dpi"`
+	RoleID       string `json:"role_id"`
+	RoleName     string `json:"role"`
+	IsActive     *bool  `json:"is_active"`
+	Password     string `json:"password"`
 }
 
 // UpdateEmployee updates an employee
@@ -308,9 +312,9 @@ func UpdateEmployee(c *gin.Context) {
 		return
 	}
 
-	// Only admin can update employees
-	if role != "admin" {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Only admin can update employees"})
+	// Admin or manager can update employees
+	if role != "admin" && role != "manager" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Only admin or manager can update employees"})
 		return
 	}
 
@@ -323,10 +327,27 @@ func UpdateEmployee(c *gin.Context) {
 		return
 	}
 
+	// Coalesce camelCase (mobile) into the snake_case fields.
+	if req.FirstName == "" {
+		req.FirstName = req.FirstNameAlt
+	}
+	if req.LastName == "" {
+		req.LastName = req.LastNameAlt
+	}
+
 	venueDB := services.DB.ForVenue(venueID)
 	if venueDB == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Venue database not available"})
 		return
+	}
+
+	// Resolve role by name (mobile sends "role", not role_id).
+	if req.RoleID == "" && req.RoleName != "" {
+		if r, _ := venueDB.QueryOne(ctx, "roles", map[string]interface{}{
+			"select": "id", "where": map[string]interface{}{"name": req.RoleName},
+		}); r != nil {
+			req.RoleID = services.GetString(r, "id")
+		}
 	}
 
 	// Check employee exists
@@ -511,9 +532,9 @@ func DeleteEmployee(c *gin.Context) {
 		return
 	}
 
-	// Only admin can delete employees
-	if role != "admin" {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Only admin can delete employees"})
+	// Admin or manager can delete employees
+	if role != "admin" && role != "manager" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Only admin or manager can delete employees"})
 		return
 	}
 

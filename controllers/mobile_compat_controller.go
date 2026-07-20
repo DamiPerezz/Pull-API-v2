@@ -104,6 +104,10 @@ func MobileCreateEventWithTickets(c *gin.Context) {
 	name := services.GetString(body, "name")
 	slug := slugify(name) + "-" + time.Now().Format("20060102150405")
 
+	// A "private" event needs staff approval before the ticket is issued; we
+	// tie is_private and require_approval together (one toggle in the app).
+	private := services.GetBool(body, "is_private") || services.GetBool(body, "require_approval")
+
 	// The venue DB is single-tenant: events carries no venue_id or
 	// organization_id column (tenancy is the database itself).
 	insertPayload := map[string]interface{}{
@@ -119,8 +123,10 @@ func MobileCreateEventWithTickets(c *gin.Context) {
 		"dress_code": services.GetString(body, "dress_code"),
 		"min_age":    services.GetInt(body, "min_age"),
 		// The app calls it custom_location; the events schema column is location.
-		"location": services.GetString(body, "custom_location"),
-		"capacity": services.GetInt(body, "ticket_limit"),
+		"location":         services.GetString(body, "custom_location"),
+		"capacity":         services.GetInt(body, "ticket_limit"),
+		"is_private":       private,
+		"require_approval": private,
 	}
 	// table_capacity has no backing column in events — tables are the
 	// event_vip_ticket_types rows. Accepted in the payload but not persisted.
@@ -217,6 +223,12 @@ func MobileUpdateEvent(c *gin.Context) {
 	}
 	if v, ok := body["ticket_limit"]; ok {
 		updates["capacity"] = v
+	}
+	// Private/approval toggle (tied together).
+	if _, ok := body["is_private"]; ok {
+		private := services.GetBool(body, "is_private") || services.GetBool(body, "require_approval")
+		updates["is_private"] = private
+		updates["require_approval"] = private
 	}
 	// table_capacity has no backing column in events; ignore it (tables are
 	// managed as event_vip_ticket_types rows).
@@ -407,6 +419,12 @@ func MobileValidateTicket(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "qr_token is required", "valid": false})
 		return
 	}
+	// SECURITY: a scanned QR is untrusted input — block PostgREST operator
+	// injection before it reaches the filter.
+	if !safeLookupCode(req.QRToken) {
+		c.JSON(http.StatusOK, gin.H{"valid": false, "message": "Ticket no encontrado"})
+		return
+	}
 	venueID := req.VenueID
 	if venueID == "" {
 		venueID = c.GetString("venue_id")
@@ -452,12 +470,25 @@ func MobileValidateTicket(c *gin.Context) {
 		return
 	}
 
-	// Mark as checked in.
+	// Mark as checked in ATOMICALLY: the conditional update is the guard
+	// against two doormen scanning the same QR in the same instant — only
+	// the request that flips checked_in_at from NULL wins.
 	ticketID := services.GetString(ticket, "id")
-	venueDB.UpdateNoReturn(ctx, "tickets", map[string]interface{}{
+	lock, lockErr := venueDB.UpdateCtx(ctx, "tickets", map[string]interface{}{
 		"checked_in_at": time.Now().Format(time.RFC3339),
 		"checked_in_by": req.WorkerID,
-	}, map[string]interface{}{"id": ticketID})
+	}, map[string]interface{}{"id": ticketID, "checked_in_at": "is.null"})
+	if lockErr != nil || len(lock) == 0 {
+		log.Printf("[Scan] DUPLICATE race venue=%s ticket=%s worker=%s", venueID, ticketID, req.WorkerID)
+		c.JSON(http.StatusOK, gin.H{
+			"valid":        false,
+			"already_used": true,
+			"message":      "Ticket ya fue usado",
+			"ticket":       ticket,
+		})
+		return
+	}
+	log.Printf("[Scan] OK venue=%s ticket=%s owner=%q worker=%s", venueID, ticketID, services.GetString(ticket, "owner_name"), req.WorkerID)
 
 	// Enrich event info for the staff UI.
 	var event map[string]interface{}
@@ -468,11 +499,17 @@ func MobileValidateTicket(c *gin.Context) {
 		})
 	}
 
+	// The app reads event_name/ticket_type/status at the top level
+	// (ticketService.js), not nested under ticket/event.
 	c.JSON(http.StatusOK, gin.H{
-		"valid":   true,
-		"message": "Acceso permitido",
-		"ticket":  ticket,
-		"event":   event,
+		"valid":       true,
+		"message":     "Acceso permitido",
+		"status":      "checked_in",
+		"event_name":  services.GetString(event, "name"),
+		"ticket_type": services.GetString(ticket, "ticket_type_name"),
+		"owner_name":  services.GetString(ticket, "owner_name"),
+		"ticket":      ticket,
+		"event":       event,
 	})
 }
 
@@ -482,6 +519,11 @@ func MobileGetVenueOrders(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 	venueID := c.Param("venueId")
+	// SECURITY: staff can only read their own venue (IDOR guard).
+	if tokenVenue := c.GetString("venue_id"); tokenVenue != "" && venueID != tokenVenue {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied for this venue"})
+		return
+	}
 	venueDB := services.DB.ForVenue(venueID)
 	if venueDB == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid venue"})
@@ -516,11 +558,12 @@ func MobileGetVenueOrders(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get orders"})
 		return
 	}
-	// Total count for pagination — separate cheap COUNT-ish query.
-	all, _ := venueDB.QueryCtx(ctx, "orders", map[string]interface{}{
-		"select": "id", "where": where,
-	})
-	totalCount := len(all)
+	// Total count for pagination — HEAD + count=exact, no rows transferred.
+	totalCount, cntErr := venueDB.CountCtx(ctx, "orders", where)
+	if cntErr != nil {
+		// Fallback: page-sized guess (better a soft count than a 500 here).
+		totalCount = offset + len(orders)
+	}
 	totalPages := (totalCount + limit - 1) / limit
 	if totalPages < 1 {
 		totalPages = 1
@@ -579,7 +622,7 @@ func MobileApproveOrder(c *gin.Context) {
 	orderID := c.Param("orderId")
 
 	current, _ := venueDB.QueryOne(ctx, "orders", map[string]interface{}{
-		"select": "id,status,stripe_session_id", "where": map[string]interface{}{"id": orderID},
+		"select": "id,order_number,status,stripe_session_id,currency,metadata", "where": map[string]interface{}{"id": orderID},
 	})
 	if current == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Order not found"})
@@ -590,22 +633,63 @@ func MobileApproveOrder(c *gin.Context) {
 		return
 	}
 
-	// Approving means "accept and settle" — run the same pipeline as the
-	// customer payment confirmation (ConfirmPayment) so the tickets get
-	// created and the buyer receives the email with QR codes + PDF. Just
-	// flipping the status (the old behavior) confirmed orders that had no
-	// tickets and no notification to the customer.
-	sessionID := services.GetString(current, "stripe_session_id")
-	if sessionID == "" {
-		code, _ := generateRandomCode(24)
-		sessionID = "mock_" + code
+	// Guard: an expired/cancelled order cannot be approved (its hold is gone).
+	if st := services.GetString(current, "status"); st == "expired" || st == "cancelled" {
+		c.JSON(http.StatusConflict, gin.H{"error": "Esta solicitud ya no se puede aprobar (" + st + ")"})
+		return
 	}
-	if s := services.GetString(current, "status"); s == "pending" || s == "" {
+	// RACE GUARD: for held orders, atomically claim payment_authorized→processing
+	// so a concurrent reject or the 48h expiry job can't act on the same hold.
+	if services.GetString(current, "status") == "payment_authorized" {
+		if !claimHeldOrder(ctx, venueDB, orderID) {
+			c.JSON(http.StatusConflict, gin.H{"error": "Esta solicitud ya está siendo procesada"})
+			return
+		}
+	}
+
+	// PRIVATE-EVENT APPROVAL: if this order holds Cybersource authorizations
+	// (payment_authorized), settle them now (capture the money) and then issue
+	// tickets via the shared confirmation rail.
+	if sid, outcome := captureHeldOrder(ctx, venueID, current); outcome != notHeld {
+		if outcome == captureFailed {
+			// The gateway refused the capture (e.g. auth expired issuer-side).
+			// Leave the order as-is so staff can retry or reject.
+			c.JSON(http.StatusBadGateway, gin.H{
+				"error": "No se pudo cobrar el pago retenido. La autorización pudo expirar; intenta de nuevo o rechaza la solicitud.",
+			})
+			return
+		}
+		// Persist the captured=true flag + WHO approved and WHEN (traceability).
+		metadata, _ := current["metadata"].(map[string]interface{})
+		if metadata == nil {
+			metadata = map[string]interface{}{}
+		}
+		metadata["captured_at"] = time.Now().Format(time.RFC3339)
 		venueDB.UpdateNoReturn(ctx, "orders", map[string]interface{}{
 			"status":            "processing",
-			"stripe_session_id": sessionID,
-			"payment_gateway":   "stripe",
+			"stripe_session_id": sid,
+			"approved_by":       c.GetString("staff_id"),
+			"approved_at":       time.Now().Format(time.RFC3339),
+			"metadata":          metadata,
 		}, map[string]interface{}{"id": orderID})
+		q := c.Request.URL.Query()
+		q.Set("session_id", sid)
+		q.Set("venue_id", venueID)
+		c.Request.URL.RawQuery = q.Encode()
+		ConfirmPayment(c)
+		return
+	}
+
+	// No held gateway authorization to settle. With real payments there is
+	// nothing to "approve into" a paid order — this is a stale/unpaid order
+	// (e.g. an abandoned pending order or leftover test data). Return a clear
+	// message instead of a 500 from trying to confirm a non-existent payment.
+	sessionID := services.GetString(current, "stripe_session_id")
+	if sessionID == "" || !strings.HasPrefix(sessionID, "neonet_") {
+		c.JSON(http.StatusConflict, gin.H{
+			"error": "Esta orden no tiene un pago pendiente de aprobar (no se completó el pago o es una orden antigua).",
+		})
+		return
 	}
 	q := c.Request.URL.Query()
 	q.Set("session_id", sessionID)
@@ -636,11 +720,39 @@ func MobileRejectOrder(c *gin.Context) {
 	if staffID != "" {
 		reason = strings.TrimSpace(reason + " (rechazada por staff " + staffID + ")")
 	}
+
+	// PRIVATE-EVENT REJECTION: release any held Cybersource authorizations so
+	// the buyer is NOT charged (both the ticket and our fee are freed), and
+	// email them that the request was declined and the hold released.
+	orderID := c.Param("orderId")
+	if held, _ := venueDB.QueryOne(ctx, "orders", map[string]interface{}{
+		"select": "id,order_number,event_id,status,currency,total,user_name,user_email,metadata", "where": map[string]interface{}{"id": orderID},
+	}); held != nil {
+		// RACE GUARD: claim the hold before releasing so approve/expiry can't
+		// also act on it. Non-held (pending) orders skip the claim.
+		if services.GetString(held, "status") == "payment_authorized" && !claimHeldOrder(ctx, venueDB, orderID) {
+			c.JSON(http.StatusConflict, gin.H{"error": "Esta solicitud ya está siendo procesada"})
+			return
+		}
+		if reverseHeldOrder(ctx, venueID, held) {
+			log.Printf("[Mobile/RejectOrder] released held authorizations for order=%s", orderID)
+			cur := services.GetString(held, "currency")
+			if cur == "" {
+				cur = "GTQ"
+			}
+			go func() {
+				bgCtx, bgCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer bgCancel()
+				sendApprovalStatusEmail(bgCtx, venueID, held, services.GetFloat64(held, "total"), cur, "rejected", false)
+			}()
+		}
+	}
+
 	result, err := venueDB.UpdateCtx(ctx, "orders", map[string]interface{}{
 		"status":              "cancelled",
 		"cancelled_at":        time.Now().Format(time.RFC3339),
 		"cancellation_reason": reason,
-	}, map[string]interface{}{"id": c.Param("orderId")})
+	}, map[string]interface{}{"id": orderID})
 	if err != nil || len(result) == 0 {
 		log.Printf("[Mobile/RejectOrder] failed id=%s err=%v rows=%d", c.Param("orderId"), err, len(result))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to reject"})
@@ -863,10 +975,10 @@ func MobileRegisterPushToken(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "push_token is required"})
 		return
 	}
-	venueID := req.VenueID
-	if venueID == "" {
-		venueID = c.GetString("venue_id")
-	}
+	// SECURITY: venue and employee come from the authenticated JWT, never the
+	// body — otherwise anyone could subscribe to another venue's staff pushes.
+	venueID := c.GetString("venue_id")
+	employeeID := c.GetString("staff_id")
 	venueDB := services.DB.ForVenue(venueID)
 	if venueDB == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid venue"})
@@ -881,10 +993,11 @@ func MobileRegisterPushToken(c *gin.Context) {
 		venueDB.UpdateNoReturn(ctx, "staff_push_tokens", map[string]interface{}{
 			"is_active":   true,
 			"device_type": req.DeviceType,
+			"employee_id": employeeID,
 		}, map[string]interface{}{"id": services.GetString(existing, "id")})
 	} else {
 		venueDB.InsertCtx(ctx, "staff_push_tokens", map[string]interface{}{
-			"employee_id": req.EmployeeID,
+			"employee_id": employeeID,
 			"push_token":  req.PushToken,
 			"device_type": req.DeviceType,
 			"is_active":   true,
@@ -1126,6 +1239,11 @@ func MobileGetBookings(c *gin.Context) {
 	if venueID == "" {
 		venueID = resolveVenueID(c)
 	}
+	// SECURITY: staff can only read their own venue (IDOR guard).
+	if tokenVenue := c.GetString("venue_id"); tokenVenue != "" && venueID != tokenVenue {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied for this venue"})
+		return
+	}
 	venueDB := services.DB.ForVenue(venueID)
 	if venueDB == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid venue"})
@@ -1296,6 +1414,11 @@ func MobileUploadEventImage(c *gin.Context) {
 func MobileOrdersSearch(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
+	// SECURITY: staff can only search their own venue (IDOR guard).
+	if tokenVenue := c.GetString("venue_id"); tokenVenue != "" && c.Param("venueId") != tokenVenue {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied for this venue"})
+		return
+	}
 	venueDB := services.DB.ForVenue(c.Param("venueId"))
 	if venueDB == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid venue"})

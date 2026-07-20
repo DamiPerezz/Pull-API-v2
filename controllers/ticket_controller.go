@@ -126,6 +126,11 @@ func GetTicketByQR(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "QR token and venue_id are required"})
 		return
 	}
+	// SECURITY: block PostgREST operator injection via the token param.
+	if !safeLookupCode(qrToken) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid QR token"})
+		return
+	}
 
 	venueDB := services.DB.ForVenue(venueID)
 	if venueDB == nil {
@@ -312,20 +317,31 @@ func ValidateTicket(c *gin.Context) {
 		}
 	}
 
-	// Validate ticket (mark as used)
+	// Validate ticket (mark as used). The checked_in_at guard makes the
+	// update atomic: two simultaneous scans of the same QR can't both win.
 	now := time.Now()
-	_, err = venueDB.UpdateCtx(ctx, "tickets", map[string]interface{}{
+	lock, err := venueDB.UpdateCtx(ctx, "tickets", map[string]interface{}{
 		"checked_in_at": now.Format(time.RFC3339),
 		"checked_in_by": staffID,
 		"validated_at":  now.Format(time.RFC3339),
 	}, map[string]interface{}{
-		"id": ticketID,
+		"id":            ticketID,
+		"checked_in_at": "is.null",
 	})
 
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"valid": false,
 			"error": "Failed to validate ticket",
+		})
+		return
+	}
+	if len(lock) == 0 {
+		c.JSON(http.StatusConflict, gin.H{
+			"valid":   false,
+			"error":   "already_validated",
+			"message": "Ticket already used",
+			"ticket":  ticket,
 		})
 		return
 	}

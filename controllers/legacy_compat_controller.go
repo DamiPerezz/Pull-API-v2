@@ -786,7 +786,15 @@ func LegacyCreatePendingOrder(c *gin.Context) {
 	}
 
 	unitPrice := services.GetFloat64(ticketType, "price")
-	total := unitPrice * float64(req.Quantity)
+	subtotal := unitPrice * float64(req.Quantity)
+
+	// Server-authoritative total: subtotal + the venue's service fee
+	// (venues.platform_fee_percent — the WebApp mirrors the same percent for
+	// display). The client-sent total is ignored on purpose.
+	total := subtotal
+	if venue, err := services.DB.GetVenue(ctx, venueID); err == nil && venue.PlatformFeePercent > 0 {
+		total = round2(subtotal * (1 + venue.PlatformFeePercent/100))
+	}
 
 	// Get or create user
 	user, _ := venueDB.QueryOne(ctx, "public_users", map[string]interface{}{
@@ -824,7 +832,7 @@ func LegacyCreatePendingOrder(c *gin.Context) {
 		"user_id":        userID,
 		"quantity":       req.Quantity,
 		"unit_price":     unitPrice,
-		"subtotal":       total,
+		"subtotal":       subtotal,
 		"total":          total,
 		"currency":       "GTQ",
 		"status":         "pending",

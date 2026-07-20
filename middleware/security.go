@@ -99,6 +99,15 @@ func (s *SecurityConfig) cleanup() {
 
 // GetRealIP extracts the real client IP, only trusting headers from trusted proxies
 func GetRealIP(c *gin.Context) string {
+	// Fly.io sets Fly-Client-IP itself and it cannot be forged by the
+	// client — prefer it over X-Forwarded-For, which callers can spoof to
+	// rotate rate-limit buckets (see AUDITORIA-2026-07-19 hallazgo A2).
+	if fip := c.GetHeader("Fly-Client-IP"); fip != "" {
+		if net.ParseIP(fip) != nil {
+			return fip
+		}
+	}
+
 	clientIP := c.ClientIP()
 
 	// Only trust forwarded headers if request comes from trusted proxy

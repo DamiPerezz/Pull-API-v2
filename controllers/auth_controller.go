@@ -78,7 +78,7 @@ func LoginStaff(c *gin.Context) {
 
 	// Find staff by email
 	staff, err := venueDB.QueryOne(ctx, "organization_workers", map[string]interface{}{
-		"select": "id,email,password_hash,first_name,last_name,role_id,is_active",
+		"select": "id,email,password_hash,first_name,last_name,role_id,is_active,failed_login_attempts,locked_until",
 		"where": map[string]interface{}{
 			"email":      strings.ToLower(req.Email),
 			"deleted_at": "is.null",
@@ -100,13 +100,27 @@ func LoginStaff(c *gin.Context) {
 		return
 	}
 
+	// SECURITY: Per-account lockout — IP-based limits alone are evadable.
+	staffID := services.GetString(staff, "id")
+	if lockedUntil := services.GetTime(staff, "locked_until"); lockedUntil != nil && lockedUntil.After(time.Now()) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Account temporarily locked. Try again later."})
+		return
+	}
+
 	// Verify password
 	passwordHash := services.GetString(staff, "password_hash")
 	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.Password)); err != nil {
-		// SECURITY: Record failed login attempt
+		// SECURITY: Record failed login attempt (IP + per-account counter)
 		if middleware.Security != nil {
 			middleware.Security.RecordFailedLogin(clientIP)
 		}
+		attempts := services.GetInt(staff, "failed_login_attempts") + 1
+		update := map[string]interface{}{"failed_login_attempts": attempts}
+		if attempts >= 5 {
+			update["locked_until"] = time.Now().Add(15 * time.Minute).Format(time.RFC3339)
+			update["failed_login_attempts"] = 0
+		}
+		venueDB.UpdateNoReturn(ctx, "organization_workers", update, map[string]interface{}{"id": staffID})
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
@@ -115,8 +129,12 @@ func LoginStaff(c *gin.Context) {
 	if middleware.Security != nil {
 		middleware.Security.ClearFailedLogins(clientIP)
 	}
+	if services.GetInt(staff, "failed_login_attempts") > 0 {
+		venueDB.UpdateNoReturn(ctx, "organization_workers", map[string]interface{}{
+			"failed_login_attempts": 0, "locked_until": nil,
+		}, map[string]interface{}{"id": staffID})
+	}
 
-	staffID := services.GetString(staff, "id")
 	roleID := services.GetString(staff, "role_id")
 
 	// OPTIMIZATION: Parallel role + venue fetch
@@ -328,8 +346,10 @@ func RefreshToken(c *gin.Context) {
 
 // RequestCodeRequest represents the code request body
 type RequestCodeRequest struct {
-	Email   string `json:"email" binding:"required,email"`
-	VenueID string `json:"venue_id" binding:"required,uuid"`
+	Email string `json:"email" binding:"required,email"`
+	// Optional: the anonymous checkout WebApp doesn't know the venue_id, so we
+	// fall back to the first active venue (single-venue deployment).
+	VenueID string `json:"venue_id"`
 }
 
 // RequestCode sends a verification code to user's email
@@ -348,6 +368,15 @@ func RequestCode(c *gin.Context) {
 	}
 
 	email := strings.ToLower(strings.TrimSpace(req.Email))
+
+	// Fall back to the first active venue when the WebApp didn't send one.
+	if req.VenueID == "" {
+		if v, _ := services.DB.Central().QueryOne(ctx, "venues", map[string]interface{}{
+			"select": "id", "where": map[string]interface{}{"is_active": true, "deleted_at": "is.null"}, "limit": 1,
+		}); v != nil {
+			req.VenueID = services.GetString(v, "id")
+		}
+	}
 
 	// Get venue database
 	venueDB := services.DB.ForVenue(req.VenueID)
@@ -442,7 +471,7 @@ func RequestCode(c *gin.Context) {
 type VerifyCodeRequest struct {
 	Email   string `json:"email" binding:"required,email"`
 	Code    string `json:"code" binding:"required,len=6"`
-	VenueID string `json:"venue_id" binding:"required,uuid"`
+	VenueID string `json:"venue_id"`
 }
 
 // VerifyCode verifies the code and returns a token
@@ -462,6 +491,15 @@ func VerifyCode(c *gin.Context) {
 	}
 
 	email := strings.ToLower(strings.TrimSpace(req.Email))
+
+	// Fall back to the first active venue when the WebApp didn't send one.
+	if req.VenueID == "" {
+		if v, _ := services.DB.Central().QueryOne(ctx, "venues", map[string]interface{}{
+			"select": "id", "where": map[string]interface{}{"is_active": true, "deleted_at": "is.null"}, "limit": 1,
+		}); v != nil {
+			req.VenueID = services.GetString(v, "id")
+		}
+	}
 
 	// Get venue database
 	venueDB := services.DB.ForVenue(req.VenueID)

@@ -52,6 +52,12 @@ func main() {
 		log.Printf("Warning: PDF service init failed: %v", err)
 	}
 
+	// Initialize Expo push service (notifies staff devices on new orders).
+	services.InitPushService()
+
+	// Start the 48h approval-expiry sweep for held private-event payments.
+	controllers.StartApprovalExpiryJob()
+
 	// Create router with custom recovery
 	router := gin.New()
 	router.Use(gin.Logger())
@@ -589,6 +595,11 @@ func setupMobileRoutes(v1 *gin.RouterGroup) {
 		// Employees (admin role consumes these)
 		authed.GET("/employees/employees", controllers.MobileGetEmployees)
 		authed.GET("/employees/employees/:employeeId", middleware.ValidateUUIDParam("employeeId"), controllers.MobileGetEmployee)
+		// Create uses a mobile-friendly shape (no password/role_id required).
+		// Update/Delete reuse the v2 routes PUT/DELETE /employees/:id, which
+		// the app already calls — adding /employees/:employeeId here would
+		// panic gin (wildcard name conflict with :id).
+		authed.POST("/employees/create", middleware.RateLimitCreate(), controllers.MobileCreateEmployee)
 
 		// Upload (event image)
 		authed.POST("/upload/event-image", controllers.MobileUploadEventImage)
@@ -606,13 +617,13 @@ func setupMobileRoutes(v1 *gin.RouterGroup) {
 		authed.POST("/ticket-types/event/:eventId", middleware.ValidateUUIDParam("eventId"), controllers.MobileCreateTicketType)
 		authed.PUT("/ticket-types/:ticketTypeId", middleware.ValidateUUIDParam("ticketTypeId"), controllers.MobileUpdateTicketType)
 		authed.DELETE("/ticket-types/:ticketTypeId", middleware.ValidateUUIDParam("ticketTypeId"), controllers.MobileDeleteTicketType)
-	}
 
-	// Notifications endpoints: token registration is needed right after login
-	// (no auth header yet on the registration call sometimes). Treat as
-	// optional auth.
-	v1.POST("/notifications/register-token", controllers.MobileRegisterPushToken)
-	v1.POST("/notifications/unregister-token", controllers.MobileUnregisterPushToken)
+		// Push token registration — MUST be authenticated (the app registers
+		// right after login, so it has a token). Public registration let an
+		// attacker subscribe their device to another venue's staff pushes.
+		authed.POST("/notifications/register-token", controllers.MobileRegisterPushToken)
+		authed.POST("/notifications/unregister-token", controllers.MobileUnregisterPushToken)
+	}
 
 	// Auth refresh alias the mobile interceptor uses on 403 INVALID_TOKEN.
 	v1.POST("/auth/refresh-token", middleware.AuthenticateStaff(), controllers.RefreshToken)
@@ -657,7 +668,9 @@ func setupLegacyRoutes(v1 *gin.RouterGroup) {
 	v1.POST("/orders/create-pending-order", middleware.RateLimitCreate(), controllers.LegacyCreatePendingOrder)
 	v1.POST("/orders/create-checkout-session", middleware.RateLimitPayment(), controllers.LegacyCreateCheckoutSession)
 	v1.GET("/orders/confirm-payment", controllers.LegacyConfirmPayment)
-	v1.POST("/orders/simulate-payment", controllers.LegacySimulatePayment)
+	v1.POST("/orders/simulate-payment", middleware.RateLimitPayment(), controllers.LegacySimulatePayment)
+	// Direct-card payment (NeoNet/Cybersource): two atomic sales per purchase.
+	v1.POST("/orders/pay", middleware.RateLimitPayment(), controllers.PayOrder)
 	v1.GET("/orders/details/:orderId", controllers.LegacyGetOrderDetails)
 }
 

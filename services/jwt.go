@@ -15,7 +15,9 @@ import (
 // =============================================
 
 const (
-	StaffTokenExpiry    = 24 * time.Hour
+	// 72h so a doorman who logged in the day before an event doesn't get
+	// logged out mid-queue (24h expiry + logout-on-401 bit us in audit A1).
+	StaffTokenExpiry    = 72 * time.Hour
 	UserTokenExpiry     = 7 * 24 * time.Hour
 	PlatformTokenExpiry = 8 * time.Hour
 )

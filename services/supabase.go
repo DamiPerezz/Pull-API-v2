@@ -160,6 +160,43 @@ func (s *SupabaseClient) QueryCtx(ctx context.Context, table string, params map[
 	return s.parseResponse(resp)
 }
 
+// CountCtx returns the exact number of rows matching the filters WITHOUT
+// fetching them: HEAD + "Prefer: count=exact" makes PostgREST answer with a
+// Content-Range header ("0-0/123") and an empty body.
+func (s *SupabaseClient) CountCtx(ctx context.Context, table string, where map[string]interface{}) (int, error) {
+	if !tableNameRegex.MatchString(table) {
+		return 0, fmt.Errorf("invalid table name")
+	}
+	reqURL := fmt.Sprintf("%s/rest/v1/%s", s.baseURL, table)
+	queryParams := s.buildQueryParams(map[string]interface{}{
+		"select": "id",
+		"where":  where,
+		"limit":  1,
+	})
+	if len(queryParams) > 0 {
+		reqURL += "?" + queryParams.Encode()
+	}
+	req, err := http.NewRequestWithContext(ctx, "HEAD", reqURL, nil)
+	if err != nil {
+		return 0, err
+	}
+	s.setHeaders(req)
+	req.Header.Set("Prefer", "count=exact")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return 0, fmt.Errorf("count error %d", resp.StatusCode)
+	}
+	cr := resp.Header.Get("Content-Range") // "0-0/123" or "*/123"
+	if i := strings.LastIndex(cr, "/"); i >= 0 && i+1 < len(cr) {
+		return strconv.Atoi(cr[i+1:])
+	}
+	return 0, fmt.Errorf("missing content-range header")
+}
+
 // QueryOne returns a single result or nil
 func (s *SupabaseClient) QueryOne(ctx context.Context, table string, params map[string]interface{}) (map[string]interface{}, error) {
 	// Force limit 1

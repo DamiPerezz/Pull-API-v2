@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -574,12 +575,38 @@ func ConfirmPayment(c *gin.Context) {
 		recordPlatformTransaction(bgCtx, venueID, order, paymentResult)
 	}()
 
-	// Send confirmation email with PDF attached + inline QR codes (fire-and-forget).
+	// Notify venue staff devices about the confirmed purchase (fire-and-forget).
 	go func() {
-		bgCtx, bgCancel := context.WithTimeout(context.Background(), 45*time.Second)
-		defer bgCancel()
-		if services.Email == nil {
+		if services.Push == nil {
 			return
+		}
+		bgCtx, bgCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer bgCancel()
+		eventName := ""
+		if ev, _ := venueDB.QueryOne(bgCtx, "events", map[string]interface{}{
+			"select": "name", "where": map[string]interface{}{"id": eventID},
+		}); ev != nil {
+			eventName = services.GetString(ev, "name")
+		}
+		body := fmt.Sprintf("%s compró %d ticket(s)", userName, quantity)
+		if eventName != "" {
+			body += " — " + eventName
+		}
+		services.Push.NotifyVenueStaff(bgCtx, venueID, "Nueva compra confirmada", body, "bookings", map[string]interface{}{
+			"type":         "order_confirmed",
+			"order_id":     orderID,
+			"order_number": services.GetString(order, "order_number"),
+			"event_id":     eventID,
+		})
+	}()
+
+	// Send confirmation email with PDF attached + inline QR codes. Runs on the
+	// bounded task queue (NOT a raw goroutine): PDF+QR rendering is the
+	// heaviest allocation in the app, and a purchase burst with unbounded
+	// goroutines can OOM the 512MB machine.
+	services.RunBackground("order-tickets-email", func(bgCtx context.Context) error {
+		if services.Email == nil {
+			return nil
 		}
 
 		// Resolve event + venue context for the email.
@@ -625,6 +652,17 @@ func ConfirmPayment(c *gin.Context) {
 				ownerName += " " + ln
 			}
 			ticketID := qrToken // stand-in until the row insert returns an id
+
+			// Render the QR ONCE per ticket; the same PNG feeds both the
+			// inline email image and the PDF attachment.
+			var qrPNG []byte
+			qrDataURL := ""
+			if services.PDF != nil {
+				if b, err := services.PDF.QRCodePNG(qrToken, 200); err == nil {
+					qrPNG = b
+					qrDataURL = "data:image/png;base64," + base64.StdEncoding.EncodeToString(b)
+				}
+			}
 			pdfTickets = append(pdfTickets, services.TicketPDFData{
 				EventName:     eventName,
 				EventDate:     eventDate,
@@ -636,14 +674,8 @@ func ConfirmPayment(c *gin.Context) {
 				OrderNumber:   services.GetString(order, "order_number"),
 				TicketID:      ticketID,
 				QRCode:        qrToken,
+				QRPNG:         qrPNG,
 			})
-
-			qrDataURL := ""
-			if services.PDF != nil {
-				if b64, err := services.PDF.QRCodeToBase64(qrToken, 200); err == nil {
-					qrDataURL = "data:image/png;base64," + b64
-				}
-			}
 			emailTickets = append(emailTickets, services.TicketData{
 				ID:             ticketID,
 				Type:           ticketTypeName,
@@ -667,7 +699,7 @@ func ConfirmPayment(c *gin.Context) {
 		}
 
 		totalStr := fmt.Sprintf("%.2f", services.GetFloat64(order, "total"))
-		services.Email.SendTickets(bgCtx, userEmail, services.TicketEmailData{
+		return services.Email.SendTickets(bgCtx, userEmail, services.TicketEmailData{
 			OrderNumber:   services.GetString(order, "order_number"),
 			CustomerName:  userName,
 			EventName:     eventName,
@@ -681,7 +713,7 @@ func ConfirmPayment(c *gin.Context) {
 			Total:         totalStr,
 			Tickets:       emailTickets,
 		}, pdfBytes)
-	}()
+	})
 
 	c.JSON(http.StatusOK, gin.H{
 		"success":      true,
@@ -700,6 +732,11 @@ func GetOrder(c *gin.Context) {
 	defer cancel()
 
 	code := c.Param("code")
+	// SECURITY: block PostgREST operator injection via the path param.
+	if !safeLookupCode(code) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid order code"})
+		return
+	}
 	venueID := c.Query("venue_id")
 
 	if code == "" || venueID == "" {

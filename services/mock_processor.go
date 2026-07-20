@@ -89,6 +89,40 @@ func (p *MockProcessor) ConfirmPayment(ctx context.Context, sessionID string) (*
 	}, nil
 }
 
+// ChargeCard simulates a direct card sale so the /orders/pay flow can be
+// exercised end-to-end in DEMO_MODE. Cards ending in 0002 are declined so
+// the frontend error path is testable.
+func (p *MockProcessor) ChargeCard(ctx context.Context, params ChargeParams) (*ChargeResult, error) {
+	b := make([]byte, 12)
+	if _, err := rand.Read(b); err != nil {
+		return nil, err
+	}
+	last4 := "0000"
+	if n := len(params.Card.Number); n >= 4 {
+		last4 = params.Card.Number[n-4:]
+	}
+	if last4 == "0002" {
+		return &ChargeResult{Success: false, ErrorMessage: "Tarjeta rechazada (simulación)"}, nil
+	}
+	return &ChargeResult{
+		Success:       true,
+		TransactionID: "mock_charge_" + hex.EncodeToString(b),
+		AuthCode:      "DEMO-" + hex.EncodeToString(b[:3]),
+		CardLast4:     last4,
+		CardBrand:     "demo",
+	}, nil
+}
+
+// CapturePayment is a no-op in demo mode (held demo auths settle instantly).
+func (p *MockProcessor) CapturePayment(ctx context.Context, transactionID, referenceCode string, amount float64, currency string) error {
+	return nil
+}
+
+// ReverseCharge is a no-op in demo mode.
+func (p *MockProcessor) ReverseCharge(ctx context.Context, transactionID, referenceCode string, amount float64, currency string) error {
+	return nil
+}
+
 func (p *MockProcessor) ProcessRefund(ctx context.Context, transactionID string, amount float64) error {
 	return nil
 }
