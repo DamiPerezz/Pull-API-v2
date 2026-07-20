@@ -465,7 +465,7 @@ var emailTemplates = map[string]string{
 <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;margin:0;padding:24px;background:#0a0a0f;color:#fff;">
   <div style="max-width:600px;margin:0 auto;background:#15151f;border:1px solid #2a2a3a;border-radius:16px;padding:36px;">
 
-    <div style="font-size:12px;letter-spacing:3px;color:#8b5cf6;font-weight:700;">AURORA HALL</div>
+    <div style="font-size:12px;letter-spacing:3px;color:#8b5cf6;font-weight:700;">PULL EVENTS</div>
     <h1 style="font-size:26px;margin:8px 0 8px;color:#fff;">Tus entradas están listas</h1>
     <p style="color:#a0a0b0;margin:0 0 28px;font-size:15px;">Hola {{.CustomerName}}, gracias por tu compra. Aquí tienes los detalles de tu orden.</p>
 
@@ -519,7 +519,7 @@ var emailTemplates = map[string]string{
       Adjuntamos también un PDF con tus entradas listas para imprimir. Presenta cada código QR en la puerta del evento.
     </p>
     <p style="color:#6b6b7b;font-size:11px;margin:18px 0 0;text-align:center;">
-      Demo · Aurora Hall · Pull Events
+      Pull Events
     </p>
   </div>
 </body>

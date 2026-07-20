@@ -130,7 +130,7 @@ func Load() {
 
 		// Brevo (alternative email provider)
 		BrevoAPIKey:    getEnv("BREVO_API_KEY", ""),
-		BrevoFromEmail: getEnv("BREVO_FROM_EMAIL", "Aurora Hall <demo@aurorahall.com>"),
+		BrevoFromEmail: getEnv("BREVO_FROM_EMAIL", "Pull Events <noreply@pullevents.com>"),
 
 		// Frontend
 		FrontendURL: frontendURL,

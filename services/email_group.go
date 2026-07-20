@@ -54,7 +54,7 @@ func (e *EmailService) SendGroupReservationConfirmation(ctx context.Context, dat
 	defer cancel()
 	_, err = e.Send(c, EmailRequest{
 		To:      []string{data.To},
-		Subject: fmt.Sprintf("Reserva %s — Aurora Hall", data.ReservationNumber),
+		Subject: fmt.Sprintf("Reserva %s — Pull Events", data.ReservationNumber),
 		HTML:    html,
 		Tags: []EmailTag{
 			{Name: "type", Value: "group_reservation"},
@@ -162,7 +162,7 @@ func (e *EmailService) SendOrderTicketsEmail(ctx context.Context, data OrderTick
 <head><meta charset="utf-8"></head>
 <body style="font-family:-apple-system,BlinkMacSystemFont,system-ui,sans-serif;margin:0;padding:24px;background:#0a0a0f;color:#fff;">
   <div style="max-width:560px;margin:0 auto;background:#15151f;border:1px solid #2a2a3a;border-radius:14px;padding:32px;">
-    <div style="font-size:12px;letter-spacing:2px;color:#8b5cf6;font-weight:600;">AURORA HALL</div>
+    <div style="font-size:12px;letter-spacing:2px;color:#8b5cf6;font-weight:600;">PULL EVENTS</div>
     <h1 style="font-size:24px;margin:8px 0 24px;">¡Pago confirmado!</h1>
     <p style="color:#a0a0b0;margin:0 0 24px;">Hola %s, tu compra para <strong>%s</strong> ha sido confirmada.</p>
 
@@ -184,7 +184,7 @@ func (e *EmailService) SendOrderTicketsEmail(ctx context.Context, data OrderTick
     %s
 
     <p style="color:#6b6b7b;font-size:12px;margin:24px 0 0;text-align:center;line-height:1.5;">
-      Presenta cada código QR en la puerta. Modo demo · Aurora Hall · Pull Events
+      Presenta cada código QR en la puerta · Pull Events
     </p>
   </div>
 </body>
@@ -199,7 +199,7 @@ func (e *EmailService) SendOrderTicketsEmail(ctx context.Context, data OrderTick
 	defer cancel()
 	_, err := e.Send(c, EmailRequest{
 		To:      []string{data.To},
-		Subject: fmt.Sprintf("Entradas confirmadas: %s — Aurora Hall", data.EventName),
+		Subject: fmt.Sprintf("Entradas confirmadas: %s — Pull Events", data.EventName),
 		HTML:    html,
 		Tags: []EmailTag{
 			{Name: "type", Value: "order_tickets"},
