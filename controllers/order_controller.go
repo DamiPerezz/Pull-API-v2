@@ -1358,7 +1358,13 @@ func recordPlatformTransaction(ctx context.Context, venueID string, order map[st
 	wg.Wait()
 
 	grossAmount := services.GetFloat64(order, "total")
-	platformFee := (grossAmount * feePercent / 100) + feeFixed
+	// El total YA incluye el fee (total = subtotal * (1+fee)). El fee real
+	// cobrado es total - total/(1+fee) — igual que el split de PayOrder. La
+	// fórmula anterior (total*fee) sobreestimaba el fee ~8% en los reportes.
+	platformFee := feeFixed
+	if feePercent > 0 {
+		platformFee += round2(grossAmount - grossAmount/(1+feePercent/100))
+	}
 	gatewayFee := 0.0
 	venueNet := grossAmount - platformFee - gatewayFee
 

@@ -315,11 +315,31 @@ func PayOrder(c *gin.Context) {
 		metadata["approval_deadline"] = deadline.Format(time.RFC3339)
 		metadata["authorized_at"] = time.Now().Format(time.RFC3339)
 
-		venueDB.UpdateNoReturn(ctx, "orders", map[string]interface{}{
+		// Ruta de dinero: si el hold no se puede PERSISTIR, la tarjeta quedó
+		// autorizada pero la orden no lo sabría (ni staff, ni job de 48h, ni
+		// nadie que pueda capturar o reversar). Liberar las autorizaciones y
+		// devolver error limpio — el cliente reintenta y no queda dinero
+		// retenido huérfano.
+		if err := venueDB.UpdateNoReturn(ctx, "orders", map[string]interface{}{
 			"status":          "payment_authorized",
 			"payment_gateway": "neonet",
 			"metadata":        metadata,
-		}, map[string]interface{}{"id": req.OrderID})
+		}, map[string]interface{}{"id": req.OrderID}); err != nil {
+			log.Printf("[PayOrder] ALERT: hold persist FAILED order=%s venueTx=%s feeTx=%s: %v — reversing",
+				orderNumber, charge1.TransactionID, feeTxID, err)
+			rbCtx, rbCancel := context.WithTimeout(context.Background(), 25*time.Second)
+			defer rbCancel()
+			if revErr := charger.ReverseCharge(rbCtx, charge1.TransactionID, orderNumber+"-VENUE-RB", venueShare, currency); revErr != nil {
+				log.Printf("[PayOrder] ALERT: hold reversal ALSO failed order=%s tx=%s: %v", orderNumber, charge1.TransactionID, revErr)
+			}
+			if feeTxID != "" {
+				if revErr := charger.ReverseCharge(rbCtx, feeTxID, orderNumber+"-FEE-RB", feeShare, currency); revErr != nil {
+					log.Printf("[PayOrder] ALERT: fee hold reversal ALSO failed order=%s tx=%s: %v", orderNumber, feeTxID, revErr)
+				}
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "No se pudo registrar el pago. No se ha realizado ningún cargo — intenta de nuevo."})
+			return
+		}
 		log.Printf("[PayOrder] HELD (awaiting approval) order=%s venue=%.2f fee=%.2f %s deadline=%s",
 			orderNumber, venueShare, feeShare, currency, deadline.Format(time.RFC3339))
 
@@ -362,12 +382,29 @@ func PayOrder(c *gin.Context) {
 		CardLast4:         charge1.CardLast4,
 		CardBrand:         charge1.CardBrand,
 	})
-	venueDB.UpdateNoReturn(ctx, "orders", map[string]interface{}{
-		"status":            "processing",
-		"stripe_session_id": sessionID,
-		"payment_gateway":   "neonet",
-		"metadata":          metadata,
-	}, map[string]interface{}{"id": req.OrderID})
+	// Ruta de dinero: el cargo YA se ejecutó (capture=true). Si no se puede
+	// persistir la sesión, ConfirmPayment devolvería 404 con el cliente ya
+	// cobrado — reintentar una vez y si no, gritar con los tx IDs para poder
+	// reversar/conciliar a mano.
+	writeCharge := func() error {
+		return venueDB.UpdateNoReturn(ctx, "orders", map[string]interface{}{
+			"status":            "processing",
+			"stripe_session_id": sessionID,
+			"payment_gateway":   "neonet",
+			"metadata":          metadata,
+		}, map[string]interface{}{"id": req.OrderID})
+	}
+	if err := writeCharge(); err != nil {
+		log.Printf("[PayOrder] charge persist failed, retrying once order=%s: %v", orderNumber, err)
+		if err = writeCharge(); err != nil {
+			log.Printf("[PayOrder] ALERT: charge persist FAILED after retry order=%s venueTx=%s feeTx=%s: %v",
+				orderNumber, charge1.TransactionID, feeTxID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": "El pago se procesó pero hubo un error registrándolo. NO vuelvas a pagar — contacta al local con tu número de orden " + orderNumber + ".",
+			})
+			return
+		}
+	}
 
 	log.Printf("[PayOrder] both charges OK order=%s venue=%.2f fee=%.2f %s", orderNumber, venueShare, feeShare, currency)
 
@@ -401,9 +438,19 @@ func captureHeldOrder(ctx context.Context, venueID string, order map[string]inte
 	if venueTx == "" {
 		return "", notHeld
 	}
-	// Already captured (e.g. a retried approve) — nothing to do, proceed.
+	// Already captured (e.g. a retried approve) — nothing to settle, but the
+	// session MUST re-registrarse en el mapa en memoria: es por-máquina y
+	// por-proceso, y ConfirmPayment lo consume (LoadAndDelete). Sin esto un
+	// retry (u otra máquina) da "Failed to confirm payment" con el dinero ya
+	// capturado.
 	if captured, _ := split["captured"].(bool); captured {
-		return "neonet_" + venueTx, captureOK
+		sessionID = "neonet_" + venueTx
+		services.RegisterNeoNetPayment(sessionID, &models.PaymentResult{
+			Success:       true,
+			TransactionID: venueTx,
+			Gateway:       models.GatewayNeoNet,
+		})
+		return sessionID, captureOK
 	}
 	processor, err := services.Payments.GetProcessor(ctx, venueID)
 	if err != nil {

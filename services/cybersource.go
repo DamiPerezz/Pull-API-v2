@@ -236,7 +236,12 @@ func (c *CybersourceClient) Sale(ctx context.Context, referenceCode string, amou
 		result.CardLast4 = card.Number[n-4:]
 	}
 
-	if status == 201 && result.Status == "AUTHORIZED" {
+	// 201 + AUTHORIZED es el caso normal; el sandbox de VisaNet GT devuelve
+	// a veces 201 + ACCEPTED en autorizaciones (visto en la 2ª auth del par
+	// atómico con capture=false) — es una aprobación, no un rechazo. Todo lo
+	// demás (DECLINED, INVALID_REQUEST, AUTHORIZED_RISK_DECLINED...) cae al
+	// camino de rechazo de abajo.
+	if status == 201 && (result.Status == "AUTHORIZED" || result.Status == "ACCEPTED") {
 		result.Success = true
 		return result, nil
 	}

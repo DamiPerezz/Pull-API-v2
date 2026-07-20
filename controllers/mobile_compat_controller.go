@@ -623,7 +623,10 @@ func MobileGetOrderDetails(c *gin.Context) {
 // MobileApproveOrder handles POST /orders/:orderId/approve. Idempotent: a
 // request against an already-confirmed order succeeds with the current row.
 func MobileApproveOrder(c *gin.Context) {
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	// 60s, no 10s: aprobar un evento privado hace DOS capturas Cybersource
+	// (venue + fee) que pueden tardar hasta 30s cada una — un ctx corto
+	// abortaba con la captura ya ejecutada en la pasarela.
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
 	defer cancel()
 	venueID := c.GetString("venue_id")
 	if venueID == "" {
@@ -679,19 +682,31 @@ func MobileApproveOrder(c *gin.Context) {
 			})
 			return
 		}
-		// Persist the captured=true flag + WHO approved and WHEN (traceability).
+		// Persist the captured flag + WHO approved and WHEN. Trazabilidad va en
+		// metadata: la tabla orders VIVA de 511 no tiene columnas
+		// approved_by/approved_at (el template sí — divergencia de esquema), y
+		// una columna fantasma tumba el UPDATE entero: la captura ya se hizo
+		// pero stripe_session_id no se guardaba y el ticket nunca se emitía.
 		metadata, _ := current["metadata"].(map[string]interface{})
 		if metadata == nil {
 			metadata = map[string]interface{}{}
 		}
 		metadata["captured_at"] = time.Now().Format(time.RFC3339)
-		venueDB.UpdateNoReturn(ctx, "orders", map[string]interface{}{
+		metadata["approved_by"] = c.GetString("staff_id")
+		metadata["approved_at"] = time.Now().Format(time.RFC3339)
+		if err := venueDB.UpdateNoReturn(ctx, "orders", map[string]interface{}{
 			"status":            "processing",
 			"stripe_session_id": sid,
-			"approved_by":       c.GetString("staff_id"),
-			"approved_at":       time.Now().Format(time.RFC3339),
 			"metadata":          metadata,
-		}, map[string]interface{}{"id": orderID})
+		}, map[string]interface{}{"id": orderID}); err != nil {
+			// Ruta de dinero: la captura YA se ejecutó en la pasarela. Si no
+			// podemos persistirla, gritar — no seguir como si nada.
+			log.Printf("[Approve] ALERT: capture OK but order update FAILED order=%s session=%s: %v", orderID, sid, err)
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": "El cobro se realizó pero no se pudo actualizar la orden. NO reintentes; avisa a soporte técnico.",
+			})
+			return
+		}
 		q := c.Request.URL.Query()
 		q.Set("session_id", sid)
 		q.Set("venue_id", venueID)
@@ -720,7 +735,8 @@ func MobileApproveOrder(c *gin.Context) {
 
 // MobileRejectOrder handles POST /orders/:orderId/reject
 func MobileRejectOrder(c *gin.Context) {
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	// 45s: rechazar libera DOS autorizaciones contra la pasarela (venue+fee).
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 45*time.Second)
 	defer cancel()
 	venueID := c.GetString("venue_id")
 	staffID := c.GetString("staff_id")
@@ -1164,11 +1180,14 @@ func MobileRejectGuestListSignup(c *gin.Context) {
 		Reason string `json:"reason"`
 	}
 	_ = c.ShouldBindJSON(&body)
-	result, err := venueDB.UpdateCtx(ctx, "guest_list_signups", map[string]interface{}{
-		"status":           "rejected",
-		"rejection_reason": body.Reason,
-		"rejected_at":      time.Now().Format(time.RFC3339),
-	}, map[string]interface{}{"id": c.Param("signupId")})
+	// guest_list_signups (BD viva 511) no tiene rejected_at/rejection_reason —
+	// el motivo va en notes, la fecha la da updated_at.
+	rejectData := map[string]interface{}{"status": "rejected"}
+	if body.Reason != "" {
+		rejectData["notes"] = "Rechazado: " + body.Reason
+	}
+	result, err := venueDB.UpdateCtx(ctx, "guest_list_signups", rejectData,
+		map[string]interface{}{"id": c.Param("signupId")})
 	if err != nil || len(result) == 0 {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to reject"})
 		return
@@ -1222,12 +1241,13 @@ func MobileBatchRejectGuestList(c *gin.Context) {
 		return
 	}
 	updated := 0
+	bulkReject := map[string]interface{}{"status": "rejected"}
+	if body.Reason != "" {
+		bulkReject["notes"] = "Rechazado: " + body.Reason
+	}
 	for _, id := range body.SignupIDs {
-		r, _ := venueDB.UpdateCtx(ctx, "guest_list_signups", map[string]interface{}{
-			"status":           "rejected",
-			"rejection_reason": body.Reason,
-			"rejected_at":      time.Now().Format(time.RFC3339),
-		}, map[string]interface{}{"id": id})
+		r, _ := venueDB.UpdateCtx(ctx, "guest_list_signups", bulkReject,
+			map[string]interface{}{"id": id})
 		updated += len(r)
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "updated": updated})
