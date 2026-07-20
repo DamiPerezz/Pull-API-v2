@@ -51,9 +51,27 @@ type TicketPDFData struct {
 	QRPNG         []byte // pre-rendered QR PNG; if set, the PDF reuses it instead of re-encoding
 }
 
+// translateTicket converts every visible string of the ticket from UTF-8 to
+// the cp1252 encoding that gofpdf's core fonts expect — without this,
+// "Pérez" renders as "PÃ©rez" in the PDF. The QR token is NOT translated:
+// its content must stay byte-exact for the scanner.
+func translateTicket(tr func(string) string, t TicketPDFData) TicketPDFData {
+	t.EventName = tr(t.EventName)
+	t.EventDate = tr(t.EventDate)
+	t.EventTime = tr(t.EventTime)
+	t.VenueName = tr(t.VenueName)
+	t.VenueLocation = tr(t.VenueLocation)
+	t.TicketType = tr(t.TicketType)
+	t.OwnerName = tr(t.OwnerName)
+	t.OrderNumber = tr(t.OrderNumber)
+	return t
+}
+
 // GenerateTicketPDF generates a single ticket PDF
 func (p *PDFService) GenerateTicketPDF(ticket TicketPDFData) ([]byte, error) {
 	pdf := gofpdf.New("P", "mm", "A4", "")
+	tr := pdf.UnicodeTranslatorFromDescriptor("") // UTF-8 → cp1252
+	ticket = translateTicket(tr, ticket)
 	pdf.SetMargins(15, 15, 15)
 	pdf.AddPage()
 
@@ -162,7 +180,7 @@ func (p *PDFService) GenerateTicketPDF(ticket TicketPDFData) ([]byte, error) {
 	pdf.SetXY(15, 140)
 	pdf.SetFont("Helvetica", "", 9)
 	pdf.SetTextColor(100, 100, 100)
-	pdf.MultiCell(180, 5, "Presenta este código QR en la entrada del evento. Esta entrada es personal e intransferible.", "", "C", false)
+	pdf.MultiCell(180, 5, tr("Presenta este código QR en la entrada del evento. Esta entrada es personal e intransferible."), "", "C", false)
 
 	// Output
 	var buf bytes.Buffer
@@ -177,6 +195,7 @@ func (p *PDFService) GenerateTicketPDF(ticket TicketPDFData) ([]byte, error) {
 // GenerateMultiTicketPDF generates PDF with multiple tickets
 func (p *PDFService) GenerateMultiTicketPDF(tickets []TicketPDFData) ([]byte, error) {
 	pdf := gofpdf.New("P", "mm", "A4", "")
+	tr := pdf.UnicodeTranslatorFromDescriptor("") // UTF-8 → cp1252
 	pdf.SetMargins(15, 15, 15)
 
 	for i, ticket := range tickets {
@@ -189,7 +208,7 @@ func (p *PDFService) GenerateMultiTicketPDF(tickets []TicketPDFData) ([]byte, er
 			yOffset = 150
 		}
 
-		p.drawTicketOnPage(pdf, ticket, yOffset)
+		p.drawTicketOnPage(pdf, tr, translateTicket(tr, ticket), yOffset)
 	}
 
 	var buf bytes.Buffer
@@ -201,8 +220,9 @@ func (p *PDFService) GenerateMultiTicketPDF(tickets []TicketPDFData) ([]byte, er
 	return buf.Bytes(), nil
 }
 
-// drawTicketOnPage draws a single ticket at given Y offset
-func (p *PDFService) drawTicketOnPage(pdf *gofpdf.Fpdf, ticket TicketPDFData, yOffset float64) {
+// drawTicketOnPage draws a single ticket at given Y offset. The ticket's
+// strings must already be cp1252-translated (see translateTicket).
+func (p *PDFService) drawTicketOnPage(pdf *gofpdf.Fpdf, tr func(string) string, ticket TicketPDFData, yOffset float64) {
 	// Ticket container
 	pdf.SetDrawColor(200, 200, 200)
 	pdf.SetLineWidth(0.5)
@@ -304,7 +324,7 @@ func (p *PDFService) drawTicketOnPage(pdf *gofpdf.Fpdf, ticket TicketPDFData, yO
 	pdf.SetXY(15, yOffset+98)
 	pdf.SetFont("Helvetica", "", 8)
 	pdf.SetTextColor(100, 100, 100)
-	pdf.MultiCell(180, 4, "Presenta este código QR en la entrada. Entrada personal e intransferible.", "", "C", false)
+	pdf.MultiCell(180, 4, tr("Presenta este código QR en la entrada. Entrada personal e intransferible."), "", "C", false)
 }
 
 // generateQRCode generates a QR code image. Note: boombuler/barcode returns

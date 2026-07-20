@@ -304,6 +304,19 @@ func (s *SupabaseClient) InsertBatch(ctx context.Context, table string, dataList
 	return nil
 }
 
+// writeWhereValue encodes a where-clause value for PATCH/DELETE URLs. Only
+// the literal null-check "is.null" passes through as an operator (needed by
+// the atomic check-in / claim guards: `WHERE checked_in_at IS NULL`);
+// everything else is a plain equality. Deliberately NOT the richer heuristic
+// of buildQueryParams: on write paths a user-supplied value must never widen
+// the filter — "is.null" against a PK matches nothing, so it is safe.
+func writeWhereValue(value interface{}) string {
+	if s, ok := value.(string); ok && s == "is.null" {
+		return s
+	}
+	return fmt.Sprintf("eq.%v", value)
+}
+
 // =============================================
 // UPDATE METHODS
 // =============================================
@@ -324,7 +337,7 @@ func (s *SupabaseClient) UpdateCtx(ctx context.Context, table string, data map[s
 		if !isValidColumnName(key) {
 			return nil, fmt.Errorf("invalid column name: %s", key)
 		}
-		queryParams.Set(key, fmt.Sprintf("eq.%v", value))
+		queryParams.Set(key, writeWhereValue(value))
 	}
 
 	reqURL := fmt.Sprintf("%s/rest/v1/%s?%s", s.baseURL, table, queryParams.Encode())
@@ -365,7 +378,7 @@ func (s *SupabaseClient) UpdateNoReturn(ctx context.Context, table string, data 
 		if !isValidColumnName(key) {
 			return fmt.Errorf("invalid column name: %s", key)
 		}
-		queryParams.Set(key, fmt.Sprintf("eq.%v", value))
+		queryParams.Set(key, writeWhereValue(value))
 	}
 
 	reqURL := fmt.Sprintf("%s/rest/v1/%s?%s", s.baseURL, table, queryParams.Encode())
@@ -420,7 +433,7 @@ func (s *SupabaseClient) DeleteCtx(ctx context.Context, table string, where map[
 		if !isValidColumnName(key) {
 			return fmt.Errorf("invalid column name: %s", key)
 		}
-		queryParams.Set(key, fmt.Sprintf("eq.%v", value))
+		queryParams.Set(key, writeWhereValue(value))
 	}
 
 	reqURL := fmt.Sprintf("%s/rest/v1/%s?%s", s.baseURL, table, queryParams.Encode())

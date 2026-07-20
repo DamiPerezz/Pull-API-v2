@@ -474,11 +474,31 @@ func MobileValidateTicket(c *gin.Context) {
 	// against two doormen scanning the same QR in the same instant — only
 	// the request that flips checked_in_at from NULL wins.
 	ticketID := services.GetString(ticket, "id")
+	// checked_in_by es uuid: sin worker en el body, usar el staff del JWT;
+	// si tampoco hay, dejarlo NULL (un "" rompe el cast a uuid).
+	workerID := req.WorkerID
+	if workerID == "" {
+		workerID = c.GetString("user_id")
+	}
+	var checkedInBy interface{}
+	if workerID != "" {
+		checkedInBy = workerID
+	}
 	lock, lockErr := venueDB.UpdateCtx(ctx, "tickets", map[string]interface{}{
 		"checked_in_at": time.Now().Format(time.RFC3339),
-		"checked_in_by": req.WorkerID,
+		"checked_in_by": checkedInBy,
 	}, map[string]interface{}{"id": ticketID, "checked_in_at": "is.null"})
-	if lockErr != nil || len(lock) == 0 {
+	if lockErr != nil {
+		// Fallo de BD/red, NO un duplicado — decirlo claro para que el
+		// portero reintente en vez de rechazar a la persona.
+		log.Printf("[Scan] claim ERROR venue=%s ticket=%s worker=%s: %v", venueID, ticketID, req.WorkerID, lockErr)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"valid":   false,
+			"message": "No se pudo validar el ticket. Reintenta.",
+		})
+		return
+	}
+	if len(lock) == 0 {
 		log.Printf("[Scan] DUPLICATE race venue=%s ticket=%s worker=%s", venueID, ticketID, req.WorkerID)
 		c.JSON(http.StatusOK, gin.H{
 			"valid":        false,
