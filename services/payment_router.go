@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"pull-api-v2/config"
 	"pull-api-v2/models"
+	"strings"
 	"sync"
 	"time"
 )
@@ -359,4 +361,36 @@ func (r *PaymentRouter) Stats() map[string]interface{} {
 		"cached_configs":    configCount,
 		"cache_ttl_minutes": r.cacheTTL.Minutes(),
 	}
+}
+
+// =============================================
+// FEE ROUTING — a qué cuenta merchant va el fee de Pull
+// =============================================
+
+// PlatformFeeVenueID: si está seteado (env PLATFORM_FEE_VENUE_ID), el fee de
+// servicio se cobra contra las credenciales de ESA fila de
+// payment_gateway_credentials (la cuenta Cybersource de PULL) en vez de la
+// del venue. Vacío = modo una-sola-cuenta (todo por la cuenta del venue,
+// como en sandbox). Así, cuando NeoNet habilite la cuenta del venue:
+//   fila del venue  -> credenciales del venue  (recibe el precio de entrada)
+//   fila de Pull    -> credenciales de Pull    (recibe el fee)
+//   PLATFORM_FEE_VENUE_ID=<id de la fila de Pull> en fly.prod.toml
+func PlatformFeeVenueID() string {
+	return strings.TrimSpace(os.Getenv("PLATFORM_FEE_VENUE_ID"))
+}
+
+// GetFeeProcessor devuelve el procesador por el que se cobra el FEE de Pull:
+// el de la plataforma si está configurado, o el del venue si no.
+func (r *PaymentRouter) GetFeeProcessor(ctx context.Context, venueID string) (PaymentProcessor, string, error) {
+	if plat := PlatformFeeVenueID(); plat != "" {
+		p, err := r.GetProcessor(ctx, plat)
+		if err != nil {
+			// La config de plataforma existe pero falla → NO cobrar el fee por
+			// el carril equivocado en silencio: que el caller decida.
+			return nil, plat, err
+		}
+		return p, plat, nil
+	}
+	p, err := r.GetProcessor(ctx, venueID)
+	return p, "", err
 }

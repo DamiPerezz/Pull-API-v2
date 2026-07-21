@@ -214,6 +214,25 @@ func PayOrder(c *gin.Context) {
 		return
 	}
 
+	// El FEE de Pull puede cobrarse por OTRA cuenta merchant (la de Pull) si
+	// PLATFORM_FEE_VENUE_ID está configurado; sin configurar, va por la del
+	// venue (modo una-cuenta, como el sandbox actual). Se guarda en el split
+	// para que capturas/reversas posteriores usen el MISMO carril.
+	feeCharger := charger
+	feeGatewayVenue := ""
+	if feeShare > 0 {
+		feeProc, plat, ferr := services.Payments.GetFeeProcessor(ctx, venueID)
+		if ferr != nil {
+			log.Printf("[PayOrder] ALERT: fee gateway (plataforma=%s) mal configurado: %v", plat, ferr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Payment gateway not configured"})
+			return
+		}
+		if fc, isFc := feeProc.(services.DirectCardCharger); isFc {
+			feeCharger = fc
+			feeGatewayVenue = plat
+		}
+	}
+
 	// Billing info: sensible Guatemala defaults when the form doesn't ask.
 	userName := services.GetString(order, "user_name")
 	firstName, lastName := userName, "."
@@ -275,7 +294,7 @@ func PayOrder(c *gin.Context) {
 	// --- Transacción 2: fee de servicio de Pull ---
 	var charge2 *services.ChargeResult
 	if feeShare > 0 {
-		charge2, err = charger.ChargeCard(ctx, services.ChargeParams{
+		charge2, err = feeCharger.ChargeCard(ctx, services.ChargeParams{
 			ReferenceCode: orderNumber + "-FEE",
 			Amount:        feeShare,
 			Currency:      currency,
@@ -298,7 +317,7 @@ func PayOrder(c *gin.Context) {
 			// Si el fee quedó en autorización PARCIAL, también retiene dinero:
 			// liberarlo igual.
 			if charge2 != nil && charge2.TransactionID != "" {
-				if revErr := charger.ReverseCharge(rbCtx, charge2.TransactionID, orderNumber+"-FEE-PARB", feeShare, currency); revErr != nil {
+				if revErr := feeCharger.ReverseCharge(rbCtx, charge2.TransactionID, orderNumber+"-FEE-PARB", feeShare, currency); revErr != nil {
 					log.Printf("[PayOrder] ALERT: fee partial-auth reversal failed order=%s tx=%s: %v", orderNumber, charge2.TransactionID, revErr)
 				}
 			}
@@ -335,6 +354,7 @@ func PayOrder(c *gin.Context) {
 		"venue_transaction": charge1.TransactionID,
 		"fee_transaction":   feeTxID,
 		"gateway":           string(processor.GetGateway()),
+		"fee_gateway_venue": feeGatewayVenue, // "" = cuenta del venue; id = cuenta de Pull
 		"captured":          capture, // false = funds held, awaiting approval
 	}
 
@@ -364,7 +384,7 @@ func PayOrder(c *gin.Context) {
 				log.Printf("[PayOrder] ALERT: hold reversal ALSO failed order=%s tx=%s: %v", orderNumber, charge1.TransactionID, revErr)
 			}
 			if feeTxID != "" {
-				if revErr := charger.ReverseCharge(rbCtx, feeTxID, orderNumber+"-FEE-RB", feeShare, currency); revErr != nil {
+				if revErr := feeCharger.ReverseCharge(rbCtx, feeTxID, orderNumber+"-FEE-RB", feeShare, currency); revErr != nil {
 					log.Printf("[PayOrder] ALERT: fee hold reversal ALSO failed order=%s tx=%s: %v", orderNumber, feeTxID, revErr)
 				}
 			}
@@ -504,7 +524,7 @@ func captureHeldOrder(ctx context.Context, venueID string, order map[string]inte
 		return "", captureFailed
 	}
 	if feeTx := services.GetString(split, "fee_transaction"); feeTx != "" {
-		if err := charger.CapturePayment(ctx, feeTx, orderNumber+"-FEE-CAP", services.GetFloat64(split, "fee_amount"), currency); err != nil {
+		if err := feeChargerForSplit(ctx, venueID, split, charger).CapturePayment(ctx, feeTx, orderNumber+"-FEE-CAP", services.GetFloat64(split, "fee_amount"), currency); err != nil {
 			// Venue already captured; log but continue so tickets still issue.
 			log.Printf("[Approve] fee capture failed (venue already captured) order=%s: %v", orderNumber, err)
 		}
@@ -558,7 +578,7 @@ func reverseHeldOrder(ctx context.Context, venueID string, order map[string]inte
 		released = false
 	}
 	if feeTx := services.GetString(split, "fee_transaction"); feeTx != "" {
-		if err := charger.ReverseCharge(ctx, feeTx, orderNumber+"-FEE-REL", services.GetFloat64(split, "fee_amount"), currency); err != nil {
+		if err := feeChargerForSplit(ctx, venueID, split, charger).ReverseCharge(ctx, feeTx, orderNumber+"-FEE-REL", services.GetFloat64(split, "fee_amount"), currency); err != nil {
 			log.Printf("[Reject] fee auth reversal failed order=%s: %v", orderNumber, err)
 			released = false
 		}
@@ -608,12 +628,24 @@ func sendApprovalStatusEmail(ctx context.Context, venueID string, order map[stri
 	if venueDB == nil || services.Email == nil {
 		return
 	}
-	eventName := ""
+	eventName, eventImage, eventDate, eventTime, eventLocation := "", "", "", "", ""
 	if eid := services.GetString(order, "event_id"); eid != "" {
 		if ev, _ := venueDB.QueryOne(ctx, "events", map[string]interface{}{
-			"select": "name", "where": map[string]interface{}{"id": eid},
+			"select": "name,image,cover_image,start_datetime,end_datetime,location,address",
+			"where":  map[string]interface{}{"id": eid},
 		}); ev != nil {
+			services.EnrichEvent(ev)
 			eventName = services.GetString(ev, "name")
+			eventImage = services.GetString(ev, "image")
+			if eventImage == "" {
+				eventImage = services.GetString(ev, "cover_image")
+			}
+			eventDate = services.GetString(ev, "event_date")
+			eventTime = services.GetString(ev, "start_time")
+			eventLocation = services.GetString(ev, "location")
+			if eventLocation == "" {
+				eventLocation = services.GetString(ev, "address")
+			}
 		}
 	}
 	venueName := ""
@@ -627,12 +659,16 @@ func sendApprovalStatusEmail(ctx context.Context, venueID string, order map[stri
 		return
 	}
 	data := services.ApprovalEmailData{
-		CustomerName: services.GetString(order, "user_name"),
-		EventName:    eventName,
-		VenueName:    venueName,
-		OrderNumber:  services.GetString(order, "order_number"),
-		Total:        fmt.Sprintf("%.2f", total),
-		Currency:     currency,
+		CustomerName:  services.GetString(order, "user_name"),
+		EventName:     eventName,
+		EventImage:    eventImage,
+		EventDate:     eventDate,
+		EventTime:     eventTime,
+		VenueName:     venueName,
+		VenueLocation: eventLocation,
+		OrderNumber:   services.GetString(order, "order_number"),
+		Total:         fmt.Sprintf("%.2f", total),
+		Currency:      currency,
 	}
 	switch kind {
 	case "pending":
@@ -640,6 +676,23 @@ func sendApprovalStatusEmail(ctx context.Context, venueID string, order map[stri
 	case "rejected", "expired":
 		_ = services.Email.SendApprovalRejected(ctx, to, data, expired)
 	}
+}
+
+// feeChargerForSplit devuelve el charger por el que se movió el FEE de una
+// orden retenida: la cuenta de plataforma si el split la registró
+// (fee_gateway_venue), o la del venue (fallback) si no.
+func feeChargerForSplit(ctx context.Context, venueID string, split map[string]interface{}, fallback services.DirectCardCharger) services.DirectCardCharger {
+	fv := services.GetString(split, "fee_gateway_venue")
+	if fv == "" {
+		return fallback
+	}
+	if p, err := services.Payments.GetProcessor(ctx, fv); err == nil {
+		if fc, ok := p.(services.DirectCardCharger); ok {
+			return fc
+		}
+	}
+	log.Printf("[Fee] ALERT: no se pudo resolver el gateway de plataforma %s — usando el del venue", fv)
+	return fallback
 }
 
 // safeLookupCode reports whether a user-supplied lookup value (order number,
