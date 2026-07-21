@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"net/http"
@@ -1446,24 +1447,65 @@ func loadRoleMap(ctx context.Context, venueDB *services.SupabaseClient) map[stri
 }
 
 // MobileUploadEventImage handles POST /upload/event-image.
-// The demo doesn't have S3/Supabase storage configured for staff uploads —
-// we accept the payload, return a placeholder image url so the client UI
-// can continue, and log what was attempted.
+// Sube la imagen del evento al Storage PÚBLICO del venue y devuelve su URL.
+// La app leía `url` (no `image_url`) → doble bug: ni se guardaba ni cuadraba
+// el campo. Ahora persiste de verdad y devuelve ambos por compatibilidad.
 func MobileUploadEventImage(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
 	var body struct {
 		ImageBase64 string `json:"image_base64"`
 		ContentType string `json:"content_type"`
 		FileName    string `json:"file_name"`
 	}
-	_ = c.ShouldBindJSON(&body)
-	size := len(body.ImageBase64)
-	log.Printf("[Mobile/UploadEventImage] file=%s ct=%s size=%d (demo: not persisted)", body.FileName, body.ContentType, size)
+	if err := c.ShouldBindJSON(&body); err != nil || body.ImageBase64 == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Falta la imagen"})
+		return
+	}
+
+	venueID := c.GetString("venue_id")
+	venueDB := services.DB.ForVenue(venueID)
+	if venueDB == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid venue"})
+		return
+	}
+
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(body.ImageBase64))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Imagen inválida"})
+		return
+	}
+	if len(raw) > 10*1024*1024 {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "La imagen supera 10MB"})
+		return
+	}
+	contentType := body.ContentType
+	if contentType == "" {
+		contentType = "image/jpeg"
+	}
+	ext := "jpg"
+	switch contentType {
+	case "image/png":
+		ext = "png"
+	case "image/webp":
+		ext = "webp"
+	}
+	// Ruta única por evento/tiempo. safeLookupCode del nombre no hace falta:
+	// generamos la ruta nosotros.
+	path := fmt.Sprintf("events/%d.%s", time.Now().UnixNano(), ext)
+
+	url, upErr := venueDB.UploadPublicObject(ctx, "event-images", path, contentType, raw)
+	if upErr != nil {
+		log.Printf("[Mobile/UploadEventImage] upload failed venue=%s: %v", venueID, upErr)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "No se pudo subir la imagen. Intenta de nuevo."})
+		return
+	}
+	log.Printf("[Mobile/UploadEventImage] OK venue=%s path=%s bytes=%d", venueID, path, len(raw))
 	c.JSON(http.StatusOK, gin.H{
-		"success":    true,
-		"image_url":  "https://images.unsplash.com/photo-1492684223066-81342ee5ff30?w=1200&q=80",
-		"file_name":  body.FileName,
-		"size_bytes": size,
-		"note":       "demo: upload acepted but not persisted, returned placeholder url",
+		"success":   true,
+		"url":       url, // la app lee este
+		"image_url": url, // compat
+		"file_name": body.FileName,
 	})
 }
 

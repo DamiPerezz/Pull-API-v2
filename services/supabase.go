@@ -117,6 +117,52 @@ func (s *SupabaseClient) GetServiceKey() string {
 }
 
 // =============================================
+// STORAGE (imágenes de eventos, etc.)
+// =============================================
+
+// ensureBucket crea el bucket público si no existe (best-effort; ignora el
+// "ya existe").
+func (s *SupabaseClient) ensureBucket(ctx context.Context, bucket string) {
+	body, _ := json.Marshal(map[string]interface{}{"id": bucket, "name": bucket, "public": true})
+	req, err := http.NewRequestWithContext(ctx, "POST", s.baseURL+"/storage/v1/bucket", bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+s.serviceKey)
+	req.Header.Set("apikey", s.serviceKey)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := s.client.Do(req)
+	if err == nil {
+		resp.Body.Close()
+	}
+}
+
+// UploadPublicObject sube bytes a un bucket PÚBLICO de Supabase Storage y
+// devuelve la URL pública. Upsert=true para que reintentos no fallen.
+func (s *SupabaseClient) UploadPublicObject(ctx context.Context, bucket, path, contentType string, data []byte) (string, error) {
+	s.ensureBucket(ctx, bucket)
+	reqURL := s.baseURL + "/storage/v1/object/" + bucket + "/" + path
+	req, err := http.NewRequestWithContext(ctx, "POST", reqURL, bytes.NewReader(data))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+s.serviceKey)
+	req.Header.Set("apikey", s.serviceKey)
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("x-upsert", "true")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return "", fmt.Errorf("storage upload %d: %s", resp.StatusCode, string(b))
+	}
+	return s.baseURL + "/storage/v1/object/public/" + bucket + "/" + path, nil
+}
+
+// =============================================
 // QUERY METHODS (with context support)
 // =============================================
 
