@@ -36,6 +36,24 @@ type CybersourceClient struct {
 	client       *http.Client
 }
 
+// cybsHTTPClient es COMPARTIDO por todos los clientes Cybersource: reutiliza
+// conexiones TLS al host de la pasarela (el http.DefaultTransport da solo 2
+// idle/host → bajo carga casi cada cobro reabría TLS). Timeout 18s por
+// llamada: 2 llamadas por compra caben en el ctx de 60s con margen, y si la
+// pasarela cuelga no atamos una goroutine 30s×2.
+var cybsHTTPClient = &http.Client{
+	Timeout: 18 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:          64,
+		MaxIdleConnsPerHost:   32,
+		MaxConnsPerHost:       64,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   8 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ForceAttemptHTTP2:     true,
+	},
+}
+
 // NewCybersourceClient builds a client. environment "production" targets the
 // live host; anything else targets the test host.
 func NewCybersourceClient(merchantID, keyID, sharedSecret, environment string) *CybersourceClient {
@@ -48,7 +66,7 @@ func NewCybersourceClient(merchantID, keyID, sharedSecret, environment string) *
 		KeyID:        keyID,
 		SharedSecret: sharedSecret,
 		Host:         host,
-		client:       &http.Client{Timeout: 30 * time.Second},
+		client:       cybsHTTPClient,
 	}
 }
 

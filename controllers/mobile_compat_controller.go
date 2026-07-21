@@ -628,6 +628,11 @@ func MobileApproveOrder(c *gin.Context) {
 	// abortaba con la captura ya ejecutada en la pasarela.
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
 	defer cancel()
+	// Aprobar CAPTURA dinero retenido: solo admin/manager, no un portero.
+	if role := c.GetString("role"); role != "admin" && role != "manager" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Solo un admin o manager puede aprobar cobros"})
+		return
+	}
 	venueID := c.GetString("venue_id")
 	if venueID == "" {
 		v, _ := services.DB.Central().QueryOne(ctx, "venues", map[string]interface{}{
@@ -738,6 +743,11 @@ func MobileRejectOrder(c *gin.Context) {
 	// 45s: rechazar libera DOS autorizaciones contra la pasarela (venue+fee).
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 45*time.Second)
 	defer cancel()
+	// Rechazar mueve dinero (reversa de retención): solo admin/manager.
+	if role := c.GetString("role"); role != "admin" && role != "manager" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Solo un admin o manager puede rechazar solicitudes"})
+		return
+	}
 	venueID := c.GetString("venue_id")
 	staffID := c.GetString("staff_id")
 	if venueID == "" {

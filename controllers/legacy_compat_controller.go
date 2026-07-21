@@ -678,6 +678,17 @@ func LegacyCreatePendingOrder(c *gin.Context) {
 		return
 	}
 
+	// SECURITY: endpoint PÚBLICO. Los ids llegan a where-clauses de PostgREST;
+	// sin validar, un valor como "not.is.null" inyecta un operador. safeLookupCode
+	// rechaza cualquier cosa que no sea [A-Za-z0-9_-]. Vacío se permite (se
+	// resuelve por slug o fallback más abajo).
+	for _, v := range []string{req.TicketTypeID, req.EventID, req.VenueID} {
+		if v != "" && !safeLookupCode(v) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Identificador inválido"})
+			return
+		}
+	}
+
 	// Derive missing fields from tickets_data when the frontend doesn't send them
 	// at the top level.
 	if req.Quantity <= 0 {

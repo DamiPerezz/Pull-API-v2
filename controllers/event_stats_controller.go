@@ -42,6 +42,14 @@ func MobileGetEventStats(c *gin.Context) {
 		return
 	}
 
+	// Cache 20s: el panel refresca cada 30s en varios móviles del staff; sin
+	// esto son 6 queries pesadas por móvil compitiendo con el checkout.
+	cacheKey := venueID + ":" + eventID
+	if cached, ok := getCachedStats(cacheKey); ok {
+		c.JSON(http.StatusOK, cached)
+		return
+	}
+
 	// --- Dinero: órdenes del evento por estado. Los totales YA incluyen el
 	// fee; para el venue lo que importa es lo cobrado (confirmed) y lo
 	// retenido a la espera (payment_authorized). Sumamos en Go: un evento
@@ -79,7 +87,7 @@ func MobileGetEventStats(c *gin.Context) {
 		pendingScan = 0
 	}
 
-	c.JSON(http.StatusOK, gin.H{
+	payload := map[string]interface{}{
 		"revenue": gin.H{
 			"captured": round2(capturedTotal), // cobrado de verdad
 			"held":     round2(heldTotal),     // retenido, pendiente de decisión
@@ -99,5 +107,7 @@ func MobileGetEventStats(c *gin.Context) {
 			"rejected":          rejectedOrders,
 			"expired":           expiredOrders,
 		},
-	})
+	}
+	setCachedStats(cacheKey, payload)
+	c.JSON(http.StatusOK, payload)
 }

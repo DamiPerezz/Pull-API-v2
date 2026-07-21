@@ -75,8 +75,11 @@ AP=$(curl -s -X POST "$API/orders/$ORDERP/approve" -H "Authorization: Bearer $TO
 check "aprobar → captura + ticket" "True" "$AP"
 
 echo "== 6. Login cliente + wallet =="
+# Resolver el user_id del email de prueba y leer SU código (no el global más
+# reciente — con actividad concurrente se colaba el código de otro usuario).
+UID_TEST=$(curl -s "$VURL/public_users?select=id&email=eq.$EMAIL" -H "apikey: $VKEY" -H "Authorization: Bearer $VKEY" | python -c "import sys,json;d=json.load(sys.stdin);print(d[0]['id'] if d else '')")
 curl -s -o /dev/null -X POST "$API/user-auth/request-code" -H 'Content-Type: application/json' -d "{\"email\":\"$EMAIL\"}"
-UCODE=$(curl -s "$VURL/verification_codes?select=code&used=eq.false&order=created_at.desc&limit=1" -H "apikey: $VKEY" -H "Authorization: Bearer $VKEY" | python -c "import sys,json;d=json.load(sys.stdin);print(d[0]['code'] if d else '')")
+UCODE=$(curl -s "$VURL/verification_codes?select=code&used=eq.false&user_id=eq.$UID_TEST&order=created_at.desc&limit=1" -H "apikey: $VKEY" -H "Authorization: Bearer $VKEY" | python -c "import sys,json;d=json.load(sys.stdin);print(d[0]['code'] if d else '')")
 CJ=$(mktemp)
 VS=$(curl -s -c "$CJ" -X POST "$API/user-auth/verify-code" -H 'Content-Type: application/json' -d "{\"email\":\"$EMAIL\",\"code\":\"$UCODE\"}" | jget success)
 check "verify-code + cookie" "True" "$VS"

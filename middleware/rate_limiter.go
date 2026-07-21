@@ -96,11 +96,16 @@ func (rl *rateLimiter) allow(key string) bool {
 }
 
 // Global rate limiters
+// Límites por IP REAL (GetRealIP resuelve la IP del comprador vía el proxy,
+// no la de salida de Cloudflare — ver security.go). Calibrados para un
+// evento con miles de personas: generosos para no estrangular a compradores
+// legítimos (incl. NAT compartido de wifi del local o de la operadora), y el
+// anti-carding real vive en pay_guard (por-orden y por-tarjeta), NO aquí.
 var (
-	authLimiter    = newRateLimiter(10, time.Minute)  // 10 auth attempts per minute
-	generalLimiter = newRateLimiter(100, time.Minute) // 100 requests per minute
-	paymentLimiter = newRateLimiter(5, time.Minute)   // 5 payment attempts per minute
-	createLimiter  = newRateLimiter(20, time.Minute)  // 20 creates per minute
+	authLimiter    = newRateLimiter(30, time.Minute)  // 30 auth/min por IP
+	generalLimiter = newRateLimiter(300, time.Minute) // 300 req/min por IP (browsing)
+	paymentLimiter = newRateLimiter(40, time.Minute)  // 40 pagos/min por IP (NAT compartido)
+	createLimiter  = newRateLimiter(80, time.Minute)  // 80 creates/min por IP
 )
 
 // createRateLimitHandler creates a rate limit middleware (factory pattern)

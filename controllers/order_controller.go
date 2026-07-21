@@ -575,30 +575,26 @@ func ConfirmPayment(c *gin.Context) {
 		recordPlatformTransaction(bgCtx, venueID, order, paymentResult)
 	}()
 
-	// Notify venue staff devices about the confirmed purchase (fire-and-forget).
-	go func() {
+	// Notify venue staff devices (por la cola ACOTADA, no goroutine cruda: un
+	// burst de compras confirmadas lanzaría cientos de goroutines pegando a
+	// Supabase+FCM justo en el pico). El nombre del evento sale de cache.
+	orderNumberForPush := services.GetString(order, "order_number")
+	services.RunBackground("order-confirmed-push", func(bgCtx context.Context) error {
 		if services.Push == nil {
-			return
-		}
-		bgCtx, bgCancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer bgCancel()
-		eventName := ""
-		if ev, _ := venueDB.QueryOne(bgCtx, "events", map[string]interface{}{
-			"select": "name", "where": map[string]interface{}{"id": eventID},
-		}); ev != nil {
-			eventName = services.GetString(ev, "name")
+			return nil
 		}
 		body := fmt.Sprintf("%s compró %d ticket(s)", userName, quantity)
-		if eventName != "" {
+		if eventName := cachedEventName(bgCtx, venueDB, eventID); eventName != "" {
 			body += " — " + eventName
 		}
 		services.Push.NotifyVenueStaff(bgCtx, venueID, "Nueva compra confirmada", body, "bookings", map[string]interface{}{
 			"type":         "order_confirmed",
 			"order_id":     orderID,
-			"order_number": services.GetString(order, "order_number"),
+			"order_number": orderNumberForPush,
 			"event_id":     eventID,
 		})
-	}()
+		return nil
+	})
 
 	// Send confirmation email with PDF attached + inline QR codes. Runs on the
 	// bounded task queue (NOT a raw goroutine): PDF+QR rendering is the

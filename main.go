@@ -14,6 +14,13 @@ func main() {
 	// Load configuration
 	config.Load()
 
+	// FAIL-SAFE: en producción, DEMO_MODE=true convertiría /orders/simulate-
+	// payment en un emisor de tickets GRATIS (MockProcessor siempre aprueba).
+	// Mejor no arrancar que abrir esa puerta con dinero real en juego.
+	if config.IsProduction() && config.App.DemoMode {
+		log.Fatal("FATAL: DEMO_MODE=true con ENVIRONMENT=production — abortando (emitiría tickets gratis)")
+	}
+
 	// Set Gin mode
 	if config.IsProduction() {
 		gin.SetMode(gin.ReleaseMode)
@@ -30,8 +37,12 @@ func main() {
 	services.InitCache()
 	log.Println("Cache: Initialized")
 
-	// Initialize background task queue (bounded worker pool)
-	services.InitTaskQueue(0) // 0 = auto-detect workers based on CPU
+	// Initialize background task queue (bounded worker pool).
+	// 16 workers fijos (no auto por CPU): en shared-cpu-1x el auto daba solo 4,
+	// y en un pico de compras los emails con PDF (~1-2s c/u) se encolaban por
+	// encima del drenaje y se DESCARTABAN en silencio → comprador sin ticket.
+	// 16 PDFs concurrentes caben de sobra en 460MiB.
+	services.InitTaskQueue(16)
 
 	if err := services.InitDatabaseRouter(); err != nil {
 		log.Fatal("Failed to initialize database router:", err)
@@ -253,8 +264,6 @@ func setupOrderRoutes(v1 *gin.RouterGroup) {
 		orders.POST("/create", middleware.RateLimitCreate(), controllers.CreateOrder)
 		orders.POST("/checkout", middleware.RateLimitPayment(), controllers.CreateCheckout)
 		orders.GET("/confirm", controllers.ConfirmPayment)
-		// Demo checkout HTML page served by the API when DEMO_MODE is on.
-		orders.GET("/demo-checkout", controllers.DemoCheckoutPage)
 		// Repoblar el checkout tras cancelar (la web lo llama al reintentar).
 		orders.GET("/cancelled/:orderId", middleware.RateLimitGeneral(), controllers.GetCancelledOrderData)
 		orders.GET("/:code", controllers.GetOrder)
@@ -684,7 +693,13 @@ func setupLegacyRoutes(v1 *gin.RouterGroup) {
 	v1.POST("/orders/create-pending-order", middleware.RateLimitCreate(), controllers.LegacyCreatePendingOrder)
 	v1.POST("/orders/create-checkout-session", middleware.RateLimitPayment(), controllers.LegacyCreateCheckoutSession)
 	v1.GET("/orders/confirm-payment", controllers.LegacyConfirmPayment)
-	v1.POST("/orders/simulate-payment", middleware.RateLimitPayment(), controllers.LegacySimulatePayment)
+	// Rutas DEMO (mock: emiten tickets sin pago real) — SOLO con DEMO_MODE.
+	// En producción NO se registran, para que no exista la superficie.
+	if config.App != nil && config.App.DemoMode {
+		v1.POST("/orders/simulate-payment", middleware.RateLimitPayment(), controllers.LegacySimulatePayment)
+		v1.GET("/orders/demo-checkout", controllers.DemoCheckoutPage)
+		log.Println("Routes: DEMO endpoints registered (simulate-payment, demo-checkout)")
+	}
 	// Direct-card payment (NeoNet/Cybersource): two atomic sales per purchase.
 	v1.POST("/orders/pay", middleware.RateLimitPayment(), controllers.PayOrder)
 	v1.GET("/orders/details/:orderId", controllers.LegacyGetOrderDetails)

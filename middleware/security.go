@@ -1,12 +1,14 @@
 package middleware
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
 	"encoding/hex"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"pull-api-v2/config"
 	"regexp"
 	"strings"
@@ -99,6 +101,21 @@ func (s *SecurityConfig) cleanup() {
 
 // GetRealIP extracts the real client IP, only trusting headers from trusted proxies
 func GetRealIP(c *gin.Context) string {
+	// IP real del comprador reenviada por NUESTRO proxy de Cloudflare Pages,
+	// que la prueba con un secreto compartido (un ataque directo a fly.dev no
+	// lo conoce). SIN esto, Fly-Client-IP es la IP de SALIDA de Cloudflare —
+	// la misma para todos los compradores — y colapsa TODOS los cubos de rate
+	// limit: al abrir la venta, cientos de personas compartirían el límite de
+	// "5 pagos/min" → 429 masivo. Ver auditoría escalabilidad 2026-07-21 #1.
+	if secret := os.Getenv("PROXY_SHARED_SECRET"); secret != "" {
+		if auth := c.GetHeader("X-Pull-Proxy-Auth"); auth != "" &&
+			hmac.Equal([]byte(auth), []byte(secret)) {
+			if cip := c.GetHeader("X-Pull-Client-IP"); net.ParseIP(cip) != nil {
+				return cip
+			}
+		}
+	}
+
 	// Fly.io sets Fly-Client-IP itself and it cannot be forged by the
 	// client — prefer it over X-Forwarded-For, which callers can spoof to
 	// rotate rate-limit buckets (see AUDITORIA-2026-07-19 hallazgo A2).

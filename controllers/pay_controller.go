@@ -147,7 +147,14 @@ func PayOrder(c *gin.Context) {
 			"order_number": services.GetString(order, "order_number"), "order_id": req.OrderID})
 		return
 	}
-	if status != "pending" && status != "processing" && status != "" {
+	// 'processing' significa que OTRO request ya está cobrando esta orden (o
+	// ya la cobró y espera confirmación). NO recobrar — evita el doble cargo
+	// por doble-click o reintento de red.
+	if status == "processing" {
+		c.JSON(http.StatusConflict, gin.H{"error": "Este pago ya se está procesando. No vuelvas a pagar; revisa tu correo en unos minutos."})
+		return
+	}
+	if status != "pending" && status != "" {
 		c.JSON(http.StatusConflict, gin.H{"error": "Order is not payable", "status": status})
 		return
 	}
@@ -170,11 +177,16 @@ func PayOrder(c *gin.Context) {
 	}
 	// recordDeclinedAttempt persiste el contador ANTES de responder al
 	// cliente, para que el límite no se pueda esquivar con reintentos rápidos.
+	// Al declinar: incrementa el contador Y devuelve la orden a 'pending'
+	// (liberando el claim atómico) para que el comprador pueda reintentar con
+	// otra tarjeta.
 	recordDeclinedAttempt := func() {
 		priorAttempts++
 		orderMeta["payment_attempts"] = priorAttempts
-		venueDB.UpdateNoReturn(ctx, "orders", map[string]interface{}{"metadata": orderMeta},
-			map[string]interface{}{"id": req.OrderID})
+		venueDB.UpdateNoReturn(ctx, "orders", map[string]interface{}{
+			"metadata": orderMeta,
+			"status":   "pending",
+		}, map[string]interface{}{"id": req.OrderID})
 		log.Printf("[PayOrder] DECLINED order=%s attempts=%d cardkey=%s",
 			services.GetString(order, "order_number"), priorAttempts, cardAttemptKey(card.Number))
 	}
@@ -256,6 +268,33 @@ func PayOrder(c *gin.Context) {
 	// (hold the funds until staff approves).
 	capture := !needsApproval
 
+	// ===== CLAIM ATÓMICO anti DOBLE-COBRO =====
+	// Solo UN request puede pasar de aquí a cobrar esta orden. pending→
+	// processing en un UPDATE condicional; si afecta 0 filas, otro request
+	// (doble-click, retry de red tras un cobro que sí pasó) ya la reclamó →
+	// 409 SIN tocar la pasarela. En declinada, recordDeclinedAttempt la
+	// devuelve a pending para reintentar.
+	claimed, claimErr := venueDB.UpdateCtx(ctx, "orders",
+		map[string]interface{}{"status": "processing"},
+		map[string]interface{}{"id": req.OrderID, "status": "pending"})
+	if claimErr != nil {
+		log.Printf("[PayOrder] claim error order=%s: %v", orderNumber, claimErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "No se pudo procesar el pago. Intenta de nuevo."})
+		return
+	}
+	if len(claimed) == 0 {
+		// Otro request ganó el claim. Releer para responder con precisión.
+		cur, _ := venueDB.QueryOne(ctx, "orders", map[string]interface{}{
+			"select": "status,order_number", "where": map[string]interface{}{"id": req.OrderID}})
+		if services.GetString(cur, "status") == "confirmed" {
+			c.JSON(http.StatusOK, gin.H{"success": true, "message": "Order already confirmed",
+				"order_number": services.GetString(cur, "order_number"), "order_id": req.OrderID})
+			return
+		}
+		c.JSON(http.StatusConflict, gin.H{"error": "Este pago ya se está procesando. No vuelvas a pagar; revisa tu correo en unos minutos."})
+		return
+	}
+
 	// --- Transacción 1: parte del venue ---
 	charge1, err := charger.ChargeCard(ctx, services.ChargeParams{
 		ReferenceCode: orderNumber + "-VENUE",
@@ -267,6 +306,9 @@ func PayOrder(c *gin.Context) {
 	})
 	if err != nil {
 		log.Printf("[PayOrder] charge1 error order=%s: %v", orderNumber, err)
+		// Error transitorio de pasarela: liberar el claim para reintentar.
+		venueDB.UpdateNoReturn(ctx, "orders", map[string]interface{}{"status": "pending"},
+			map[string]interface{}{"id": req.OrderID})
 		c.JSON(http.StatusBadGateway, gin.H{"error": "No se pudo procesar el pago. Intenta de nuevo."})
 		return
 	}
