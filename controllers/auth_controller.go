@@ -657,8 +657,12 @@ func GetUserProfile(c *gin.Context) {
 		return
 	}
 
+	// La web exige `success` en el body (refreshProfile del AuthContext lo
+	// comprueba al montar la app — sin él, descarta la sesión válida y
+	// rebota al login).
 	c.JSON(http.StatusOK, gin.H{
-		"user": user,
+		"success": true,
+		"user":    user,
 	})
 }
 
@@ -752,6 +756,7 @@ func UpdateUserProfile(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
+		"success": true,
 		"message": "Profile updated successfully",
 		"user":    result[0],
 	})
