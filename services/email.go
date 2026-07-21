@@ -300,6 +300,16 @@ func (e *EmailService) SendTickets(ctx context.Context, to string, data TicketEm
 		// Cheap default so the <img> in the template doesn't 404.
 		eventImage = "https://images.unsplash.com/photo-1492684223066-81342ee5ff30?w=1200&q=80"
 	}
+	// Los QR inline van como template.URL: html/template bloquea data-URIs
+	// "no confiables" en src (los sustituye por #ZgotmplZ) y los QR nunca se
+	// pintaban. Son PNGs generados por nosotros — confiables.
+	ticketRows := make([]map[string]interface{}, 0, len(data.Tickets))
+	for _, tk := range data.Tickets {
+		ticketRows = append(ticketRows, map[string]interface{}{
+			"ID": tk.ID, "Type": tk.Type, "OwnerName": tk.OwnerName,
+			"QRCode": tk.QRCode, "QRImageDataURL": template.URL(tk.QRImageDataURL),
+		})
+	}
 	payload := map[string]interface{}{
 		"event_name":       data.EventName,
 		"event_date":       data.EventDate,
@@ -313,11 +323,15 @@ func (e *EmailService) SendTickets(ctx context.Context, to string, data TicketEm
 		"order_number":     data.OrderNumber,
 		"currency":         data.Currency,
 		"total":            data.Total,
-		"tickets":          data.Tickets,
+		"tickets":          ticketRows,
 	}
 
 	// Prefer the v1 template; fall back to the inline "tickets" template if
 	// the embed didn't pick it up for some reason.
+	// IMPORTANTE: compilar ANTES de consultar el mapa — se compila lazy en el
+	// primer render, así que sin esto el PRIMER email tras cada arranque veía
+	// el mapa vacío y caía al fallback (que además salía con campos vacíos).
+	compileTemplatesOnce.Do(compileAllTemplates)
 	tmplName := "tickets_with_pdfs"
 	if _, ok := compiledTemplates[tmplName]; !ok {
 		tmplName = "tickets"
@@ -467,42 +481,42 @@ var emailTemplates = map[string]string{
 
     <div style="font-size:12px;letter-spacing:3px;color:#8b5cf6;font-weight:700;">PULL EVENTS</div>
     <h1 style="font-size:26px;margin:8px 0 8px;color:#fff;">Tus entradas están listas</h1>
-    <p style="color:#a0a0b0;margin:0 0 28px;font-size:15px;">Hola {{.CustomerName}}, gracias por tu compra. Aquí tienes los detalles de tu orden.</p>
+    <p style="color:#a0a0b0;margin:0 0 28px;font-size:15px;">Hola {{.user_name}}, gracias por tu compra. Aquí tienes los detalles de tu orden.</p>
 
     <div style="background:linear-gradient(135deg,rgba(99,102,241,0.12),rgba(139,92,246,0.06));border-left:3px solid #6366f1;padding:16px 18px;border-radius:10px;margin-bottom:24px;">
       <div style="font-size:11px;color:#8b8b9b;letter-spacing:1.2px;margin-bottom:4px;">ORDEN</div>
-      <div style="font-size:18px;font-weight:700;color:#fff;">{{.OrderNumber}}</div>
+      <div style="font-size:18px;font-weight:700;color:#fff;">{{.order_number}}</div>
     </div>
 
     <table style="width:100%;border-collapse:collapse;font-size:14px;margin-bottom:28px;">
       <tr>
         <td style="padding:10px 0;color:#a0a0b0;">Evento</td>
-        <td style="padding:10px 0;text-align:right;color:#fff;font-weight:500;">{{.EventName}}</td>
+        <td style="padding:10px 0;text-align:right;color:#fff;font-weight:500;">{{.event_name}}</td>
       </tr>
       <tr>
         <td style="padding:10px 0;color:#a0a0b0;border-top:1px solid #2a2a3a;">Fecha</td>
-        <td style="padding:10px 0;text-align:right;color:#fff;border-top:1px solid #2a2a3a;">{{.EventDate}}</td>
+        <td style="padding:10px 0;text-align:right;color:#fff;border-top:1px solid #2a2a3a;">{{.event_date}}</td>
       </tr>
       <tr>
         <td style="padding:10px 0;color:#a0a0b0;border-top:1px solid #2a2a3a;">Hora</td>
-        <td style="padding:10px 0;text-align:right;color:#fff;border-top:1px solid #2a2a3a;">{{.EventTime}}</td>
+        <td style="padding:10px 0;text-align:right;color:#fff;border-top:1px solid #2a2a3a;">{{.event_time}}</td>
       </tr>
       <tr>
         <td style="padding:10px 0;color:#a0a0b0;border-top:1px solid #2a2a3a;">Lugar</td>
-        <td style="padding:10px 0;text-align:right;color:#fff;border-top:1px solid #2a2a3a;">{{.VenueName}}</td>
+        <td style="padding:10px 0;text-align:right;color:#fff;border-top:1px solid #2a2a3a;">{{.venue_name}}</td>
       </tr>
       <tr>
         <td style="padding:10px 0;color:#a0a0b0;border-top:1px solid #2a2a3a;">Tipo</td>
-        <td style="padding:10px 0;text-align:right;color:#fff;border-top:1px solid #2a2a3a;">{{.TicketType}}</td>
+        <td style="padding:10px 0;text-align:right;color:#fff;border-top:1px solid #2a2a3a;">{{.ticket_type_name}}</td>
       </tr>
       <tr>
         <td style="padding:14px 0;font-weight:700;color:#fff;border-top:2px solid #6366f1;">Total</td>
-        <td style="padding:14px 0;text-align:right;font-weight:700;font-size:18px;color:#fff;border-top:2px solid #6366f1;">{{.Currency}} {{.Total}}</td>
+        <td style="padding:14px 0;text-align:right;font-weight:700;font-size:18px;color:#fff;border-top:2px solid #6366f1;">{{.currency}} {{.total}}</td>
       </tr>
     </table>
 
     <h2 style="font-size:16px;color:#fff;margin:8px 0 16px;">Códigos QR de tus entradas</h2>
-    {{range $i, $t := .Tickets}}
+    {{range $i, $t := .tickets}}
     <div style="background:#1a1a24;border:1px solid #2a2a3a;border-radius:14px;padding:18px;margin-bottom:14px;display:flex;align-items:center;gap:18px;">
       <div style="background:#fff;padding:6px;border-radius:8px;flex-shrink:0;">
         <img src="{{$t.QRImageDataURL}}" alt="QR" width="120" height="120" style="display:block;width:120px;height:120px;"/>
