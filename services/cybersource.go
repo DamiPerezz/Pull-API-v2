@@ -159,13 +159,14 @@ type CybsBillTo struct {
 
 // CybsSaleResult is the outcome of a sale (auth+capture).
 type CybsSaleResult struct {
-	Success      bool
-	PaymentID    string // Cybersource transaction id (used for reversal/refund)
-	Status       string // AUTHORIZED | DECLINED | ...
-	AuthCode     string
-	CardLast4    string
-	ErrorReason  string
-	ErrorMessage string
+	Success          bool
+	PaymentID        string // Cybersource transaction id (used for reversal/refund)
+	Status           string // AUTHORIZED | DECLINED | ...
+	AuthCode         string
+	CardLast4        string
+	AuthorizedAmount float64 // lo que el emisor aprobó de verdad (parcial < pedido)
+	ErrorReason      string
+	ErrorMessage     string
 }
 
 // cardTypeFor maps a PAN prefix to Cybersource's card type codes.
@@ -234,6 +235,33 @@ func (c *CybersourceClient) Sale(ctx context.Context, referenceCode string, amou
 	}
 	if n := len(card.Number); n >= 4 {
 		result.CardLast4 = card.Number[n-4:]
+	}
+
+	// AUTORIZACIÓN PARCIAL (tarjetas prepago, o el trigger "SDISCOUNT" del
+	// sandbox de VisaNet GT, que con ciertos importes autoriza el 80%): el
+	// emisor aprueba MENOS de lo pedido. NO se decide aquí — se expone el
+	// importe autorizado y el CALLER elige (la parte del venue se rechaza y
+	// reversa; el fee de Pull se acepta recortado y se captura lo autorizado,
+	// porque matar una venta entera por el fee es peor negocio).
+	result.AuthorizedAmount = amount
+	if oi, ok := resp["orderInformation"].(map[string]interface{}); ok {
+		if ad, ok := oi["amountDetails"].(map[string]interface{}); ok {
+			if auth := GetFloat64(ad, "authorizedAmount"); auth > 0 {
+				result.AuthorizedAmount = auth
+			}
+			if result.AuthorizedAmount < amount-0.005 {
+				log.Printf("[Cybersource] PARTIAL AUTH ref=%s pedido=%.2f autorizado=%.2f",
+					referenceCode, amount, result.AuthorizedAmount)
+			}
+		}
+	}
+	// Diagnóstico: cuando el status no es el AUTHORIZED de manual, dejar en
+	// logs qué devolvió la pasarela (sin datos de tarjeta) para conciliar.
+	if result.Status != "AUTHORIZED" {
+		oiJSON, _ := json.Marshal(resp["orderInformation"])
+		procJSON, _ := json.Marshal(resp["processorInformation"])
+		log.Printf("[Cybersource] status=%s ref=%s orderInformation=%s processorInformation=%s",
+			result.Status, referenceCode, oiJSON, procJSON)
 	}
 
 	// 201 + AUTHORIZED es el caso normal; el sandbox de VisaNet GT devuelve

@@ -674,6 +674,12 @@ func GetFloat64(m map[string]interface{}, key string) float64 {
 			return float64(n)
 		case int64:
 			return float64(n)
+		case string:
+			// Cybersource devuelve los importes como strings ("64.00") —
+			// sin esto, authorizedAmount parcial se leía como 0.
+			if f, err := strconv.ParseFloat(n, 64); err == nil {
+				return f
+			}
 		}
 	}
 	return 0

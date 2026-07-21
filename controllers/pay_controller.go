@@ -251,9 +251,24 @@ func PayOrder(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "No se pudo procesar el pago. Intenta de nuevo."})
 		return
 	}
-	if !charge1.Success {
+	// La parte del VENUE debe autorizarse ENTERA: una autorización parcial
+	// (prepago sin saldo, o el trigger SDISCOUNT del sandbox) dejaría al
+	// local cobrando de menos → se trata como rechazo y se libera lo retenido.
+	venuePartial := charge1.Success && charge1.AuthorizedAmount > 0 && charge1.AuthorizedAmount < venueShare-0.005
+	if !charge1.Success || venuePartial {
+		if charge1.TransactionID != "" {
+			rbCtx, rbCancel := context.WithTimeout(context.Background(), 25*time.Second)
+			defer rbCancel()
+			if revErr := charger.ReverseCharge(rbCtx, charge1.TransactionID, orderNumber+"-VENUE-PARB", venueShare, currency); revErr != nil {
+				log.Printf("[PayOrder] ALERT: venue partial/declined reversal failed order=%s tx=%s: %v", orderNumber, charge1.TransactionID, revErr)
+			}
+		}
 		recordDeclinedAttempt()
-		c.JSON(http.StatusPaymentRequired, gin.H{"error": charge1.ErrorMessage, "declined": true})
+		msg := charge1.ErrorMessage
+		if venuePartial {
+			msg = "Tu tarjeta no autorizó el importe completo. Usa otra tarjeta."
+		}
+		c.JSON(http.StatusPaymentRequired, gin.H{"error": msg, "declined": true})
 		return
 	}
 
@@ -280,6 +295,13 @@ func PayOrder(c *gin.Context) {
 			} else {
 				log.Printf("[PayOrder] fee charge failed, venue charge reversed order=%s", orderNumber)
 			}
+			// Si el fee quedó en autorización PARCIAL, también retiene dinero:
+			// liberarlo igual.
+			if charge2 != nil && charge2.TransactionID != "" {
+				if revErr := charger.ReverseCharge(rbCtx, charge2.TransactionID, orderNumber+"-FEE-PARB", feeShare, currency); revErr != nil {
+					log.Printf("[PayOrder] ALERT: fee partial-auth reversal failed order=%s tx=%s: %v", orderNumber, charge2.TransactionID, revErr)
+				}
+			}
 			recordDeclinedAttempt()
 			msg := "No se pudo completar el pago. No se ha realizado ningún cargo."
 			if charge2 != nil && charge2.ErrorMessage != "" {
@@ -293,6 +315,15 @@ func PayOrder(c *gin.Context) {
 	feeTxID := ""
 	if charge2 != nil {
 		feeTxID = charge2.TransactionID
+		// Fee con autorización PARCIAL: se acepta recortado — matar una venta
+		// entera por el fee de Pull es peor negocio. Se registra el importe
+		// REAL autorizado para que capturas y reversas posteriores usen esa
+		// cifra (capturar más de lo autorizado = settlement Failed en el EBC).
+		if charge2.AuthorizedAmount > 0 && charge2.AuthorizedAmount < feeShare-0.005 {
+			log.Printf("[PayOrder] fee PARTIAL order=%s pedido=%.2f autorizado=%.2f — se captura lo autorizado",
+				orderNumber, feeShare, charge2.AuthorizedAmount)
+			feeShare = round2(charge2.AuthorizedAmount)
+		}
 	}
 
 	// Persistir el desglose de las dos transacciones en la orden.

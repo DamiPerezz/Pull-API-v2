@@ -24,12 +24,13 @@ type ChargeParams struct {
 
 // ChargeResult is the outcome of one sale.
 type ChargeResult struct {
-	Success       bool
-	TransactionID string
-	AuthCode      string
-	CardLast4     string
-	CardBrand     string
-	ErrorMessage  string
+	Success          bool
+	TransactionID    string
+	AuthCode         string
+	CardLast4        string
+	CardBrand        string
+	AuthorizedAmount float64 // < Amount pedido si la autorización fue parcial
+	ErrorMessage     string
 }
 
 // DirectCardCharger is implemented by processors that can charge a raw card.

@@ -63,12 +63,13 @@ func (p *NeoNetProcessor) ChargeCard(ctx context.Context, params ChargeParams) (
 		return nil, err
 	}
 	return &ChargeResult{
-		Success:       sale.Success,
-		TransactionID: sale.PaymentID,
-		AuthCode:      sale.AuthCode,
-		CardLast4:     sale.CardLast4,
-		CardBrand:     brandFor(params.Card.Number),
-		ErrorMessage:  sale.ErrorMessage,
+		Success:          sale.Success,
+		TransactionID:    sale.PaymentID,
+		AuthCode:         sale.AuthCode,
+		CardLast4:        sale.CardLast4,
+		CardBrand:        brandFor(params.Card.Number),
+		AuthorizedAmount: sale.AuthorizedAmount,
+		ErrorMessage:     sale.ErrorMessage,
 	}, nil
 }
 
