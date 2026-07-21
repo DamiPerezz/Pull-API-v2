@@ -194,6 +194,7 @@ func setupAuthRoutes(v1 *gin.RouterGroup) {
 	{
 		userAuth.POST("/request-code", middleware.RateLimitAuth(), controllers.RequestCode)
 		userAuth.POST("/verify-code", middleware.RateLimitAuth(), controllers.VerifyCode)
+		userAuth.POST("/logout", controllers.UserLogout)
 		userAuth.GET("/profile", middleware.AuthenticateUser(), controllers.GetUserProfile)
 		userAuth.PUT("/profile", middleware.AuthenticateUser(), controllers.UpdateUserProfile)
 	}
@@ -273,6 +274,8 @@ func setupTicketRoutes(v1 *gin.RouterGroup) {
 	tickets.Use(middleware.AuthenticateUser())
 	{
 		tickets.GET("/my", controllers.GetMyTickets)
+		// Alias: la web llama /tickets/my-tickets (naming v1).
+		tickets.GET("/my-tickets", controllers.GetMyTickets)
 		tickets.GET("/:id/pdf", middleware.ValidateUUIDParam("id"), controllers.GetTicketPDF)
 	}
 

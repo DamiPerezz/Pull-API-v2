@@ -27,10 +27,14 @@ func GetMyTickets(c *gin.Context) {
 		return
 	}
 
+	// venue_id opcional: la web (single-venue) no lo envía.
 	venueID := c.Query("venue_id")
 	if venueID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "venue_id is required"})
-		return
+		if v, _ := services.DB.Central().QueryOne(ctx, "venues", map[string]interface{}{
+			"select": "id", "where": map[string]interface{}{"is_active": true, "deleted_at": "is.null"}, "limit": 1,
+		}); v != nil {
+			venueID = services.GetString(v, "id")
+		}
 	}
 
 	venueDB := services.DB.ForVenue(venueID)
@@ -52,9 +56,9 @@ func GetMyTickets(c *gin.Context) {
 		whereClause["event_id"] = eventID
 	}
 
-	// Get tickets
+	// Get tickets (columnas REALES de la BD viva — pdf_url no existe)
 	tickets, err := venueDB.QueryCtx(ctx, "tickets", map[string]interface{}{
-		"select": "id,order_id,event_id,ticket_type_id,qr_token,source,ticket_type_name,owner_name,owner_email,checked_in_at,pdf_url,created_at",
+		"select": "id,order_id,event_id,ticket_type_id,qr_token,source,ticket_type_name,owner_name,owner_last_name,owner_email,checked_in_at,created_at",
 		"where":  whereClause,
 		"order":  "created_at.desc",
 	})
@@ -77,10 +81,15 @@ func GetMyTickets(c *gin.Context) {
 
 	var events []map[string]interface{}
 	if len(eventIDs) > 0 {
+		// Columnas REALES (event_date/start_time no existen — los deriva
+		// EnrichEvent de start_datetime).
 		events, _ = venueDB.QueryCtx(ctx, "events", map[string]interface{}{
-			"select": "id,name,slug,event_date,start_time,image",
+			"select": "id,name,slug,image,cover_image,start_datetime,end_datetime,location,address",
 			"where":  map[string]interface{}{"id": "in.(" + joinIDs(eventIDs) + ")"},
 		})
+		for _, ev := range events {
+			services.EnrichEvent(ev)
+		}
 	}
 
 	// Build event map for O(1) lookup
@@ -95,6 +104,24 @@ func GetMyTickets(c *gin.Context) {
 		if event, ok := eventMap[evtID]; ok {
 			ticket["event"] = event
 
+			// Compat con el wallet de la web: espera campos planos
+			// (event_name/event_date/start_time/validated_at) y los nests
+			// de los joins v1 (events.image, events.venues.location,
+			// ticket_types.name).
+			img := services.GetString(event, "image")
+			if img == "" {
+				img = services.GetString(event, "cover_image")
+			}
+			ticket["event_name"] = services.GetString(event, "name")
+			ticket["event_date"] = services.GetString(event, "event_date")
+			ticket["start_time"] = services.GetString(event, "start_time")
+			ticket["events"] = map[string]interface{}{
+				"image": img,
+				"venues": map[string]interface{}{
+					"location": services.GetString(event, "location"),
+				},
+			}
+
 			// Filter by upcoming if requested
 			if upcoming == "true" {
 				eventDate := services.GetString(event, "event_date")
@@ -103,6 +130,10 @@ func GetMyTickets(c *gin.Context) {
 				}
 			}
 		}
+		ticket["ticket_types"] = map[string]interface{}{
+			"name": services.GetString(ticket, "ticket_type_name"),
+		}
+		ticket["validated_at"] = ticket["checked_in_at"]
 
 		enrichedTickets = append(enrichedTickets, ticket)
 	}

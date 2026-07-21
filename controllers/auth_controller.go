@@ -591,8 +591,15 @@ func VerifyCode(c *gin.Context) {
 		return
 	}
 
+	// La web NO guarda el token (política anti-XSS): espera una cookie
+	// HttpOnly y comprueba `success` en el body. El middleware ya lee la
+	// cookie "auth_token" como fallback (extractToken).
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie("auth_token", token, 7*24*3600, "/", "", true, true)
+
 	c.JSON(http.StatusOK, gin.H{
-		"token": token,
+		"success": true,
+		"token":   token,
 		"user": gin.H{
 			"id":      userID,
 			"email":   email,
@@ -600,6 +607,14 @@ func VerifyCode(c *gin.Context) {
 			"surname": services.GetString(user, "surname"),
 		},
 	})
+}
+
+// UserLogout clears the HttpOnly auth cookie.
+// POST /api/v1/user-auth/logout
+func UserLogout(c *gin.Context) {
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie("auth_token", "", -1, "/", "", true, true)
+	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
 // GetUserProfile returns the user's profile
@@ -614,10 +629,14 @@ func GetUserProfile(c *gin.Context) {
 		return
 	}
 
+	// venue_id opcional: la web (single-venue) no lo envía.
 	venueID := c.Query("venue_id")
 	if venueID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "venue_id is required"})
-		return
+		if v, _ := services.DB.Central().QueryOne(ctx, "venues", map[string]interface{}{
+			"select": "id", "where": map[string]interface{}{"is_active": true, "deleted_at": "is.null"}, "limit": 1,
+		}); v != nil {
+			venueID = services.GetString(v, "id")
+		}
 	}
 
 	venueDB := services.DB.ForVenue(venueID)
@@ -674,10 +693,14 @@ func UpdateUserProfile(c *gin.Context) {
 		return
 	}
 
+	// venue_id opcional: la web (single-venue) no lo envía.
 	venueID := c.Query("venue_id")
 	if venueID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "venue_id is required"})
-		return
+		if v, _ := services.DB.Central().QueryOne(ctx, "venues", map[string]interface{}{
+			"select": "id", "where": map[string]interface{}{"is_active": true, "deleted_at": "is.null"}, "limit": 1,
+		}); v != nil {
+			venueID = services.GetString(v, "id")
+		}
 	}
 
 	venueDB := services.DB.ForVenue(venueID)
