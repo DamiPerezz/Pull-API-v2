@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -146,5 +147,59 @@ func MobileCreateEmployee(c *gin.Context) {
 		"message":           "Empleado creado",
 		"data":              employee,
 		"generatedPassword": password,
+	})
+}
+
+// MobileResetEmployeePassword — el admin genera una contraseña nueva para un
+// empleado y la recibe UNA vez (las contraseñas se guardan con hash
+// irreversible: no se pueden "ver", solo restablecer).
+// POST /employees/:id/reset-password
+func MobileResetEmployeePassword(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	if role := c.GetString("role"); role != "admin" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Solo un admin puede restablecer contraseñas"})
+		return
+	}
+	venueID := c.GetString("venue_id")
+	venueDB := services.DB.ForVenue(venueID)
+	if venueDB == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid venue"})
+		return
+	}
+	employeeID := c.Param("id")
+
+	emp, err := venueDB.QueryOne(ctx, "organization_workers", map[string]interface{}{
+		"select": "id,first_name,last_name,email",
+		"where":  map[string]interface{}{"id": employeeID, "deleted_at": "is.null"},
+	})
+	if err != nil || emp == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Empleado no encontrado"})
+		return
+	}
+
+	password := genTempPassword()
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "No se pudo procesar la contraseña"})
+		return
+	}
+	if err := venueDB.UpdateNoReturn(ctx, "organization_workers", map[string]interface{}{
+		"password_hash": string(hash),
+	}, map[string]interface{}{"id": employeeID}); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "No se pudo actualizar la contraseña"})
+		return
+	}
+	log.Printf("[Employees] password RESET employee=%s by admin=%s", employeeID, c.GetString("staff_id"))
+
+	c.JSON(http.StatusOK, gin.H{
+		"success":           true,
+		"generatedPassword": password,
+		"employee": gin.H{
+			"id":    services.GetString(emp, "id"),
+			"name":  services.GetString(emp, "first_name") + " " + services.GetString(emp, "last_name"),
+			"email": services.GetString(emp, "email"),
+		},
 	})
 }

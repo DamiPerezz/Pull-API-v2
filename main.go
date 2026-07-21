@@ -366,6 +366,9 @@ func setupStaffRoutes(v1 *gin.RouterGroup) {
 		employees.POST("", controllers.CreateEmployee)
 		employees.PUT("/:id", middleware.ValidateUUIDParam("id"), controllers.UpdateEmployee)
 		employees.DELETE("/:id", middleware.ValidateUUIDParam("id"), controllers.DeleteEmployee)
+		// Restablecer contraseña (solo admin): genera una nueva y la devuelve
+		// UNA vez. Va en este grupo (:id) — otro nombre de wildcard panickea gin.
+		employees.POST("/:id/reset-password", middleware.ValidateUUIDParam("id"), controllers.MobileResetEmployeePassword)
 	}
 
 	// Roles endpoint
