@@ -579,6 +579,9 @@ func setupMobileRoutes(v1 *gin.RouterGroup) {
 	authed.Use(middleware.AuthenticateStaff())
 	{
 		// Events CRUD (mobile staff)
+		// Panel de control del evento (dinero cobrado/retenido + personas
+		// por estado) para el staff.
+		authed.GET("/event/stats/:eventId", middleware.ValidateUUIDParam("eventId"), controllers.MobileGetEventStats)
 		authed.POST("/event/create-event", controllers.MobileCreateEvent)
 		authed.POST("/event/create-event-with-tickets", controllers.MobileCreateEventWithTickets)
 		authed.PUT("/event/update-event/:eventId", middleware.ValidateUUIDParam("eventId"), controllers.MobileUpdateEvent)

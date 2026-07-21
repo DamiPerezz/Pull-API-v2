@@ -57,17 +57,28 @@ func MobileCreateEmployee(c *gin.Context) {
 		return
 	}
 
+	// Acepta camelCase Y snake_case: el formulario manda firstName pero el
+	// store de la app lo convertía a first_name → llegaba vacío y saltaba
+	// "Nombre, apellido y email son obligatorios" con los campos rellenos.
 	var req struct {
-		FirstName string `json:"firstName"`
-		LastName  string `json:"lastName"`
-		Email     string `json:"email"`
-		DPI       string `json:"dpi"`
-		Role      string `json:"role"`
-		Password  string `json:"password"`
+		FirstName      string `json:"firstName"`
+		FirstNameSnake string `json:"first_name"`
+		LastName       string `json:"lastName"`
+		LastNameSnake  string `json:"last_name"`
+		Email          string `json:"email"`
+		DPI            string `json:"dpi"`
+		Role           string `json:"role"`
+		Password       string `json:"password"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Datos inválidos"})
 		return
+	}
+	if req.FirstName == "" {
+		req.FirstName = req.FirstNameSnake
+	}
+	if req.LastName == "" {
+		req.LastName = req.LastNameSnake
 	}
 	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
 	if req.FirstName == "" || req.LastName == "" || req.Email == "" {
