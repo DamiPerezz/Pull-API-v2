@@ -255,6 +255,8 @@ func setupOrderRoutes(v1 *gin.RouterGroup) {
 		orders.GET("/confirm", controllers.ConfirmPayment)
 		// Demo checkout HTML page served by the API when DEMO_MODE is on.
 		orders.GET("/demo-checkout", controllers.DemoCheckoutPage)
+		// Repoblar el checkout tras cancelar (la web lo llama al reintentar).
+		orders.GET("/cancelled/:orderId", middleware.RateLimitGeneral(), controllers.GetCancelledOrderData)
 		orders.GET("/:code", controllers.GetOrder)
 	}
 
@@ -276,7 +278,9 @@ func setupTicketRoutes(v1 *gin.RouterGroup) {
 		tickets.GET("/my", controllers.GetMyTickets)
 		// Alias: la web llama /tickets/my-tickets (naming v1).
 		tickets.GET("/my-tickets", controllers.GetMyTickets)
-		tickets.GET("/:id/pdf", middleware.ValidateUUIDParam("id"), controllers.GetTicketPDF)
+		// Genera el PDF al vuelo (la columna pdf_url del handler viejo no existe).
+		tickets.GET("/:id/pdf", middleware.ValidateUUIDParam("id"), controllers.DownloadTicketPDF)
+		tickets.GET("/:id/download-pdf", middleware.ValidateUUIDParam("id"), controllers.DownloadTicketPDF)
 	}
 
 	// Public ticket lookup (by QR)
@@ -336,6 +340,9 @@ func setupStaffRoutes(v1 *gin.RouterGroup) {
 	}
 
 	// User notifications
+	// Wallet: gasto por venue del usuario autenticado.
+	v1.GET("/users/spending/venues", middleware.AuthenticateUser(), controllers.GetUserVenueSpending)
+
 	userNotifications := v1.Group("/users/notifications")
 	userNotifications.Use(middleware.AuthenticateUser())
 	{

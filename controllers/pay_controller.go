@@ -490,35 +490,38 @@ func captureHeldOrder(ctx context.Context, venueID string, order map[string]inte
 }
 
 // reverseHeldOrder releases the two held authorizations of a private-event
-// order (on staff rejection). No-op ok=false if there are no held auths.
-func reverseHeldOrder(ctx context.Context, venueID string, order map[string]interface{}) bool {
+// order (on staff rejection). Returns (held, released): held=false si no hay
+// autorizaciones que liberar; released=false si ALGUNA reversa falló en la
+// pasarela (queda released_ok=false en metadata y ALERT en logs — la
+// autorización caducará sola del lado del emisor, pero no digas "liberada").
+func reverseHeldOrder(ctx context.Context, venueID string, order map[string]interface{}) (held bool, released bool) {
 	metadata, _ := order["metadata"].(map[string]interface{})
 	split, _ := metadata["payment_split"].(map[string]interface{})
 	if split == nil || services.GetString(split, "gateway") != "neonet" {
-		return false
+		return false, false
 	}
 	// If already captured, a reversal won't work — would need a refund.
 	if captured, _ := split["captured"].(bool); captured {
-		return false
+		return false, false
 	}
 	venueTx := services.GetString(split, "venue_transaction")
 	if venueTx == "" {
-		return false
+		return false, false
 	}
 	processor, err := services.Payments.GetProcessor(ctx, venueID)
 	if err != nil {
-		return false
+		return false, false
 	}
 	charger, isCharger := processor.(services.DirectCardCharger)
 	if !isCharger {
-		return false
+		return false, false
 	}
 	orderNumber := services.GetString(order, "order_number")
 	currency := services.GetString(order, "currency")
 	if currency == "" {
 		currency = "GTQ"
 	}
-	released := true
+	released = true
 	if err := charger.ReverseCharge(ctx, venueTx, orderNumber+"-VENUE-REL", services.GetFloat64(split, "venue_amount"), currency); err != nil {
 		log.Printf("[Reject] venue auth reversal failed order=%s: %v", orderNumber, err)
 		released = false
@@ -538,7 +541,11 @@ func reverseHeldOrder(ctx context.Context, venueID string, order map[string]inte
 		venueDB.UpdateNoReturn(ctx, "orders", map[string]interface{}{"metadata": metadata},
 			map[string]interface{}{"id": services.GetString(order, "id")})
 	}
-	return true
+	if !released {
+		log.Printf("[Reject] ALERT: REVERSAL INCOMPLETE order=%s — revisar en EBC y reversar a mano si sigue retenida",
+			orderNumber)
+	}
+	return true, released
 }
 
 func orDefault(v, def string) string {

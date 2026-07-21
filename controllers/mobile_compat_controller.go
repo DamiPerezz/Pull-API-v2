@@ -770,8 +770,8 @@ func MobileRejectOrder(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": "Esta solicitud ya está siendo procesada"})
 			return
 		}
-		if reverseHeldOrder(ctx, venueID, held) {
-			log.Printf("[Mobile/RejectOrder] released held authorizations for order=%s", orderID)
+		if wasHeld, released := reverseHeldOrder(ctx, venueID, held); wasHeld {
+			log.Printf("[Mobile/RejectOrder] held authorizations release attempted order=%s released=%v", orderID, released)
 			cur := services.GetString(held, "currency")
 			if cur == "" {
 				cur = "GTQ"
@@ -781,6 +781,13 @@ func MobileRejectOrder(c *gin.Context) {
 				defer bgCancel()
 				sendApprovalStatusEmail(bgCtx, venueID, held, services.GetFloat64(held, "total"), cur, "rejected", false)
 			}()
+			if !released {
+				// El rechazo sigue adelante (la auth caduca sola en el emisor),
+				// pero el staff debe saber que la liberación no se confirmó.
+				defer func() {
+					log.Printf("[Mobile/RejectOrder] order=%s cancelled with UNCONFIRMED reversal", orderID)
+				}()
+			}
 		}
 	}
 

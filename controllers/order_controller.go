@@ -841,6 +841,7 @@ func GetVenueOrders(c *gin.Context) {
 func ApproveOrder(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
+	_ = ctx
 
 	venueID := c.GetString("venue_id")
 	staffID := c.GetString("staff_id")
@@ -857,29 +858,15 @@ func ApproveOrder(c *gin.Context) {
 		return
 	}
 
-	// Update order
-	result, err := venueDB.UpdateCtx(ctx, "orders", map[string]interface{}{
-		"status":      "payment_authorized",
-		"approved_by": staffID,
-		"approved_at": time.Now().Format(time.RFC3339),
-	}, map[string]interface{}{
-		"id":     orderID,
-		"status": "pending",
-	})
-
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to approve order"})
-		return
-	}
-
-	if len(result) == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Order not found or not pending"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"message": "Order approved",
-		"order":   result[0],
+	// RETIRADO: este flujo legacy ponía una orden PENDING (sin pago) en
+	// payment_authorized (que significa "fondos retenidos en la pasarela") y
+	// escribía columnas que no existen en la BD viva. La aprobación real es
+	// POST /orders/:orderId/approve (móvil) sobre órdenes payment_authorized.
+	_ = staffID
+	_ = venueDB
+	_ = orderID
+	c.JSON(http.StatusGone, gin.H{
+		"error": "Flujo retirado. Las órdenes se aprueban desde la app de staff (requieren pago retenido).",
 	})
 }
 
@@ -924,13 +911,16 @@ func RejectOrder(c *gin.Context) {
 	ticketTypeID := services.GetString(order, "ticket_type_id")
 	quantity := services.GetInt(order, "quantity")
 
-	// Update order
+	// Update order — solo columnas REALES de la BD viva (rejected_by/
+	// rejected_at/reject_reason no existen); quién rechazó va en la razón.
+	reason := req.Reason
+	if reason == "" {
+		reason = "Rechazada por staff"
+	}
 	result, err := venueDB.UpdateCtx(ctx, "orders", map[string]interface{}{
-		"status":        "cancelled",
-		"rejected_by":   staffID,
-		"rejected_at":   time.Now().Format(time.RFC3339),
-		"reject_reason": req.Reason,
-		"cancelled_at":  time.Now().Format(time.RFC3339),
+		"status":              "cancelled",
+		"cancellation_reason": fmt.Sprintf("%s (staff %s)", reason, staffID),
+		"cancelled_at":        time.Now().Format(time.RFC3339),
 	}, map[string]interface{}{
 		"id": orderID,
 	})
@@ -1102,7 +1092,7 @@ func handleStripeCheckoutCompleted(ctx context.Context, venueID string, rawData 
 
 	// Update order status atomically
 	_, err = venueDB.UpdateCtx(ctx, "orders", map[string]interface{}{
-		"status":     "confirming",
+		"status":     "processing", // claim idempotente ("confirming" no existe en el enum)
 		"updated_at": time.Now(),
 	}, map[string]interface{}{
 		"id":     orderID,
@@ -1292,7 +1282,7 @@ func handleNeoNetPaymentCompleted(ctx context.Context, venueID string, data map[
 
 	// Update order status atomically
 	_, err := venueDB.UpdateCtx(ctx, "orders", map[string]interface{}{
-		"status":                  "confirming",
+		"status":                  "processing", // claim idempotente ("confirming" no existe en el enum)
 		"neonet_transaction_id":   transactionID,
 		"neonet_authorization_code": services.GetString(data, "authorization_code"),
 		"updated_at":              time.Now(),

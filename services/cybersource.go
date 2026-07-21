@@ -276,6 +276,7 @@ func (c *CybersourceClient) Reverse(ctx context.Context, paymentID, referenceCod
 	if status != 201 {
 		return fmt.Errorf("reversal HTTP %d status=%s", status, GetString(resp, "status"))
 	}
+	log.Printf("[Cybersource] reversal OK ref=%s status=%s", referenceCode, GetString(resp, "status"))
 	return nil
 }
 
@@ -298,6 +299,9 @@ func (c *CybersourceClient) Capture(ctx context.Context, paymentID, referenceCod
 	if status != 201 {
 		return fmt.Errorf("capture HTTP %d status=%s", status, GetString(resp, "status"))
 	}
+	// El status del body queda en logs para conciliar contra el EBC
+	// (capturas suelen volver PENDING hasta el settlement del batch).
+	log.Printf("[Cybersource] capture OK ref=%s status=%s", referenceCode, GetString(resp, "status"))
 	return nil
 }
 
@@ -319,5 +323,6 @@ func (c *CybersourceClient) Refund(ctx context.Context, paymentID, referenceCode
 	if status != 201 {
 		return fmt.Errorf("refund HTTP %d status=%s", status, GetString(resp, "status"))
 	}
+	log.Printf("[Cybersource] refund OK ref=%s status=%s", referenceCode, GetString(resp, "status"))
 	return nil
 }

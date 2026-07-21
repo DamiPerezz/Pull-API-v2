@@ -78,7 +78,7 @@ func expireOverdueAuthorizations() {
 				continue
 			}
 			// Release the held authorizations (venue + fee).
-			released := reverseHeldOrder(ctx, venueID, order)
+			_, released := reverseHeldOrder(ctx, venueID, order)
 			venueDB.UpdateNoReturn(ctx, "orders", map[string]interface{}{
 				"status":              "expired",
 				"cancelled_at":        now.Format(time.RFC3339),

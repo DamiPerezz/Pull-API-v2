@@ -1,4 +1,12 @@
 -- =============================================
+-- TEMPLATE CANONICO de BD por venue (2026-07-21)
+-- venue_database_template.sql queda DEPRECADO (era el esquema viejo con el
+-- que se creo la BD viva de 511 — por eso la BD viva NO tiene approved_by/
+-- rejected_by en orders ni rejected_at en guest_list_signups; el codigo
+-- escribe esa trazabilidad en metadata y debe seguir haciendolo).
+-- =============================================
+
+-- =============================================
 -- PULL - VENUE DATABASE TEMPLATE
 -- =============================================
 -- Este schema se usa para crear una nueva base de datos por cada venue
