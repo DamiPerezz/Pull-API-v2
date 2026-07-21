@@ -1,22 +1,13 @@
 -- =============================================
--- DEPRECADO — NO USAR ESTE ARCHIVO
+-- DEPRECADO — usar sql/venue_template.sql
 -- =============================================
--- El template canónico para crear la BD de un venue nuevo es:
+-- Historia: ESTE archivo era el esquema con el que se creó la BD viva de
+-- 511 Events. El 2026-07-21 su contenido (verificado idéntico a la BD viva
+-- columna a columna) se movió a sql/venue_template.sql como canónico único,
+-- añadiendo las migraciones manuales posteriores (enum order_status completo
+-- + staff_push_tokens). El archivo que antes se llamaba venue_template.sql
+-- describía un esquema que no coincidía ni con la BD viva ni con el código
+-- (origen de los bugs de "columna fantasma") y fue reemplazado.
 --
---     sql/venue_template.sql
---
--- Este archivo era una versión ANTERIOR del esquema (enum order_status sin
--- payment_authorized/payment_failed/checked_in, orders sin approved_by/
--- rejected_by, guest_list_signups sin rejected_at...). La BD viva de
--- 511 Events se creó con esta versión vieja, y de esa divergencia salieron
--- varios bugs de "columna fantasma" (ver reauditoría 2026-07-20/21 y
--- HANDOFF.md).
---
--- Reglas desde 2026-07-21:
---   1. Venues NUEVOS → ejecutar sql/venue_template.sql (completo).
---   2. El CÓDIGO no debe asumir columnas que no estén en la BD viva de 511
---      (la más pobre): trazabilidad tipo approved_by/rejected_by va en
---      metadata (jsonb), no en columnas.
---   3. Si venue_template.sql cambia, verificar el diff contra la BD viva
---      antes de tocar handlers.
+-- Venues nuevos → ejecutar sql/venue_template.sql entero.
 -- =============================================
