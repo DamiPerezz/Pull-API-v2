@@ -68,8 +68,9 @@ func main() {
 		log.Printf("Warning: PDF service init failed: %v", err)
 	}
 
-	// Initialize Expo push service (notifies staff devices on new orders).
+	// Initialize push: FCM (Android) + APNs (iOS, feature-flag por APNS_* vars).
 	services.InitPushService()
+	services.InitAPNs()
 
 	// Start the 48h approval-expiry sweep for held private-event payments.
 	controllers.StartApprovalExpiryJob()

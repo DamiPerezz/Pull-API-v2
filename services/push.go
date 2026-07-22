@@ -187,7 +187,7 @@ func (p *PushService) NotifyVenueStaff(ctx context.Context, venueID, title, body
 		return
 	}
 	rows, err := venueDB.QueryCtx(ctx, "staff_push_tokens", map[string]interface{}{
-		"select": "push_token",
+		"select": "push_token,device_type",
 		"where":  map[string]interface{}{"is_active": true},
 	})
 	if err != nil {
@@ -195,45 +195,82 @@ func (p *PushService) NotifyVenueStaff(ctx context.Context, venueID, title, body
 		return
 	}
 
+	// Separar por plataforma: iOS → APNs directo, resto → FCM. Un mismo token
+	// no se envía dos veces (dedup por push_token).
 	seen := map[string]bool{}
-	var tokens []string
+	var fcmTokens, iosTokens []string
 	for _, r := range rows {
 		t := GetString(r, "push_token")
 		if t == "" || seen[t] {
 			continue
 		}
 		seen[t] = true
-		tokens = append(tokens, t)
+		if GetString(r, "device_type") == "ios" {
+			iosTokens = append(iosTokens, t)
+		} else {
+			fcmTokens = append(fcmTokens, t)
+		}
 	}
-	if len(tokens) == 0 {
+	if len(fcmTokens) == 0 && len(iosTokens) == 0 {
 		log.Printf("[Push] no active tokens for venue=%s", venueID)
 		return
 	}
 
-	accessToken, err := p.getAccessToken(ctx)
-	if err != nil {
-		log.Printf("[Push] cannot get FCM access token: %v", err)
-		return
+	deactivate := func(token string) {
+		venueDB.UpdateNoReturn(ctx, "staff_push_tokens", map[string]interface{}{
+			"is_active": false,
+		}, map[string]interface{}{"push_token": token})
 	}
 
 	sent := 0
-	for _, token := range tokens {
-		status, err := p.sendOne(ctx, accessToken, token, title, body, channelID, data)
+
+	// --- Android / FCM ---
+	if len(fcmTokens) > 0 {
+		accessToken, err := p.getAccessToken(ctx)
 		if err != nil {
-			log.Printf("[Push] send error: %v", err)
-			continue
+			log.Printf("[Push] cannot get FCM access token: %v", err)
+		} else {
+			for _, token := range fcmTokens {
+				status, err := p.sendOne(ctx, accessToken, token, title, body, channelID, data)
+				if err != nil {
+					log.Printf("[Push] FCM send error: %v", err)
+					continue
+				}
+				if status == http.StatusOK {
+					sent++
+					continue
+				}
+				if status == http.StatusNotFound || status == http.StatusBadRequest {
+					deactivate(token)
+				}
+				log.Printf("[Push] FCM returned HTTP %d for a token", status)
+			}
 		}
-		if status == http.StatusOK {
-			sent++
-			continue
-		}
-		// 404 (UNREGISTERED) / 400 (invalid) → token is dead, deactivate it.
-		if status == http.StatusNotFound || status == http.StatusBadRequest {
-			venueDB.UpdateNoReturn(ctx, "staff_push_tokens", map[string]interface{}{
-				"is_active": false,
-			}, map[string]interface{}{"push_token": token})
-		}
-		log.Printf("[Push] FCM returned HTTP %d for a token", status)
 	}
-	log.Printf("[Push] NotifyVenueStaff venue=%s sent=%d/%d", venueID, sent, len(tokens))
+
+	// --- iOS / APNs (feature-flag: solo si APNS_* está configurado) ---
+	if len(iosTokens) > 0 {
+		if !apnsEnabled() {
+			log.Printf("[Push] %d token(s) iOS sin enviar: APNs no configurado (faltan APNS_* secrets)", len(iosTokens))
+		} else {
+			for _, token := range iosTokens {
+				status, err := apns.send(ctx, token, title, body, data)
+				if err != nil {
+					log.Printf("[APNs] send error: %v", err)
+					continue
+				}
+				if status == http.StatusOK {
+					sent++
+					continue
+				}
+				// 410 Unregistered / 400 BadDeviceToken → token muerto.
+				if status == http.StatusGone || status == http.StatusBadRequest {
+					deactivate(token)
+				}
+				log.Printf("[APNs] returned HTTP %d for a token", status)
+			}
+		}
+	}
+
+	log.Printf("[Push] NotifyVenueStaff venue=%s sent=%d/%d (fcm=%d ios=%d)", venueID, sent, len(fcmTokens)+len(iosTokens), len(fcmTokens), len(iosTokens))
 }
