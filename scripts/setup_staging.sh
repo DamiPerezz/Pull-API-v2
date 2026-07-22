@@ -136,8 +136,11 @@ sql  = open(path, encoding="utf-8").read()
 
 def run(q):
     body = json.dumps({"query": q}).encode()
+    # User-Agent de navegador: el Cloudflare de api.supabase.com bloquea la
+    # firma por defecto de urllib/curl con un 403 "error code: 1010".
     req = urllib.request.Request(url, data=body, method="POST", headers={
-        "Authorization": "Bearer " + tok, "Content-Type": "application/json"})
+        "Authorization": "Bearer " + tok, "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     try:
         with urllib.request.urlopen(req, timeout=180) as r:
             return r.status, r.read().decode(errors="replace")
