@@ -54,3 +54,7 @@ fly.state
 # ===== DEMO SCRATCH =====
 /cmd/hashpwd/hashpwd
 /cmd/hashpwd/hashpwd.exe
+
+# Claves Apple (.p8 App Store Connect / APNs) — NUNCA a git
+*.p8
+*.p8.txt
