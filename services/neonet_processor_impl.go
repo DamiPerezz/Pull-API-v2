@@ -92,6 +92,17 @@ func (p *NeoNetProcessor) ReverseCharge(ctx context.Context, transactionID, refe
 	return cli.Reverse(ctx, transactionID, referenceCode, amount, currency)
 }
 
+// RefundCharge deshace una venta ya capturada (rollback del par atómico en
+// público cuando la 2ª tx falla tras capturarse la 1ª). Usa /refunds, no
+// /reversals — una venta liquidada no se revierte con un auth-reversal.
+func (p *NeoNetProcessor) RefundCharge(ctx context.Context, transactionID, referenceCode string, amount float64, currency string) error {
+	cli, err := p.client()
+	if err != nil {
+		return err
+	}
+	return cli.Refund(ctx, transactionID, referenceCode, amount, currency)
+}
+
 // neonetConfirmPayment resolves a session charged by PayOrder.
 func (p *NeoNetProcessor) neonetConfirmPayment(sessionID string) (*models.PaymentResult, error) {
 	if v, ok := neonetVerified.LoadAndDelete(sessionID); ok {

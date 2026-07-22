@@ -118,7 +118,9 @@ type EmailResponse struct {
 // Resend transactional API.
 func (e *EmailService) Send(ctx context.Context, req EmailRequest) (string, error) {
 	// Brevo first (preferred for the demo deployment).
+	brevoAttempted := false
 	if config.App.BrevoAPIKey != "" {
+		brevoAttempted = true
 		id, err := e.sendViaBrevo(ctx, req)
 		if err == nil {
 			return id, nil
@@ -127,9 +129,15 @@ func (e *EmailService) Send(ctx context.Context, req EmailRequest) (string, erro
 		log.Printf("[Email] Brevo failed, falling back to Resend: %v", err)
 	}
 
-	// If no API key, just log
+	// Sin key de Resend: solo se puede "mockear" en desarrollo real (ningún
+	// proveedor configurado). Si Brevo ESTABA configurado y falló, esto es un
+	// fallo de entrega REAL — NUNCA devolver éxito falso, o el caller marca el
+	// ticket como entregado cuando el comprador se quedó sin su QR.
 	if e.apiKey == "" {
-		log.Printf("[Email] Would send to %v: %s", req.To, req.Subject)
+		if brevoAttempted {
+			return "", fmt.Errorf("email NO enviado: Brevo falló y no hay RESEND_API_KEY de fallback")
+		}
+		log.Printf("[Email] Would send to %v: %s (sin proveedor de email configurado)", req.To, req.Subject)
 		return "mock-email-id", nil
 	}
 

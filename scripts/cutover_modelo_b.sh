@@ -442,6 +442,22 @@ PY
 # MODO cliente
 # ═════════════════════════════════════════════════════════════════════
 mode_cliente() {
+  # GUARDA: el swap al cliente SOLO es correcto DESPUÉS de pull-como-venue.
+  # Sin PLATFORM_FEE_VENUE_ID configurado, el fee 8% se cobraría por la fila
+  # del venue = por la cuenta del CLIENTE → Pull NO cobra su comisión.
+  local pf_uuid
+  pf_uuid=$(grep '^PLATFORM_FEE_VENUE_ID_VALUE=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r' || true)
+  if [ -z "$pf_uuid" ]; then
+    echo "⛔ ABORTADO: no encuentro PLATFORM_FEE_VENUE_ID_VALUE en $ENV_FILE."
+    echo "   El modo 'cliente' solo es correcto DESPUÉS de haber ejecutado"
+    echo "   'pull-como-venue' (que crea la fila Pull Platform y setea el"
+    echo "   puntero del fee). Sin eso, el fee 8% se cobraría por la cuenta"
+    echo "   del cliente y Pull NO cobraría su comisión."
+    echo "   Si de verdad sabes lo que haces: exporta ALLOW_CLIENTE_SIN_FEE=1."
+    [ "${ALLOW_CLIENTE_SIN_FEE:-}" = "1" ] || exit 1
+    echo "   (ALLOW_CLIENTE_SIN_FEE=1 — continuando bajo tu responsabilidad)"
+  fi
+
   confirm_or_abort "CLIENTE" \
 "Vas a cambiar SOLO la fila del venue ($VENUE_ROW_ID) a las credenciales de
    PRODUCCIÓN del CLIENTE 511. La fila Pull Platform y PLATFORM_FEE_VENUE_ID

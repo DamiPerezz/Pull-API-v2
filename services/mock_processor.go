@@ -123,6 +123,11 @@ func (p *MockProcessor) ReverseCharge(ctx context.Context, transactionID, refere
 	return nil
 }
 
+// RefundCharge is a no-op in demo mode.
+func (p *MockProcessor) RefundCharge(ctx context.Context, transactionID, referenceCode string, amount float64, currency string) error {
+	return nil
+}
+
 func (p *MockProcessor) ProcessRefund(ctx context.Context, transactionID string, amount float64) error {
 	return nil
 }

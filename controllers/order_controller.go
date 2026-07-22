@@ -695,7 +695,7 @@ func ConfirmPayment(c *gin.Context) {
 		}
 
 		totalStr := fmt.Sprintf("%.2f", services.GetFloat64(order, "total"))
-		return services.Email.SendTickets(bgCtx, userEmail, services.TicketEmailData{
+		emailErr := services.Email.SendTickets(bgCtx, userEmail, services.TicketEmailData{
 			OrderNumber:   services.GetString(order, "order_number"),
 			CustomerName:  userName,
 			EventName:     eventName,
@@ -709,6 +709,16 @@ func ConfirmPayment(c *gin.Context) {
 			Total:         totalStr,
 			Tickets:       emailTickets,
 		}, pdfBytes)
+
+		// El QR viaja SOLO por email. Si el envío falla, el comprador YA pagó y
+		// los tickets YA están en la BD (reenviables): dejar rastro accionable
+		// LOUD en logs para reenviar durante el evento (cmd/resend). El propio
+		// número de orden basta para reenviar. Nunca dejar el fallo en silencio.
+		if emailErr != nil {
+			log.Printf("[Email] ALERT ticket email FAILED order=%s to=%s: %v — REENVIAR (cmd/resend %s)",
+				services.GetString(order, "order_number"), userEmail, emailErr, services.GetString(order, "order_number"))
+		}
+		return emailErr
 	})
 
 	c.JSON(http.StatusOK, gin.H{

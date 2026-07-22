@@ -345,16 +345,20 @@ func PayOrder(c *gin.Context) {
 			Capture:       capture,
 		})
 		if err != nil || !charge2.Success {
-			// Rollback: reversar la primera venta/autorización con un contexto
-			// PROPIO (no el de la request, que puede estar casi agotado tras 2
-			// llamadas lentas al gateway) para no dejar el cargo sin reversar.
+			// Rollback: deshacer la 1ª tx con un contexto PROPIO (no el de la
+			// request, casi agotado tras 2 llamadas lentas al gateway) para no
+			// dejar el cargo sin deshacer. CLAVE: en público (capture=true) la
+			// 1ª venta YA está LIQUIDADA → hay que REEMBOLSAR (refund), no
+			// reversar (un auth-reversal no deshace una venta capturada → el
+			// comprador quedaría cobrado sin ticket). En privado (capture=false)
+			// es una autorización retenida → reverse.
 			rbCtx, rbCancel := context.WithTimeout(context.Background(), 25*time.Second)
 			defer rbCancel()
-			if revErr := charger.ReverseCharge(rbCtx, charge1.TransactionID, orderNumber+"-VENUE-RB", venueShare, currency); revErr != nil {
-				log.Printf("[PayOrder] ALERT: fee charge failed AND reversal failed order=%s tx=%s: %v",
-					orderNumber, charge1.TransactionID, revErr)
+			if undoErr := undoVenueCharge(rbCtx, charger, capture, charge1.TransactionID, orderNumber+"-VENUE-RB", venueShare, currency); undoErr != nil {
+				log.Printf("[PayOrder] ALERT: fee charge failed AND venue undo (capture=%v) failed order=%s tx=%s: %v — REEMBOLSAR MANUAL EN EBC",
+					capture, orderNumber, charge1.TransactionID, undoErr)
 			} else {
-				log.Printf("[PayOrder] fee charge failed, venue charge reversed order=%s", orderNumber)
+				log.Printf("[PayOrder] fee charge failed, venue charge undone (capture=%v) order=%s", capture, orderNumber)
 			}
 			// Si el fee quedó en autorización PARCIAL, también retiene dinero:
 			// liberarlo igual.
@@ -718,6 +722,17 @@ func sendApprovalStatusEmail(ctx context.Context, venueID string, order map[stri
 	case "rejected", "expired":
 		_ = services.Email.SendApprovalRejected(ctx, to, data, expired)
 	}
+}
+
+// undoVenueCharge deshace la 1ª tx (entrada) según cómo se cobró: si fue
+// captura inmediata (público) hay que REEMBOLSAR; si fue solo autorización
+// (privado, retención) basta con reversar. Usar el método equivocado deja al
+// comprador cobrado sin ticket (reverse sobre venta liquidada = no-op).
+func undoVenueCharge(ctx context.Context, charger services.DirectCardCharger, captured bool, txID, ref string, amount float64, currency string) error {
+	if captured {
+		return charger.RefundCharge(ctx, txID, ref, amount, currency)
+	}
+	return charger.ReverseCharge(ctx, txID, ref, amount, currency)
 }
 
 // feeChargerForSplit devuelve el charger por el que se movió el FEE de una

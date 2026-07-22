@@ -39,6 +39,11 @@ type DirectCardCharger interface {
 	// CapturePayment settles a held authorization (private-event approval).
 	CapturePayment(ctx context.Context, transactionID, referenceCode string, amount float64, currency string) error
 	// ReverseCharge releases a held authorization (private-event rejection,
-	// or rollback of the atomic pair).
+	// or rollback of the atomic pair). SOLO válido sobre una autorización NO
+	// capturada; una venta ya liquidada (capture=true) NO se deshace con esto.
 	ReverseCharge(ctx context.Context, transactionID, referenceCode string, amount float64, currency string) error
+	// RefundCharge deshace una venta YA CAPTURADA/liquidada (capture=true):
+	// rollback del par atómico en eventos públicos cuando la 2ª tx falla tras
+	// haberse capturado la 1ª. Un reversal no sirve para una venta liquidada.
+	RefundCharge(ctx context.Context, transactionID, referenceCode string, amount float64, currency string) error
 }
