@@ -2,6 +2,7 @@
 .env
 .env.local
 .env.*.local
+.staging.ids
 *.pem
 *.key
 *_rsa

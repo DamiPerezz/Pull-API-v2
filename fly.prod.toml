@@ -29,6 +29,10 @@ primary_region = "dfw"   # Dallas — closest active region to Guatemala (mia de
   # el fee 8% se cobra por la cuenta de Pull y la entrada por la del venue.
   # Sin ella: todo por la cuenta del venue (modo actual).
   # PLATFORM_FEE_VENUE_ID = "<id-venue-pull-platform>"
+  # Cuando el dominio bueno esté vivo (CNAME en Hostinger + custom domain en
+  # el proyecto Pages), cambiar FRONTEND_URL a https://511events.pullevents.com
+  # y redeployar: es la base de los links en emails/PDFs. NO cambiarlo antes
+  # de que el dominio resuelva o los links de los correos saldrán rotos.
   FRONTEND_URL = "https://pull-511-events.pages.dev"
   # Soft memory ceiling so the Go GC gets aggressive before Fly's OOM
   # killer does (PDF generation runs in unbounded goroutines).
