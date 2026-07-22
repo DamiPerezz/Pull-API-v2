@@ -1,0 +1,8 @@
+# Los scripts de shell DEBEN mantener LF: con CRLF, bash en Git Bash/Linux
+# falla con errores tipo "\r: command not found" (los deploy scripts corren
+# tanto en Windows/Git Bash como en CI Linux).
+*.sh text eol=lf
+# Go y configs: LF consistente entre Windows y el builder remoto de Fly.
+*.go text eol=lf
+*.toml text eol=lf
+*.sql text eol=lf
