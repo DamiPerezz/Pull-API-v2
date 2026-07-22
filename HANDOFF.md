@@ -102,11 +102,16 @@ npx expo start --tunnel     # scan QR from Expo Go
 
 ## How to redeploy
 
-**Backend (Fly.io)**:
+> **⚠️ 2026-07-22:** hay TRES entornos (ver `ENVIRONMENTS.md` en la raíz
+> del workspace). PRODUCCIÓN 511: `bash scripts/deploy_prod.sh`. STAGING:
+> `bash scripts/deploy_staging.sh`. Lo de abajo deploya la DEMO Aurora y
+> ahora requiere `-c fly.demo.toml` explícito (fly.toml ya no existe).
+
+**Backend (Fly.io) — demo Aurora**:
 ```bash
 cd Pull-API-v2
 go build ./...              # sanity check
-flyctl deploy --remote-only --strategy immediate
+flyctl deploy -c fly.demo.toml --remote-only --strategy immediate
 ```
 Takes ~60–90s. If the machine ends up STOPPED after deploy, run
 `flyctl machine start <machine-id> --app pull-api-v2-demo` — it happens

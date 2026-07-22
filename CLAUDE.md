@@ -372,12 +372,22 @@ Todo verde = listo. Cualquier rojo = arréglalo antes de tocar features.
 
 ## Deploy flows
 
-### Backend (Fly.io)
+> **⚠️ ACTUALIZADO 2026-07-22 — tres entornos.** La fuente de verdad es
+> `ENVIRONMENTS.md` en la raíz del workspace. Resumen:
+>
+> - **PRODUCCIÓN 511 Events** (dinero real): `bash scripts/deploy_prod.sh`
+>   — exige rama main + árbol limpio + push, y tagea `prod-*`.
+> - **STAGING 511** (Cybersource sandbox): `bash scripts/deploy_staging.sh`.
+> - **DEMO Aurora** (lo de abajo): solo con `-c fly.demo.toml`, y solo si
+>   de verdad quieres tocar la demo de Diego. `fly.toml` YA NO EXISTE:
+>   `flyctl deploy` a secas falla a propósito.
+
+### Backend (Fly.io) — DEMO Aurora únicamente
 
 ```bash
 cd Pull-API-v2
 go build ./...                                       # sanity local
-flyctl deploy --remote-only --strategy immediate     # 60-90s
+flyctl deploy -c fly.demo.toml --remote-only --strategy immediate
 flyctl status --app pull-api-v2-demo                 # STARTED + passing?
 ```
 
@@ -392,7 +402,13 @@ arrancar (route duplicada, typo en struct). Ver logs.
 
 ### WebApp (Cloudflare Pages)
 
-Auto-deploy en cada push a `dev`. Manual:
+> Producción 511: `bash scripts/deploy_prod.sh` (proyecto
+> `pull-511-events`, rama main). Staging: `bash scripts/deploy_staging.sh`.
+> Lo de abajo es la DEMO.
+
+Auto-deploy de la DEMO en cada push a `dev` del repo **GreenLock**
+(nuestro origin es el fork DamiPerezz: pushear ahí NO toca la demo).
+Manual demo:
 
 ```bash
 cd PullWebApp-GL
