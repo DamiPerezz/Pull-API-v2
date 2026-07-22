@@ -12,6 +12,10 @@ import (
 // approval. The buyer does NOT get a ticket/QR yet — they get one of these
 // status emails instead. The real ticket email (SendTickets) only goes out
 // once staff approves and the funds are captured.
+//
+// Visual system: shared dark theme (see email_theme.go), same language as
+// the tickets_with_pdfs.html reference template. Banner color is semantic:
+// amber = pending, red = rejected/expired.
 // =============================================
 
 // ApprovalEmailData carries the venue/event context for status emails.
@@ -28,42 +32,44 @@ type ApprovalEmailData struct {
 	Currency      string
 }
 
-// approvalShell — mismo lenguaje visual oscuro que el email de tickets:
-// tarjeta oscura, marca PULL EVENTS, foto del evento y tabla de detalles.
-func approvalShell(accentRGB, badge, badgeColor string, d ApprovalEmailData, bodyHTML string) string {
-	esc := html.EscapeString
-	hero := ""
-	if d.EventImage != "" {
-		hero = fmt.Sprintf(`<img src="%s" alt="" width="100%%" style="display:block;width:100%%;max-height:220px;object-fit:cover;border-radius:12px;margin:0 0 24px;" />`, esc(d.EventImage))
+// approvalHero renders the event image (rounded, like the reference) when we
+// have one.
+func approvalHero(d ApprovalEmailData) string {
+	if d.EventImage == "" {
+		return ""
 	}
-	row := func(label, value string) string {
+	return fmt.Sprintf(
+		`<table width="100%%" cellpadding="0" cellspacing="0" border="0" role="presentation" style="border-collapse:collapse;margin:0 0 24px;"><tr><td><img src="%s" alt="%s" width="504" style="border:0;border-radius:12px;display:block;outline:none;text-decoration:none;height:auto;width:100%%;max-width:100%%;font-size:13px;" /></td></tr></table>`,
+		html.EscapeString(d.EventImage), html.EscapeString(d.EventName))
+}
+
+// approvalDetailsCard renders the accent-tinted "Event Details"-style card
+// with the same fields the old table showed (Evento, Fecha, Hora, Lugar,
+// Solicitud); empty fields are skipped.
+func approvalDetailsCard(accentRGB string, d ApprovalEmailData) string {
+	esc := html.EscapeString
+	field := func(label, value string) string {
 		if value == "" {
 			return ""
 		}
-		return fmt.Sprintf(`<tr><td style="padding:9px 0;color:#a0a0b0;border-top:1px solid #2a2a3a;">%s</td><td style="padding:9px 0;text-align:right;color:#fff;font-weight:500;border-top:1px solid #2a2a3a;">%s</td></tr>`, label, esc(value))
+		return emailDetailField(label, esc(value))
 	}
-	details := fmt.Sprintf(`
-    <table style="width:100%%;border-collapse:collapse;font-size:14px;margin:20px 0 4px;">
-      <tr><td style="padding:9px 0;color:#a0a0b0;">Evento</td><td style="padding:9px 0;text-align:right;color:#fff;font-weight:600;">%s</td></tr>
-      %s%s%s%s
-    </table>`,
-		esc(d.EventName),
-		row("Fecha", d.EventDate), row("Hora", d.EventTime),
-		row("Lugar", firstNonEmpty(d.VenueLocation, d.VenueName)),
-		row("Solicitud", d.OrderNumber))
+	inner := field("Evento", d.EventName) +
+		field("Fecha", d.EventDate) +
+		field("Hora", d.EventTime) +
+		field("Lugar", firstNonEmpty(d.VenueLocation, d.VenueName)) +
+		field("Solicitud", d.OrderNumber)
+	return emailAccentCard(accentRGB, inner)
+}
 
-	return fmt.Sprintf(`<!DOCTYPE html>
-<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
-<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;margin:0;padding:24px;background:#0a0a0f;color:#fff;">
-  <div style="max-width:560px;margin:0 auto;background:#15151f;border:1px solid #2a2a3a;border-radius:16px;padding:32px;">
-    <div style="font-size:12px;letter-spacing:3px;color:#8b5cf6;font-weight:700;margin-bottom:16px;">PULL EVENTS</div>
-    %s
-    <div style="display:inline-block;background:rgba(%s,0.14);border:1px solid rgba(%s,0.4);color:%s;font-size:12px;font-weight:700;letter-spacing:1px;padding:6px 14px;border-radius:999px;margin-bottom:14px;">%s</div>
-    %s
-    %s
-  </div>
-  <p style="color:#6b6b7b;font-size:11px;text-align:center;margin:18px 0 0;">Pull Events</p>
-</body></html>`, hero, accentRGB, accentRGB, badgeColor, badge, bodyHTML, details)
+// approvalAmountCard renders the highlighted amount box (held / released),
+// centered like the reference "Event Details" card values.
+func approvalAmountCard(accentRGB, label, total, currency string) string {
+	esc := html.EscapeString
+	inner := fmt.Sprintf(
+		`<div style="font-family:%s;font-size:11px;font-weight:600;letter-spacing:1.2px;line-height:1;text-align:center;text-transform:uppercase;color:rgba(255, 255, 255, 0.55);margin-bottom:12px;">%s</div>%s`,
+		emailFontStack, label, emailBigValue(esc(total)+" "+esc(currency)))
+	return emailAccentCard(accentRGB, inner)
 }
 
 func firstNonEmpty(a, b string) string {
@@ -73,32 +79,44 @@ func firstNonEmpty(a, b string) string {
 	return b
 }
 
+// BuildApprovalPendingEmail renders the "request received, funds held" email
+// HTML. Exported so preview tooling can render it without sending.
+func BuildApprovalPendingEmail(d ApprovalEmailData) string {
+	esc := html.EscapeString
+	body := emailGreeting("Hola ", esc(d.CustomerName)) +
+		emailParagraph(fmt.Sprintf(
+			`Hemos recibido tu solicitud para <strong style="color:#ffffff;">%s</strong>. Es un evento privado: el equipo de %s debe aprobarla.`,
+			esc(d.EventName), esc(d.VenueName))) +
+		approvalAmountCard(emailAccentAmber, "IMPORTE RETENIDO — NO COBRADO", d.Total, d.Currency) +
+		approvalHero(d) +
+		approvalDetailsCard(emailAccentAmber, d) +
+		emailFineprint(`Solo se cobrará si el equipo aprueba tu solicitud — entonces recibirás tu entrada con el código QR. Si en <strong style="color:#ffffff;">48 horas</strong> no hay respuesta, la retención se libera sola y no pagas nada.`)
+
+	return renderEmailShell(emailShellData{
+		HTMLTitle:  "Solicitud recibida - Pull",
+		AccentRGB:  emailAccentAmber,
+		BannerText: "PENDIENTE DE APROBACIÓN",
+		Title:      "Solicitud recibida",
+		BodyHTML:   body,
+		FooterNote: "Pull Events",
+	})
+}
+
 // SendApprovalPending tells the buyer their request was received and is
 // awaiting staff approval (funds held, not charged).
 func (e *EmailService) SendApprovalPending(ctx context.Context, to string, d ApprovalEmailData) error {
-	esc := html.EscapeString
-	body := fmt.Sprintf(`
-    <h1 style="font-size:24px;margin:4px 0 10px;color:#fff;">Solicitud recibida</h1>
-    <p style="color:#a0a0b0;margin:0 0 18px;font-size:15px;line-height:1.6;">Hola %s, hemos recibido tu solicitud para <strong style="color:#fff;">%s</strong>. Es un evento privado: el equipo de %s debe aprobarla.</p>
-    <div style="background:rgba(139,92,246,0.08);border-left:3px solid #8b5cf6;padding:14px 16px;border-radius:10px;margin-bottom:6px;">
-      <div style="font-size:11px;color:#8b8b9b;letter-spacing:1.2px;margin-bottom:2px;">IMPORTE RETENIDO — NO COBRADO</div>
-      <div style="font-size:22px;font-weight:800;color:#fff;">%s %s</div>
-    </div>
-    <p style="color:#a0a0b0;font-size:13px;line-height:1.6;margin:14px 0 0;">Solo se cobrará si el equipo aprueba tu solicitud — entonces recibirás tu entrada con el código QR. Si en <strong style="color:#fff;">48 horas</strong> no hay respuesta, la retención se libera sola y no pagas nada.</p>`,
-		esc(d.CustomerName), esc(d.EventName), esc(d.VenueName), esc(d.Total), esc(d.Currency))
-
 	_, err := e.Send(ctx, EmailRequest{
 		To:      []string{to},
 		Subject: "Solicitud recibida — " + d.EventName,
-		HTML:    approvalShell("251,191,36", "PENDIENTE DE APROBACIÓN", "#fbbf24", d, body),
+		HTML:    BuildApprovalPendingEmail(d),
 		Tags:    []EmailTag{{Name: "type", Value: "approval_pending"}},
 	})
 	return err
 }
 
-// SendApprovalRejected tells the buyer their request was declined and the
-// held funds were released. Used for both staff rejection and 48h expiry.
-func (e *EmailService) SendApprovalRejected(ctx context.Context, to string, d ApprovalEmailData, expired bool) error {
+// BuildApprovalRejectedEmail renders the "declined / expired, funds released"
+// email HTML. Exported so preview tooling can render it without sending.
+func BuildApprovalRejectedEmail(d ApprovalEmailData, expired bool) string {
 	esc := html.EscapeString
 	reason := "El equipo no ha aprobado tu solicitud."
 	heading := "Solicitud rechazada"
@@ -108,20 +126,37 @@ func (e *EmailService) SendApprovalRejected(ctx context.Context, to string, d Ap
 		heading = "Solicitud no procesada"
 		badge = "SIN RESPUESTA EN 48H"
 	}
-	body := fmt.Sprintf(`
-    <h1 style="font-size:24px;margin:4px 0 10px;color:#fff;">%s</h1>
-    <p style="color:#a0a0b0;margin:0 0 18px;font-size:15px;line-height:1.6;">Hola %s, %s Tu solicitud para <strong style="color:#fff;">%s</strong> no se ha completado.</p>
-    <div style="background:rgba(248,113,113,0.08);border-left:3px solid #f87171;padding:14px 16px;border-radius:10px;margin-bottom:6px;">
-      <div style="font-size:11px;color:#8b8b9b;letter-spacing:1.2px;margin-bottom:2px;">IMPORTE LIBERADO</div>
-      <div style="font-size:22px;font-weight:800;color:#fff;">%s %s</div>
-    </div>
-    <p style="color:#a0a0b0;font-size:13px;line-height:1.6;margin:14px 0 0;"><strong style="color:#fff;">No se te ha cobrado nada.</strong> La retención sobre tu tarjeta se ha liberado; según tu banco puede tardar unos días en desaparecer del extracto.</p>`,
-		heading, esc(d.CustomerName), reason, esc(d.EventName), esc(d.Total), esc(d.Currency))
 
+	body := emailGreeting("Hola ", esc(d.CustomerName)) +
+		emailParagraph(fmt.Sprintf(
+			`%s Tu solicitud para <strong style="color:#ffffff;">%s</strong> no se ha completado.`,
+			reason, esc(d.EventName))) +
+		approvalAmountCard(emailAccentRed, "IMPORTE LIBERADO", d.Total, d.Currency) +
+		approvalHero(d) +
+		approvalDetailsCard(emailAccentRed, d) +
+		emailFineprint(`<strong style="color:#ffffff;">No se te ha cobrado nada.</strong> La retención sobre tu tarjeta se ha liberado; según tu banco puede tardar unos días en desaparecer del extracto.`)
+
+	return renderEmailShell(emailShellData{
+		HTMLTitle:  heading + " - Pull",
+		AccentRGB:  emailAccentRed,
+		BannerText: badge,
+		Title:      heading,
+		BodyHTML:   body,
+		FooterNote: "Pull Events",
+	})
+}
+
+// SendApprovalRejected tells the buyer their request was declined and the
+// held funds were released. Used for both staff rejection and 48h expiry.
+func (e *EmailService) SendApprovalRejected(ctx context.Context, to string, d ApprovalEmailData, expired bool) error {
+	heading := "Solicitud rechazada"
+	if expired {
+		heading = "Solicitud no procesada"
+	}
 	_, err := e.Send(ctx, EmailRequest{
 		To:      []string{to},
 		Subject: heading + " — " + d.EventName,
-		HTML:    approvalShell("248,113,113", badge, "#f87171", d, body),
+		HTML:    BuildApprovalRejectedEmail(d, expired),
 		Tags:    []EmailTag{{Name: "type", Value: "approval_rejected"}},
 	})
 	return err

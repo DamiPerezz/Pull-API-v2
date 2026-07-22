@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"html"
 	"html/template"
 	"io"
 	"io/fs"
@@ -236,33 +237,29 @@ func sanitizeResendTags(tags []EmailTag) []EmailTag {
 // TEMPLATE EMAILS
 // =============================================
 
+// BuildVerificationCodeEmail renders the login-code email HTML (shared dark
+// theme). Exported so preview tooling can render it without sending.
+func BuildVerificationCodeEmail(venueName, code string) string {
+	esc := html.EscapeString
+	body := emailParagraph(fmt.Sprintf("Usa este código para iniciar sesión en %s:", esc(venueName))) +
+		emailAccentCard(emailAccentPurple, emailCode(esc(code))) +
+		emailFineprint("Este código expira en 10 minutos.") +
+		emailFineprint("Si no solicitaste este código, puedes ignorar este correo.")
+
+	return renderEmailShell(emailShellData{
+		HTMLTitle: "Tu código de verificación - Pull",
+		AccentRGB: emailAccentPurple,
+		Title:     "Tu código de verificación",
+		BodyHTML:  body,
+	})
+}
+
 // SendVerificationCode sends verification code email
 func (e *EmailService) SendVerificationCode(ctx context.Context, to, code, venueName string) error {
-	html := fmt.Sprintf(`
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-</head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background-color: #f5f5f5;">
-    <div style="max-width: 500px; margin: 0 auto; background: white; border-radius: 12px; padding: 40px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
-        <h1 style="color: #1a1a1a; margin: 0 0 20px; font-size: 24px;">Tu código de verificación</h1>
-        <p style="color: #666; margin: 0 0 30px; font-size: 16px;">Usa este código para iniciar sesión en %s:</p>
-        <div style="background: #f8f9fa; border-radius: 8px; padding: 20px; text-align: center; margin-bottom: 30px;">
-            <span style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #1a1a1a;">%s</span>
-        </div>
-        <p style="color: #999; margin: 0; font-size: 14px;">Este código expira en 10 minutos.</p>
-        <p style="color: #999; margin: 10px 0 0; font-size: 14px;">Si no solicitaste este código, puedes ignorar este correo.</p>
-    </div>
-</body>
-</html>
-`, venueName, code)
-
 	_, err := e.Send(ctx, EmailRequest{
 		To:      []string{to},
 		Subject: fmt.Sprintf("Tu código de verificación: %s", code),
-		HTML:    html,
+		HTML:    BuildVerificationCodeEmail(venueName, code),
 		Tags: []EmailTag{
 			{Name: "type", Value: "verification"},
 			{Name: "venue", Value: venueName},
@@ -615,32 +612,28 @@ func encodeBase64(data []byte) string {
 // VIP LIST EMAILS
 // =============================================
 
+// BuildVIPListInvitationEmail renders the VIP list invitation HTML (shared
+// dark theme). Exported so preview tooling can render it without sending.
+func BuildVIPListInvitationEmail(guestName, organizerName, listName, confirmURL string) string {
+	esc := html.EscapeString
+	body := emailGreeting("Hola ", esc(guestName)) +
+		emailParagraph(fmt.Sprintf(
+			`<strong style="color:#ffffff;">%s</strong> te ha invitado a unirte a su VIP list <strong style="color:#ffffff;">"%s"</strong>.`,
+			esc(organizerName), esc(listName))) +
+		emailButton(confirmURL, "Confirmar asistencia") +
+		emailFineprint("Si no conoces a esta persona, puedes ignorar este correo.")
+
+	return renderEmailShell(emailShellData{
+		HTMLTitle: "Invitación VIP - Pull",
+		AccentRGB: emailAccentPurple,
+		Title:     "🎉 Invitación VIP",
+		BodyHTML:  body,
+	})
+}
+
 // SendVIPListInvitation sends invitation to join a VIP list
 func (e *EmailService) SendVIPListInvitation(to, guestName, organizerName, listName, qrToken string) error {
 	confirmURL := fmt.Sprintf("%s/vip-list/confirm/%s", config.App.FrontendURL, qrToken)
-
-	html := fmt.Sprintf(`
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-</head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background-color: #f5f5f5;">
-    <div style="max-width: 500px; margin: 0 auto; background: white; border-radius: 12px; padding: 40px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
-        <h1 style="color: #1a1a1a; margin: 0 0 20px; font-size: 24px;">🎉 Invitación VIP</h1>
-        <p style="color: #666; margin: 0 0 20px; font-size: 16px;">Hola %s,</p>
-        <p style="color: #666; margin: 0 0 30px; font-size: 16px;"><strong>%s</strong> te ha invitado a unirte a su VIP list <strong>"%s"</strong>.</p>
-
-        <div style="text-align: center; margin: 30px 0;">
-            <a href="%s" style="background: #1a1a1a; color: white; padding: 15px 30px; border-radius: 8px; text-decoration: none; font-weight: 600; display: inline-block;">Confirmar asistencia</a>
-        </div>
-
-        <p style="color: #999; margin: 30px 0 0; font-size: 14px; text-align: center;">Si no conoces a esta persona, puedes ignorar este correo.</p>
-    </div>
-</body>
-</html>
-`, guestName, organizerName, listName, confirmURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -648,7 +641,7 @@ func (e *EmailService) SendVIPListInvitation(to, guestName, organizerName, listN
 	_, err := e.Send(ctx, EmailRequest{
 		To:      []string{to},
 		Subject: fmt.Sprintf("%s te invita a su VIP list", organizerName),
-		HTML:    html,
+		HTML:    BuildVIPListInvitationEmail(guestName, organizerName, listName, confirmURL),
 		Tags: []EmailTag{
 			{Name: "type", Value: "vip_invitation"},
 		},
@@ -688,35 +681,34 @@ func (e *EmailService) SendGuestConfirmation(to, organizerName, guestName, listN
 	return err
 }
 
+// BuildVIPListApprovedEmail renders the VIP list approved HTML (shared dark
+// theme, green banner). Exported so preview tooling can render it without
+// sending.
+func BuildVIPListApprovedEmail(organizerName, listName, listURL string) string {
+	esc := html.EscapeString
+	body := emailGreeting("Hola ", esc(organizerName)) +
+		emailParagraph(fmt.Sprintf(
+			`Tu VIP list <strong style="color:#ffffff;">"%s"</strong> ha sido aprobada. Ya puedes invitar a tus amigos.`,
+			esc(listName))) +
+		emailButton(listURL, "Ver mi VIP list")
+
+	return renderEmailShell(emailShellData{
+		HTMLTitle: "VIP List aprobada - Pull",
+		AccentRGB: emailAccentGreen,
+		Title:     "🎉 VIP List aprobada",
+		BodyHTML:  body,
+	})
+}
+
 // SendVIPListApproved notifies organizer their VIP list was approved
 func (e *EmailService) SendVIPListApproved(to, organizerName, listName string) error {
-	html := fmt.Sprintf(`
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-</head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background-color: #f5f5f5;">
-    <div style="max-width: 500px; margin: 0 auto; background: white; border-radius: 12px; padding: 40px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
-        <h1 style="color: #1a1a1a; margin: 0 0 20px; font-size: 24px;">🎉 VIP List aprobada</h1>
-        <p style="color: #666; margin: 0 0 20px; font-size: 16px;">Hola %s,</p>
-        <p style="color: #666; margin: 0 0 30px; font-size: 16px;">Tu VIP list <strong>"%s"</strong> ha sido aprobada. Ya puedes invitar a tus amigos.</p>
-
-        <div style="text-align: center; margin: 30px 0;">
-            <a href="%s/my-vip-lists" style="background: #1a1a1a; color: white; padding: 15px 30px; border-radius: 8px; text-decoration: none; font-weight: 600; display: inline-block;">Ver mi VIP list</a>
-        </div>
-    </div>
-</body>
-</html>
-`, organizerName, listName, config.App.FrontendURL)
-
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	_, err := e.Send(ctx, EmailRequest{
 		To:      []string{to},
 		Subject: fmt.Sprintf("Tu VIP list \"%s\" fue aprobada", listName),
-		HTML:    html,
+		HTML:    BuildVIPListApprovedEmail(organizerName, listName, config.App.FrontendURL+"/my-vip-lists"),
 		Tags: []EmailTag{
 			{Name: "type", Value: "vip_approved"},
 		},
@@ -724,38 +716,40 @@ func (e *EmailService) SendVIPListApproved(to, organizerName, listName string) e
 	return err
 }
 
-// SendVIPListRejected notifies organizer their VIP list was rejected
-func (e *EmailService) SendVIPListRejected(to, organizerName, listName, reason string) error {
+// BuildVIPListRejectedEmail renders the VIP list rejected HTML (shared dark
+// theme, red banner). Exported so preview tooling can render it without
+// sending.
+func BuildVIPListRejectedEmail(organizerName, listName, reason string) string {
+	esc := html.EscapeString
 	reasonText := ""
 	if reason != "" {
-		reasonText = fmt.Sprintf("<p style=\"color: #666; margin: 0 0 30px; font-size: 16px;\">Motivo: %s</p>", reason)
+		reasonText = emailParagraph(fmt.Sprintf("Motivo: %s", esc(reason)))
 	}
 
-	html := fmt.Sprintf(`
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-</head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background-color: #f5f5f5;">
-    <div style="max-width: 500px; margin: 0 auto; background: white; border-radius: 12px; padding: 40px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
-        <h1 style="color: #1a1a1a; margin: 0 0 20px; font-size: 24px;">VIP List no aprobada</h1>
-        <p style="color: #666; margin: 0 0 20px; font-size: 16px;">Hola %s,</p>
-        <p style="color: #666; margin: 0 0 20px; font-size: 16px;">Lamentamos informarte que tu VIP list <strong>"%s"</strong> no fue aprobada.</p>
-        %s
-        <p style="color: #999; margin: 30px 0 0; font-size: 14px;">Si tienes dudas, contacta al venue.</p>
-    </div>
-</body>
-</html>
-`, organizerName, listName, reasonText)
+	body := emailGreeting("Hola ", esc(organizerName)) +
+		emailParagraph(fmt.Sprintf(
+			`Lamentamos informarte que tu VIP list <strong style="color:#ffffff;">"%s"</strong> no fue aprobada.`,
+			esc(listName))) +
+		reasonText +
+		emailFineprint("Si tienes dudas, contacta al venue.")
 
+	return renderEmailShell(emailShellData{
+		HTMLTitle: "VIP List no aprobada - Pull",
+		AccentRGB: emailAccentRed,
+		Title:     "VIP List no aprobada",
+		BodyHTML:  body,
+	})
+}
+
+// SendVIPListRejected notifies organizer their VIP list was rejected
+func (e *EmailService) SendVIPListRejected(to, organizerName, listName, reason string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	_, err := e.Send(ctx, EmailRequest{
 		To:      []string{to},
 		Subject: fmt.Sprintf("Tu VIP list \"%s\" no fue aprobada", listName),
-		HTML:    html,
+		HTML:    BuildVIPListRejectedEmail(organizerName, listName, reason),
 		Tags: []EmailTag{
 			{Name: "type", Value: "vip_rejected"},
 		},
@@ -763,31 +757,29 @@ func (e *EmailService) SendVIPListRejected(to, organizerName, listName, reason s
 	return err
 }
 
+// BuildGuestListConfirmationEmail renders the guest list signup confirmation
+// HTML (shared dark theme, green banner). Exported so preview tooling can
+// render it without sending.
+func BuildGuestListConfirmationEmail(guestName, listName, eventName, qrURL string) string {
+	esc := html.EscapeString
+	body := emailGreeting("Hola ", esc(guestName)) +
+		emailParagraph(fmt.Sprintf(
+			`Tu registro en la lista <strong style="color:#ffffff;">"%s"</strong> para <strong style="color:#ffffff;">%s</strong> ha sido confirmado.`,
+			esc(listName), esc(eventName))) +
+		emailButton(qrURL, "Ver mi QR") +
+		emailFineprint("Presenta este QR en la entrada del evento.")
+
+	return renderEmailShell(emailShellData{
+		HTMLTitle: "Registro confirmado - Pull",
+		AccentRGB: emailAccentGreen,
+		Title:     "✅ Registro confirmado",
+		BodyHTML:  body,
+	})
+}
+
 // SendGuestListConfirmation sends confirmation for guest list signup
 func (e *EmailService) SendGuestListConfirmation(to, guestName, eventName, listName, qrToken string) error {
 	qrURL := fmt.Sprintf("%s/guest-list/qr/%s", config.App.FrontendURL, qrToken)
-
-	html := fmt.Sprintf(`
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-</head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background-color: #f5f5f5;">
-    <div style="max-width: 500px; margin: 0 auto; background: white; border-radius: 12px; padding: 40px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
-        <h1 style="color: #1a1a1a; margin: 0 0 20px; font-size: 24px;">✅ Registro confirmado</h1>
-        <p style="color: #666; margin: 0 0 20px; font-size: 16px;">Hola %s,</p>
-        <p style="color: #666; margin: 0 0 30px; font-size: 16px;">Tu registro en la lista <strong>"%s"</strong> para <strong>%s</strong> ha sido confirmado.</p>
-
-        <div style="text-align: center; margin: 30px 0;">
-            <a href="%s" style="background: #1a1a1a; color: white; padding: 15px 30px; border-radius: 8px; text-decoration: none; font-weight: 600; display: inline-block;">Ver mi QR</a>
-        </div>
-
-        <p style="color: #999; margin: 30px 0 0; font-size: 14px; text-align: center;">Presenta este QR en la entrada del evento.</p>
-    </div>
-</body>
-</html>
-`, guestName, listName, eventName, qrURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -795,7 +787,7 @@ func (e *EmailService) SendGuestListConfirmation(to, guestName, eventName, listN
 	_, err := e.Send(ctx, EmailRequest{
 		To:      []string{to},
 		Subject: fmt.Sprintf("Confirmación: %s - %s", listName, eventName),
-		HTML:    html,
+		HTML:    BuildGuestListConfirmationEmail(guestName, listName, eventName, qrURL),
 		Tags: []EmailTag{
 			{Name: "type", Value: "guest_list_confirmation"},
 		},
