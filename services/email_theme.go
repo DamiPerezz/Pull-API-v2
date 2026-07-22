@@ -12,7 +12,10 @@ package services
 // Email-client constraints respected here: table layout only (no flexbox or
 // grid), all styles inline, absolute image URLs, system font stack.
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // Semantic accent colors (RGB triplets, ready for rgba()/rgb() wrapping).
 //
@@ -27,7 +30,7 @@ const (
 	emailAccentPurple = "139, 92, 246"
 
 	emailFontStack = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif"
-	emailLogoURL   = "https://pullevents.com/public/logo.png"
+	emailLogoURL   = "https://mwuppgpmlynfxyghkpzv.supabase.co/storage/v1/object/public/venue-images/pull/logo-email.png"
 )
 
 // emailShellData describes one themed email.
@@ -72,7 +75,7 @@ func renderEmailShell(d emailShellData) string {
 	footerNote := ""
 	if d.FooterNote != "" {
 		footerNote = fmt.Sprintf(
-			`<div style="font-family:%s;font-size:11px;line-height:1;color:rgba(255, 255, 255, 0.3);">%s</div>`,
+			`<div style="font-family:%s;font-size:11px;line-height:1;color:#5c5c66;color:rgba(255, 255, 255, 0.3);">%s</div>`,
 			emailFontStack, d.FooterNote)
 	}
 
@@ -92,7 +95,7 @@ func renderEmailShell(d emailShellData) string {
           <!-- Logo header -->
           <tr>
             <td style="padding:48px 48px 40px;text-align:center;background-color:rgba(139, 92, 246, 0.08);">
-              <img src="%s" alt="Pull Logo" width="200" style="border:0;display:inline-block;outline:none;text-decoration:none;height:auto;width:200px;max-width:200px;font-size:13px;" />
+              <img src="%s" alt="PULL EVENTS" width="200" style="border:0;display:inline-block;outline:none;text-decoration:none;height:auto;width:200px;max-width:200px;color:#a78bfa;font-size:20px;font-weight:bold;" />
             </td>
           </tr>
           <!-- Status banner -->
@@ -108,7 +111,7 @@ func renderEmailShell(d emailShellData) string {
           <!-- Footer -->
           <tr>
             <td style="padding:24px 48px;text-align:center;background-color:rgba(0, 0, 0, 0.4);">
-              <div style="font-family:%s;font-size:12px;font-weight:500;line-height:1;color:rgba(255, 255, 255, 0.4);margin-bottom:8px;">&copy; 2024 Pull. All rights reserved.</div>
+              <div style="font-family:%s;font-size:12px;font-weight:500;line-height:1;color:#77777f;color:rgba(255, 255, 255, 0.4);margin-bottom:8px;">&copy; %d Pull. Todos los derechos reservados.</div>
               %s
             </td>
           </tr>
@@ -117,14 +120,14 @@ func renderEmailShell(d emailShellData) string {
     </tr>
   </table>
 </body>
-</html>`, d.HTMLTitle, emailLogoURL, banner, title, d.BodyHTML, emailFontStack, footerNote)
+</html>`, d.HTMLTitle, emailLogoURL, banner, title, d.BodyHTML, emailFontStack, time.Now().Year(), footerNote)
 }
 
 // emailParagraph renders a left-aligned body paragraph. innerHTML may contain
 // inline markup (already escaped by the caller where needed).
 func emailParagraph(innerHTML string) string {
 	return fmt.Sprintf(
-		`<p style="margin:0 0 16px;font-family:%s;font-size:15px;font-weight:400;line-height:1.7;color:rgba(255, 255, 255, 0.75);text-align:left;">%s</p>`,
+		`<p style="margin:0 0 16px;font-family:%s;font-size:15px;font-weight:400;line-height:1.7;color:#bfbfc6;color:rgba(255, 255, 255, 0.75);text-align:left;">%s</p>`,
 		emailFontStack, innerHTML)
 }
 
@@ -139,7 +142,7 @@ func emailGreeting(prefixHTML, name string) string {
 // emailFineprint renders a small dim note.
 func emailFineprint(innerHTML string) string {
 	return fmt.Sprintf(
-		`<p style="margin:16px 0 0;font-family:%s;font-size:13px;font-weight:400;line-height:1.6;color:rgba(255, 255, 255, 0.5);text-align:left;">%s</p>`,
+		`<p style="margin:16px 0 0;font-family:%s;font-size:13px;font-weight:400;line-height:1.6;color:#8a8a94;color:rgba(255, 255, 255, 0.5);text-align:left;">%s</p>`,
 		emailFontStack, innerHTML)
 }
 
@@ -162,14 +165,14 @@ func emailInfoCard(innerHTML string) string {
 // card ("EVENT DETAILS" style).
 func emailCardLabel(text string) string {
 	return fmt.Sprintf(
-		`<div style="font-family:%s;font-size:11px;font-weight:600;letter-spacing:1.2px;line-height:1;text-align:center;text-transform:uppercase;color:rgba(255, 255, 255, 0.55);margin-bottom:16px;">%s</div>`,
+		`<div style="font-family:%s;font-size:11px;font-weight:600;letter-spacing:1.2px;line-height:1;text-align:center;text-transform:uppercase;color:#93939d;color:rgba(255, 255, 255, 0.55);margin-bottom:16px;">%s</div>`,
 		emailFontStack, text)
 }
 
 // emailDetailField renders one label-above-value field inside a details card.
 func emailDetailField(label, value string) string {
 	return fmt.Sprintf(
-		`<div style="font-family:%s;font-size:13px;line-height:1;text-align:left;color:rgba(255, 255, 255, 0.5);padding:0 0 4px;">%s</div><div style="font-family:%s;font-size:15px;font-weight:500;line-height:1.4;text-align:left;color:#ffffff;padding:0 0 16px;">%s</div>`,
+		`<div style="font-family:%s;font-size:13px;line-height:1;text-align:left;color:#8a8a94;color:rgba(255, 255, 255, 0.5);padding:0 0 4px;">%s</div><div style="font-family:%s;font-size:15px;font-weight:500;line-height:1.4;text-align:left;color:#ffffff;padding:0 0 16px;">%s</div>`,
 		emailFontStack, label, emailFontStack, value)
 }
 

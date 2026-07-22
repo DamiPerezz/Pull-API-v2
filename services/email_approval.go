@@ -67,7 +67,7 @@ func approvalDetailsCard(accentRGB string, d ApprovalEmailData) string {
 func approvalAmountCard(accentRGB, label, total, currency string) string {
 	esc := html.EscapeString
 	inner := fmt.Sprintf(
-		`<div style="font-family:%s;font-size:11px;font-weight:600;letter-spacing:1.2px;line-height:1;text-align:center;text-transform:uppercase;color:rgba(255, 255, 255, 0.55);margin-bottom:12px;">%s</div>%s`,
+		`<div style="font-family:%s;font-size:11px;font-weight:600;letter-spacing:1.2px;line-height:1;text-align:center;text-transform:uppercase;color:#93939d;color:rgba(255, 255, 255, 0.55);margin-bottom:12px;">%s</div>%s`,
 		emailFontStack, label, emailBigValue(esc(total)+" "+esc(currency)))
 	return emailAccentCard(accentRGB, inner)
 }
@@ -77,6 +77,15 @@ func firstNonEmpty(a, b string) string {
 		return a
 	}
 	return b
+}
+
+// approvalRejectedHeading is the single source of truth for the heading (and
+// subject) of the rejected/expired approval email.
+func approvalRejectedHeading(expired bool) string {
+	if expired {
+		return "Solicitud no procesada"
+	}
+	return "Solicitud rechazada"
 }
 
 // BuildApprovalPendingEmail renders the "request received, funds held" email
@@ -119,11 +128,10 @@ func (e *EmailService) SendApprovalPending(ctx context.Context, to string, d App
 func BuildApprovalRejectedEmail(d ApprovalEmailData, expired bool) string {
 	esc := html.EscapeString
 	reason := "El equipo no ha aprobado tu solicitud."
-	heading := "Solicitud rechazada"
+	heading := approvalRejectedHeading(expired)
 	badge := "RECHAZADA"
 	if expired {
 		reason = "El equipo no respondió dentro del plazo de 48 horas."
-		heading = "Solicitud no procesada"
 		badge = "SIN RESPUESTA EN 48H"
 	}
 
@@ -149,10 +157,7 @@ func BuildApprovalRejectedEmail(d ApprovalEmailData, expired bool) string {
 // SendApprovalRejected tells the buyer their request was declined and the
 // held funds were released. Used for both staff rejection and 48h expiry.
 func (e *EmailService) SendApprovalRejected(ctx context.Context, to string, d ApprovalEmailData, expired bool) error {
-	heading := "Solicitud rechazada"
-	if expired {
-		heading = "Solicitud no procesada"
-	}
+	heading := approvalRejectedHeading(expired)
 	_, err := e.Send(ctx, EmailRequest{
 		To:      []string{to},
 		Subject: heading + " — " + d.EventName,
