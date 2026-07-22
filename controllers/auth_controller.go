@@ -416,17 +416,17 @@ func RequestCode(c *gin.Context) {
 		return
 	}
 
-	// Invalidate previous codes (fire-and-forget)
-	go func() {
-		bgCtx, bgCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer bgCancel()
-		venueDB.UpdateNoReturn(bgCtx, "verification_codes", map[string]interface{}{
-			"used": true,
-		}, map[string]interface{}{
-			"user_id": userID,
-			"used":    false,
-		})
-	}()
+	// Invalidate previous codes SÍNCRONO antes de insertar el nuevo. Si esto
+	// fuera fire-and-forget (go func), su UPDATE `used=true WHERE used=false`
+	// podía ejecutarse DESPUÉS del INSERT de abajo y marcar usado el código
+	// recién creado → verify-code lo rechazaba de forma intermitente (race
+	// cazada en la auditoría pre-evento, ~40-60% en carga).
+	venueDB.UpdateNoReturn(ctx, "verification_codes", map[string]interface{}{
+		"used": true,
+	}, map[string]interface{}{
+		"user_id": userID,
+		"used":    false,
+	})
 
 	// Store code (expires in 10 minutes)
 	expiresAt := time.Now().Add(10 * time.Minute)

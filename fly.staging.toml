@@ -13,8 +13,11 @@
 # Secretos (flyctl secrets set -a pull-api-v2-staging KEY=value):
 # JWT_SECRET y APP_KEY PROPIOS de staging (nunca los de prod — así un
 # token o backup de staging jamás abre prod), SUPABASE de los proyectos
-# staging, BREVO_API_KEY (cuenta compartida, remitente distinto),
-# PROXY_SHARED_SECRET propio de staging.
+# staging, PROXY_SHARED_SECRET propio de staging.
+# ⚠️ Staging NO lleva BREVO_API_KEY A PROPÓSITO: sin key el backend LOGUEA
+# los emails en vez de enviarlos. Staging comparte la cuenta Brevo de prod;
+# enviar de verdad inundaría bandejas reales y gastaría el cupo del evento.
+# NO setees BREVO_API_KEY en staging.
 # Ver ENVIRONMENTS.md en la raíz del workspace.
 # =============================================
 app = "pull-api-v2-staging"

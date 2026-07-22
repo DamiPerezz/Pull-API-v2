@@ -67,4 +67,9 @@ primary_region = "dfw"   # Dallas — closest active region to Guatemala (mia de
 
 [[vm]]
   size = "shared-cpu-1x"
-  memory = "512mb"
+  # 1GB para el evento: 16 workers de la task queue generan PDFs pesados en
+  # el pico. GOMEMLIMIT=900MiB (secret) SOLO es correcto con 1GB físico; con
+  # 512MB el OOM-killer de Fly mataría el proceso antes de que el GC de Go
+  # actúe. OJO: `flyctl scale memory` se revierte en el siguiente deploy si
+  # este valor no está alineado — por eso vive aquí.
+  memory = "1024mb"
