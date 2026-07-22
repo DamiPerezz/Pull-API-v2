@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"pull-api-v2/middleware"
 	"pull-api-v2/services"
@@ -786,15 +787,14 @@ func LegacyCreatePendingOrder(c *gin.Context) {
 
 	minQty := services.GetInt(ticketType, "min_quantity")
 	maxQty := services.GetInt(ticketType, "max_quantity")
-	availableQty := services.GetInt(ticketType, "available_quantity")
 	if req.Quantity < minQty || req.Quantity > maxQty {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Quantity must be between %d and %d", minQty, maxQty)})
 		return
 	}
-	if req.Quantity > availableQty {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Not enough tickets available"})
-		return
-	}
+	// La disponibilidad se comprueba y RESERVA de forma ATÓMICA más abajo (RPC
+	// reserve_ticket_type), justo antes de crear la orden — un check aquí sería
+	// TOCTOU (dos compradores simultáneos leerían el mismo "quedan N" y ambos
+	// pasarían = sobreventa).
 
 	unitPrice := services.GetFloat64(ticketType, "price")
 	subtotal := unitPrice * float64(req.Quantity)
@@ -827,6 +827,34 @@ func LegacyCreatePendingOrder(c *gin.Context) {
 		userID = services.GetString(user, "id")
 	}
 
+	// RESERVA ATÓMICA del aforo ANTES de crear la orden. La RPC hace el
+	// check+incremento de quantity_reserved en una sola sentencia Postgres →
+	// imposible sobrevender aunque N compradores lleguen a la vez. Devuelve las
+	// disponibles restantes, o -1 si no hay stock.
+	rpcRes, rpcErr := venueDB.CallRPC(ctx, "reserve_ticket_type", map[string]interface{}{
+		"p_id": req.TicketTypeID, "p_qty": req.Quantity,
+	})
+	if rpcErr != nil {
+		log.Printf("[CreatePendingOrder] ALERT reserve RPC failed tt=%s qty=%d: %v", req.TicketTypeID, req.Quantity, rpcErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "No se pudo reservar el aforo. Intenta de nuevo."})
+		return
+	}
+	if remaining, _ := rpcRes.(float64); remaining < 0 {
+		c.JSON(http.StatusConflict, gin.H{"error": "No quedan suficientes entradas disponibles.", "sold_out": true})
+		return
+	}
+	// A partir de aquí el aforo está RESERVADO: si algo falla antes de dejar la
+	// orden pendiente, hay que LIBERARLo para no bloquear plazas fantasma.
+	releaseReserved := func() {
+		bgCtx, bgCancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer bgCancel()
+		if _, e := venueDB.CallRPC(bgCtx, "release_ticket_type", map[string]interface{}{
+			"p_id": req.TicketTypeID, "p_qty": req.Quantity,
+		}); e != nil {
+			log.Printf("[CreatePendingOrder] ALERT release tras fallo falló tt=%s qty=%d: %v", req.TicketTypeID, req.Quantity, e)
+		}
+	}
+
 	paymentLinkCode, _ := generateRandomCode(16)
 	expiresAt := time.Now().Add(30 * time.Minute)
 
@@ -853,18 +881,10 @@ func LegacyCreatePendingOrder(c *gin.Context) {
 		"metadata":       metaForOrder,
 	})
 	if err != nil {
+		releaseReserved() // no dejar el aforo reservado sin orden que lo respalde
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create order"})
 		return
 	}
-
-	// Reserve tickets
-	go func() {
-		bgCtx, bgCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer bgCancel()
-		venueDB.UpdateNoReturn(bgCtx, "ticket_types", map[string]interface{}{
-			"quantity_reserved": services.GetInt(ticketType, "quantity_reserved") + req.Quantity,
-		}, map[string]interface{}{"id": req.TicketTypeID})
-	}()
 
 	c.JSON(http.StatusCreated, gin.H{
 		"success":           true,
