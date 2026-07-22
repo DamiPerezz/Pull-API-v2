@@ -67,3 +67,7 @@ CREATE INDEX IF NOT EXISTS idx_transactions_venue_created
   ON transactions (venue_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_transactions_type
   ON transactions (transaction_type);
+
+-- RLS activado SIN policies: el backend usa service_role (bypasea RLS) y
+-- así la llave pública anon no puede leer/escribir el ledger.
+ALTER TABLE transactions ENABLE ROW LEVEL SECURITY;
