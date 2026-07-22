@@ -10,6 +10,11 @@
 set -u
 cd "$(dirname "$0")/.."
 
+# En máquinas solo-python3 un 'python' a pelo revienta con mensajes
+# engañosos (p.ej. el guard sandbox abortaría con environment='').
+PYBIN=$(command -v python || command -v python3 || true)
+[ -n "$PYBIN" ] || { echo "ABORTADO: ni python ni python3 están en PATH"; exit 1; }
+
 API="https://staging.pull-511-events.pages.dev/api/v1"
 WEB="https://staging.pull-511-events.pages.dev"
 FLY="https://pull-api-v2-staging.fly.dev"
@@ -46,9 +51,23 @@ done
 # Staging debe estar SIEMPRE en environment=test. Si no lo está, alguien
 # metió credenciales de producción donde no tocaba: aborta y NO pases
 # tarjetas hasta corregirlo (cada intento sería una transacción real).
-GW_ENV=$(curl -s "$CURL_CENTRAL/payment_gateway_credentials?select=environment&venue_id=eq.$VENUE" \
-  -H "apikey: $CKEY" -H "Authorization: Bearer $CKEY" \
-  | python -c "import sys,json;d=json.load(sys.stdin);print(d[0].get('environment','') if d else '')" 2>/dev/null)
+# Query espejo EXACTO de services/payment_router.go:loadPaymentConfig
+# (venue_id + is_active=true + is_primary=true): validamos la MISMA fila
+# que el backend carga. Debe haber EXACTAMENTE 1; con 0 o >1 abortamos.
+GW_ROWS=$(curl -s "$CURL_CENTRAL/payment_gateway_credentials?select=environment&venue_id=eq.$VENUE&is_primary=eq.true&is_active=eq.true" \
+  -H "apikey: $CKEY" -H "Authorization: Bearer $CKEY")
+GW_N=$(printf '%s' "$GW_ROWS" | "$PYBIN" -c "import sys,json
+try: d=json.load(sys.stdin)
+except Exception: d=None
+print(len(d) if isinstance(d,list) else -1)" 2>/dev/null)
+if [ "$GW_N" != "1" ]; then
+  echo "ABORTADO: esperaba EXACTAMENTE 1 fila is_primary=true/is_active=true en"
+  echo "payment_gateway_credentials para el venue staging y hay '$GW_N'."
+  echo "Con 0 el backend cae al default config; con >1 este guard podría validar una fila"
+  echo "distinta de la que usa el backend. Corrige la central staging antes del smoke."
+  exit 1
+fi
+GW_ENV=$(printf '%s' "$GW_ROWS" | "$PYBIN" -c "import sys,json;d=json.load(sys.stdin);print(d[0].get('environment','') if d else '')" 2>/dev/null)
 if [ "$GW_ENV" != "test" ] && [ "$GW_ENV" != "sandbox" ]; then
   echo "ABORTADO: la pasarela del venue STAGING está en environment='$GW_ENV' (no test/sandbox)."
   echo "Esto NUNCA debería pasar en staging. Revisa payment_gateway_credentials en la"
@@ -63,7 +82,7 @@ fail() { FAIL_N=$((FAIL_N+1)); echo "  ✘ $1"; }
 check() { # check <desc> <esperado> <obtenido>
   if [ "$2" = "$3" ]; then ok "$1"; else fail "$1 (esperaba $2, fue $3)"; fi
 }
-jget() { python -c "import sys,json;
+jget() { "$PYBIN" -c "import sys,json;
 d=json.load(sys.stdin)
 for k in '$1'.split('.'): d=d.get(k,{}) if isinstance(d,dict) else {}
 print(d if not isinstance(d,dict) else '')" 2>/dev/null; }
@@ -92,7 +111,7 @@ ORDER=$(echo "$R" | jget order_id); CODE=$(echo "$R" | jget payment_link_code)
 [ -n "$ORDER" ] && ok "orden creada" || fail "crear orden"
 check "anti-carding: pay SIN code → 403" "403" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/orders/pay" -H 'Content-Type: application/json' -d "{\"order_id\":\"$ORDER\",\"card\":$CARD}")"
 check "pago con code → 200" "200" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/orders/pay" -H 'Content-Type: application/json' -d "{\"order_id\":\"$ORDER\",\"payment_link_code\":\"$CODE\",\"card\":$CARD}")"
-QR=$(curl -s "$VURL/tickets?select=qr_token&order_id=eq.$ORDER" -H "apikey: $VKEY" -H "Authorization: Bearer $VKEY" | python -c "import sys,json;d=json.load(sys.stdin);print(d[0]['qr_token'] if d else '')")
+QR=$(curl -s "$VURL/tickets?select=qr_token&order_id=eq.$ORDER" -H "apikey: $VKEY" -H "Authorization: Bearer $VKEY" | "$PYBIN" -c "import sys,json;d=json.load(sys.stdin);print(d[0]['qr_token'] if d else '')")
 [ -n "$QR" ] && ok "ticket emitido" || fail "ticket emitido"
 
 echo "== 4. Escaneo en puerta =="
@@ -110,7 +129,7 @@ if [ -n "$EVENT_PRIV" ] && [ -n "$TT_PRIV" ]; then
   ORDERP=$(echo "$R" | jget order_id); CODEP=$(echo "$R" | jget payment_link_code)
   PA=$(curl -s -X POST "$API/orders/pay" -H 'Content-Type: application/json' -d "{\"order_id\":\"$ORDERP\",\"payment_link_code\":\"$CODEP\",\"card\":$CARD}" | jget pending_approval)
   check "pago retenido (pending_approval)" "True" "$PA"
-  ST=$(curl -s "$VURL/orders?select=status&id=eq.$ORDERP" -H "apikey: $VKEY" -H "Authorization: Bearer $VKEY" | python -c "import sys,json;print(json.load(sys.stdin)[0]['status'])")
+  ST=$(curl -s "$VURL/orders?select=status&id=eq.$ORDERP" -H "apikey: $VKEY" -H "Authorization: Bearer $VKEY" | "$PYBIN" -c "import sys,json;print(json.load(sys.stdin)[0]['status'])")
   check "estado payment_authorized" "payment_authorized" "$ST"
   AP=$(curl -s -X POST "$API/orders/$ORDERP/approve" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{}' | jget success)
   check "aprobar → captura + ticket" "True" "$AP"
@@ -119,20 +138,25 @@ else
 fi
 
 echo "== 6. Login cliente + wallet =="
-# Resolver el user_id del email de prueba y leer SU código (no el global más
-# reciente — con actividad concurrente se colaría el código de otro usuario).
-UID_TEST=$(curl -s "$VURL/public_users?select=id&email=eq.$EMAIL" -H "apikey: $VKEY" -H "Authorization: Bearer $VKEY" | python -c "import sys,json;d=json.load(sys.stdin);print(d[0]['id'] if d else '')")
 curl -s -o /dev/null -X POST "$API/user-auth/request-code" -H 'Content-Type: application/json' -d "{\"email\":\"$EMAIL\"}"
-UCODE=$(curl -s "$VURL/verification_codes?select=code&used=eq.false&user_id=eq.$UID_TEST&order=created_at.desc&limit=1" -H "apikey: $VKEY" -H "Authorization: Bearer $VKEY" | python -c "import sys,json;d=json.load(sys.stdin);print(d[0]['code'] if d else '')")
-CJ=$(mktemp)
-VS=$(curl -s -c "$CJ" -X POST "$API/user-auth/verify-code" -H 'Content-Type: application/json' -d "{\"email\":\"$EMAIL\",\"code\":\"$UCODE\"}" | jget success)
-check "verify-code + cookie" "True" "$VS"
-check "profile con cookie" "True" "$(curl -s -b "$CJ" "$API/user-auth/profile" | jget success)"
-NT=$(curl -s -b "$CJ" "$API/tickets/my-tickets" | python -c "import sys,json;print(len(json.load(sys.stdin).get('tickets',[])))")
-[ "$NT" -ge 1 ] 2>/dev/null && ok "wallet con $NT tickets" || fail "wallet tickets ($NT)"
-SP=$(curl -s -b "$CJ" "$API/users/spending/venues" | python -c "import sys,json;s=json.load(sys.stdin).get('spending',[]);print(s[0]['total_spent'] if s else '')")
-[ -n "$SP" ] && ok "spending ($SP)" || fail "spending"
-rm -f "$CJ"
+# Resolver el user_id DESPUÉS del request-code (si el paso 3 falló puede no
+# existir aún el public_user) y leer SU código (no el global más reciente —
+# con actividad concurrente se colaría el código de otro usuario).
+UID_TEST=$(curl -s "$VURL/public_users?select=id&email=eq.$EMAIL" -H "apikey: $VKEY" -H "Authorization: Bearer $VKEY" | "$PYBIN" -c "import sys,json;d=json.load(sys.stdin);print(d[0]['id'] if d else '')")
+if [ -z "$UID_TEST" ]; then
+  fail "no hay public_user para $EMAIL (¿falló el paso 3?) — paso 6 SALTADO"
+else
+  UCODE=$(curl -s "$VURL/verification_codes?select=code&used=eq.false&user_id=eq.$UID_TEST&order=created_at.desc&limit=1" -H "apikey: $VKEY" -H "Authorization: Bearer $VKEY" | "$PYBIN" -c "import sys,json;d=json.load(sys.stdin);print(d[0]['code'] if d else '')")
+  CJ=$(mktemp)
+  VS=$(curl -s -c "$CJ" -X POST "$API/user-auth/verify-code" -H 'Content-Type: application/json' -d "{\"email\":\"$EMAIL\",\"code\":\"$UCODE\"}" | jget success)
+  check "verify-code + cookie" "True" "$VS"
+  check "profile con cookie" "True" "$(curl -s -b "$CJ" "$API/user-auth/profile" | jget success)"
+  NT=$(curl -s -b "$CJ" "$API/tickets/my-tickets" | "$PYBIN" -c "import sys,json;print(len(json.load(sys.stdin).get('tickets',[])))")
+  [ "$NT" -ge 1 ] 2>/dev/null && ok "wallet con $NT tickets" || fail "wallet tickets ($NT)"
+  SP=$(curl -s -b "$CJ" "$API/users/spending/venues" | "$PYBIN" -c "import sys,json;s=json.load(sys.stdin).get('spending',[]);print(s[0]['total_spent'] if s else '')")
+  [ -n "$SP" ] && ok "spending ($SP)" || fail "spending"
+  rm -f "$CJ"
+fi
 
 echo
 echo "===== RESULTADO: $PASS_N OK / $FAIL_N FALLOS ====="

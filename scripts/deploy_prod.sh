@@ -16,6 +16,10 @@
 #   flyctl releases -a pull-api-v2-prod          # lista releases con imagen
 #   flyctl deploy -c fly.prod.toml --image <ref-imagen-anterior>
 # Rollback por código: git checkout <tag-anterior> -- . && commit && deploy.
+#
+# NOTA fuente de verdad: 'origin' es el fork DamiPerezz/Pull-API-v2 — ahí viven
+# el código de producción y los tags prod-*. El repo GreenLock (upstream) está
+# desfasado y no acepta push (403); NO es referencia para rollbacks.
 # =============================================================================
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -39,10 +43,22 @@ if [ -n "$(git status --porcelain)" ]; then
 fi
 
 git fetch origin main --quiet
-if ! git merge-base --is-ancestor HEAD origin/main; then
-  echo "ERROR: HEAD no está en origin/main. Haz 'git push' primero:"
-  echo "       nunca deployamos código que no esté respaldado en GitHub."
-  exit 1
+if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
+  if git merge-base --is-ancestor HEAD origin/main; then
+    behind=$(git rev-list --count HEAD..origin/main)
+    echo "ERROR: HEAD está $behind commit(s) POR DETRÁS de origin/main — deployarías"
+    echo "       código viejo y el tag mentiría. Haz 'git pull' primero."
+    if [ "${ALLOW_OLD_DEPLOY:-}" = "1" ]; then
+      echo "(ALLOW_OLD_DEPLOY=1 — rollback deliberado a versión antigua, continuando)"
+    else
+      echo "       Para un rollback deliberado: ALLOW_OLD_DEPLOY=1 bash scripts/deploy_prod.sh"
+      exit 1
+    fi
+  else
+    echo "ERROR: HEAD no está pusheado a origin/main. Haz 'git push' primero:"
+    echo "       nunca deployamos código que no esté respaldado en GitHub."
+    exit 1
+  fi
 fi
 
 echo "== go build + go vet =="
@@ -64,8 +80,13 @@ else
   exit 1
 fi
 
-tag="prod-$(date +%Y%m%d-%H%M)"
-git tag -a "$tag" -m "Deploy $APP commit $commit"
-git push origin "$tag" --quiet
-echo ""
-echo "== DEPLOYADO: $commit → $APP  (tag: $tag) =="
+tag="prod-$(date +%Y%m%d-%H%M%S)"
+if git tag -a "$tag" -m "Deploy $APP commit $commit" && git push origin "$tag" --quiet; then
+  echo ""
+  echo "== DEPLOYADO: $commit → $APP  (tag: $tag) =="
+else
+  echo ""
+  echo "== DEPLOYADO: $commit → $APP  — PERO el tag falló =="
+  echo "El deploy SÍ está vivo y verificado; crea el tag a mano:"
+  echo "  git tag -a $tag -m 'Deploy $APP commit $commit' && git push origin $tag"
+fi

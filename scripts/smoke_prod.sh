@@ -6,6 +6,9 @@
 # Crea órdenes de prueba — límpialas antes del evento real.
 # =============================================
 set -u
+cd "$(dirname "$0")/.."
+[ -f .env.prod.local ] || { echo "ABORTADO: no encuentro .env.prod.local (¿repo equivocado?)"; exit 1; }
+command -v python >/dev/null 2>&1 || { echo "ABORTADO: falta python en PATH"; exit 1; }
 API="https://pull-511-events.pages.dev/api/v1"
 FLY="https://pull-api-v2-prod.fly.dev"
 VENUE="5d3a4758-fabb-46a2-9dc3-86b2ee8bcafa"
@@ -20,24 +23,48 @@ VKEY=$(grep "^DEFAULT_SERVICE_KEY=" .env.prod.local | cut -d= -f2-)
 PASS=$(grep "^STAFF_ADMIN_PASSWORD=" .env.prod.local | cut -d= -f2-)
 VURL="https://faioqaaaonucbnxpmpxx.supabase.co/rest/v1"
 CKEY=$(grep "^CENTRAL_SERVICE_KEY=" .env.prod.local | cut -d= -f2-)
+[ -n "$CKEY" ] || { echo "ABORTADO: CENTRAL_SERVICE_KEY no encontrada en .env.prod.local"; exit 1; }
 CURL_CENTRAL="https://mwuppgpmlynfxyghkpzv.supabase.co/rest/v1"
 
 # ── GUARD POST-CUTOVER ───────────────────────────────────────────────
 # Este script pasa una tarjeta por /orders/pay. Con la pasarela del venue
-# en environment=production eso sería un COBRO REAL (aunque la 4111 test
-# sería rechazada, cada intento cuenta como transacción real y dispara
-# los límites anti-carding). Solo se permite con la fila en test/sandbox.
-GW_ENV=$(curl -s "$CURL_CENTRAL/payment_gateway_credentials?select=environment&venue_id=eq.$VENUE" \
+# en environment=production eso sería un COBRO REAL. La query espeja
+# EXACTAMENTE el filtro del backend (payment_router.go: is_active=true AND
+# is_primary=true) y exige UNA sola fila — cualquier ambigüedad o fallo de
+# lectura aborta (fail-closed).
+# ⚠️ TOCTOU: el backend cachea la config de pasarela 5 MINUTOS. Tras cambiar
+# la fila (cutover o rollback), espera >5 min o haz
+#   flyctl apps restart pull-api-v2-prod
+# antes de fiarte de este guard.
+GW_ENV=$(curl -s "$CURL_CENTRAL/payment_gateway_credentials?select=environment&venue_id=eq.$VENUE&is_active=eq.true&is_primary=eq.true" \
   -H "apikey: $CKEY" -H "Authorization: Bearer $CKEY" \
-  | python -c "import sys,json;d=json.load(sys.stdin);print(d[0].get('environment','') if d else '')" 2>/dev/null)
-if [ "$GW_ENV" != "test" ] && [ "$GW_ENV" != "sandbox" ]; then
-  echo "ABORTADO: la pasarela del venue está en environment='$GW_ENV' (no test/sandbox)."
-  echo "Tras el cutover a Cybersource PRODUCCIÓN este smoke ya no debe correr:"
-  echo "usa el smoke de STAGING para probar pagos, y verifica prod con los"
-  echo "pasos no-monetarios (health, login, listados) a mano."
-  exit 1
-fi
-echo "(pasarela venue en environment=$GW_ENV — OK para smoke con tarjeta test)"
+  | python -c "import sys,json
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    print('READ_ERROR'); raise SystemExit
+if not isinstance(d,list) or len(d)==0: print('READ_ERROR')
+elif len(d)>1: print('AMBIGUOUS')
+else: print(d[0].get('environment','READ_ERROR'))" 2>/dev/null)
+[ -n "$GW_ENV" ] || GW_ENV="READ_ERROR"
+case "$GW_ENV" in
+  test|sandbox)
+    echo "(pasarela venue en environment=$GW_ENV — OK para smoke con tarjeta test)";;
+  AMBIGUOUS)
+    echo "ABORTADO: hay MÁS de una fila activa+primaria en payment_gateway_credentials"
+    echo "para el venue — estado ambiguo; arregla las filas antes de correr el smoke."
+    exit 1;;
+  READ_ERROR)
+    echo "ABORTADO: no pude leer la fila de la pasarela (red, clave o respuesta"
+    echo "inesperada) — fail-closed: sin confirmación de sandbox no se pasa tarjeta."
+    exit 1;;
+  *)
+    echo "ABORTADO: la pasarela del venue está en environment='$GW_ENV' (no test/sandbox)."
+    echo "Tras el cutover a Cybersource PRODUCCIÓN este smoke ya no debe correr:"
+    echo "usa scripts/smoke_staging.sh para pagos, y verifica prod con los pasos"
+    echo "no-monetarios (health, login, listados) a mano."
+    exit 1;;
+esac
 
 PASS_N=0; FAIL_N=0
 ok()   { PASS_N=$((PASS_N+1)); echo "  ✔ $1"; }
@@ -56,7 +83,8 @@ check "web viva"       "200" "$(curl -s -o /dev/null -w '%{http_code}' https://p
 check "CORS origin hostil bloqueado" "Origin not allowed" "$(curl -s -X POST $FLY/api/v1/orders/create-pending-order -H 'Origin: https://evil.example.com' -H 'Content-Type: application/json' -d '{}' | jget error)"
 
 echo "== 2. Staff =="
-TOKEN=$(curl -s -X POST "$API/auth/login-staff" -H 'Content-Type: application/json' -d "{\"email\":\"$EMAIL\",\"password\":\"$PASS\"}" | jget token)
+LOGIN_BODY=$(E="$EMAIL" P="$PASS" python -c "import json,os;print(json.dumps({'email':os.environ['E'],'password':os.environ['P']}))")
+TOKEN=$(printf '%s' "$LOGIN_BODY" | curl -s -X POST "$API/auth/login-staff" -H 'Content-Type: application/json' -d @- | jget token)
 [ -n "$TOKEN" ] && ok "login staff" || fail "login staff"
 check "eventos" "200" "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$API/event/upcoming-events/$VENUE")"
 PAG=$(curl -s -H "Authorization: Bearer $TOKEN" "$API/orders/venue/$VENUE?status=All&limit=5" | jget pagination.totalCount)

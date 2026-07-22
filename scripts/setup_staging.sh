@@ -27,7 +27,10 @@
 #           .env.prod.local presente, go y python en PATH.
 # Idempotente razonable: si una fila ya existe (venue por slug, etc.)
 # la reutiliza con aviso en vez de duplicar.
-# NUNCA imprime secretos en claro.
+# NUNCA imprime secretos en claro, con UNA excepción deliberada: la
+# password del admin recién generada SÍ se muestra una única vez en el
+# resumen final (además de persistirse en .env.staging.local) para que
+# el operador la guarde en su gestor de contraseñas.
 # =============================================
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -112,8 +115,13 @@ echo "  ✔ precondiciones OK (central staging: $CREF, venue staging: $VREF)"
 # Primero intenta el archivo ENTERO en una sola query; si la API lo rechaza
 # (tamaño u otro error) lo trocea POR STATEMENT con un splitter que respeta
 # dollar-quoting ($$...$$), strings y comentarios, tolerando los errores de
-# "ya existe" (re-runs). Fallback final documentado: pegar el archivo en el
-# SQL Editor del dashboard.
+# "ya existe" (re-runs; cada statement tolerado se loggea a stderr).
+# Limitaciones del splitter: los comentarios de bloque ANIDADOS
+# (/* /* */ */) NO están soportados; los statements que quedan vacíos
+# tras quitar comentarios y espacios se descartan (p.ej. el bloque final
+# de solo-comentarios de central_schema.sql).
+# Fallback final documentado: pegar el archivo en el SQL Editor del
+# dashboard.
 apply_sql() {
   local ref="$1" file="$2" label="$3"
   echo "  → aplicando $file al proyecto $ref ($label)"
@@ -181,14 +189,25 @@ def split_sql(text):
     if s: stmts.append(s)
     return stmts
 
+def comment_only(stmt):
+    # True si el statement queda vacio tras quitar comentarios y espacios.
+    # Suficiente para descartar bloques de solo-comentarios; los
+    # comentarios de bloque anidados NO estan soportados.
+    s = re.sub(r"/\*.*?\*/", "", stmt, flags=re.S)
+    s = re.sub(r"--[^\n]*", "", s)
+    return not s.strip()
+
 status, body = run(sql)
 if 200 <= status < 300:
     print("    OK (archivo entero, 1 query)")
     sys.exit(0)
 
 print("    la query entera fallo (HTTP %s) — reintento por statement..." % status)
-tolerable = ("already exists", "duplicate", "42710", "42p07", "42701", "42p16")
-stmts = split_sql(sql)
+# OJO: nada de 'duplicate' generico — matchearia el 23505 de un seed
+# fallido ('duplicate key value violates unique constraint') y lo
+# tragariamos en silencio. Solo errores DDL de "ya existe".
+tolerable = ("already exists", "42710", "42p07", "42701", "42p16", "duplicate object")
+stmts = [s for s in split_sql(sql) if not comment_only(s)]
 skipped = 0
 for k, st in enumerate(stmts, 1):
     status, body = run(st)
@@ -197,6 +216,9 @@ for k, st in enumerate(stmts, 1):
     low = body.lower()
     if any(t in low for t in tolerable):
         skipped += 1
+        first = st.splitlines()[0][:120] if st.splitlines() else ""
+        print("    tolerado (ya existia) stmt %d/%d: %s" % (k, len(stmts), first),
+              file=sys.stderr)
         continue
     if status == 401:
         print("    ERROR: SUPABASE_ACCESS_TOKEN invalido o expirado (401).")
@@ -244,7 +266,42 @@ print("" if v is None else v)
 PY
 }
 
+# jcount — número de filas del array JSON en $REST_BODY (-1 si no parsea)
+jcount() {
+  "$PYBIN" - "$REST_BODY" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print(-1); raise SystemExit
+print(len(d) if isinstance(d, list) else -1)
+PY
+}
+
 gen_uuid() { { uuidgen 2>/dev/null || "$PYBIN" -c "import uuid;print(uuid.uuid4())"; } | tr 'A-Z' 'a-z'; }
+
+# persist_admin_creds — escribe STAFF_ADMIN_EMAIL/STAFF_ADMIN_PASSWORD en
+# $ENV_STG (mismo convenio que .env.prod.local). Se llama INMEDIATAMENTE
+# tras crear/rehashear el admin para que un fallo posterior (p.ej. flyctl)
+# no pierda la password para siempre. ADMIN_PASS es token_urlsafe
+# ([A-Za-z0-9_-]) — seguro para sed sin escapar.
+persist_admin_creds() {
+  if grep -q '^STAFF_ADMIN_EMAIL=' "$ENV_STG"; then
+    sed -i "s|^STAFF_ADMIN_EMAIL=.*|STAFF_ADMIN_EMAIL=$ADMIN_EMAIL|" "$ENV_STG"
+  else
+    {
+      echo ""
+      echo "# Staff admin de staging (generado por scripts/setup_staging.sh)"
+      echo "STAFF_ADMIN_EMAIL=$ADMIN_EMAIL"
+    } >> "$ENV_STG"
+  fi
+  if grep -q '^STAFF_ADMIN_PASSWORD=' "$ENV_STG"; then
+    sed -i "s|^STAFF_ADMIN_PASSWORD=.*|STAFF_ADMIN_PASSWORD=$ADMIN_PASS|" "$ENV_STG"
+  else
+    echo "STAFF_ADMIN_PASSWORD=$ADMIN_PASS" >> "$ENV_STG"
+  fi
+  echo "  ✔ STAFF_ADMIN_* persistidos en $ENV_STG"
+}
 
 # ── 1. Esquemas via Management API ───────────────────────────────────
 echo "== 1. Esquema SQL (Management API) =="
@@ -352,22 +409,62 @@ fi
 # ── 3. Migrar la pasarela Cybersource SANDBOX desde prod ─────────────
 echo "== 3. Pasarela sandbox (payment_gateway_credentials prod → staging) =="
 
-rest "$STG_CENTRAL_URL" "$STG_CENTRAL_KEY" GET "payment_gateway_credentials?venue_id=eq.$VENUE_ID&select=id,environment"
-PGC_ID=$(jfield id)
-if [ -n "$PGC_ID" ]; then
+# Guard espejo EXACTO de services/payment_router.go:loadPaymentConfig
+# (venue_id + is_active=true + is_primary=true): hay que validar la MISMA
+# fila que el backend va a cargar, no una cualquiera (con >1 fila, d[0]
+# sin filtrar podía ser otra).
+rest "$STG_CENTRAL_URL" "$STG_CENTRAL_KEY" GET "payment_gateway_credentials?venue_id=eq.$VENUE_ID&select=id"
+PGC_TOTAL=$(jcount)
+[ "$PGC_TOTAL" -ge 0 ] 2>/dev/null || { echo "  ✘ no pude leer payment_gateway_credentials del central staging (HTTP $REST_CODE)"; exit 1; }
+rest "$STG_CENTRAL_URL" "$STG_CENTRAL_KEY" GET "payment_gateway_credentials?venue_id=eq.$VENUE_ID&is_primary=eq.true&is_active=eq.true&select=id,environment"
+PGC_N=$(jcount)
+if [ "$PGC_N" = "1" ]; then
   PGC_ENV=$(jfield environment)
-  echo "  ⚠ ya existe fila de pasarela para el venue staging (environment=$PGC_ENV) — salto"
+  echo "  ⚠ ya existe fila primaria activa de pasarela para el venue staging (environment=$PGC_ENV) — salto"
   if [ "$PGC_ENV" != "test" ] && [ "$PGC_ENV" != "sandbox" ]; then
     echo "  ✘ PELIGRO: esa fila NO está en test/sandbox. Staging jamás debe cobrar dinero real. Corrígela a mano."
     exit 1
   fi
+elif [ "$PGC_N" != "0" ]; then
+  echo "  ✘ hay $PGC_N filas is_primary=true/is_active=true de pasarela para el venue staging."
+  echo "    Con más de una, el backend cargaría una al azar (limit 1 sin order) — imposible"
+  echo "    garantizar sandbox. Deja EXACTAMENTE una fila primaria activa y re-ejecuta."
+  exit 1
+elif [ "$PGC_TOTAL" != "0" ]; then
+  echo "  ✘ hay $PGC_TOTAL fila(s) de pasarela para el venue staging pero NINGUNA is_primary=true/is_active=true."
+  echo "    El backend caería al default config (Stripe). Marca la fila sandbox como primaria"
+  echo "    y activa (o bórralas todas para que este script la re-cree) y re-ejecuta."
+  exit 1
 else
-  # Solo LECTURA contra la central de prod.
+  # Solo LECTURA contra la central de prod. Filtramos environment
+  # in.(test,sandbox): tras el cutover a producción la fila PRIMARIA de
+  # prod será la REAL, y copiarla a staging sería un desastre. A propósito
+  # NO exigimos is_primary (la sandbox deja de ser primaria tras el
+  # cutover) — solo sandbox + activa.
   PROD_ROW="$TMP_WORK/pgc_prod.json"
   code=$(curl -s -o "$PROD_ROW" -w '%{http_code}' \
-    "$PROD_CENTRAL_URL/rest/v1/payment_gateway_credentials?venue_id=eq.$PROD_VENUE_ID&is_primary=eq.true&is_active=eq.true&limit=1" \
+    "$PROD_CENTRAL_URL/rest/v1/payment_gateway_credentials?venue_id=eq.$PROD_VENUE_ID&environment=in.(test,sandbox)&is_active=eq.true&limit=1" \
     -H "apikey: $PROD_CENTRAL_KEY" -H "Authorization: Bearer $PROD_CENTRAL_KEY")
   [ "$code" = "200" ] || { echo "  ✘ ERROR leyendo la fila de prod (HTTP $code)"; exit 1; }
+
+  PROD_N=$("$PYBIN" - "$PROD_ROW" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print(-1); raise SystemExit
+print(len(d) if isinstance(d, list) else -1)
+PY
+)
+  if [ "$PROD_N" != "1" ]; then
+    echo "  ✘ NO hay fila de pasarela SANDBOX (environment in test/sandbox, is_active=true) en la"
+    echo "    central de PROD para el venue $PROD_VENUE_ID."
+    echo "    Este script SOLO copia credenciales sandbox — jamás las de producción. Crea o"
+    echo "    reactiva la fila sandbox en la central de prod (aunque ya no sea is_primary tras"
+    echo "    el cutover) e inténtalo de nuevo, o inserta la fila de staging a mano con"
+    echo "    environment=test."
+    exit 1
+  fi
 
   OLD_ENC=$("$PYBIN" - "$PROD_ROW" <<'PY'
 import json, sys
@@ -375,7 +472,7 @@ d = json.load(open(sys.argv[1]))
 print(d[0].get("secret_key_encrypted", "") if d else "")
 PY
 )
-  [ -n "$OLD_ENC" ] || { echo "  ✘ la fila de prod no tiene secret_key_encrypted (¿venue id correcto?)"; exit 1; }
+  [ -n "$OLD_ENC" ] || { echo "  ✘ la fila sandbox de prod no tiene secret_key_encrypted (¿venue id correcto?)"; exit 1; }
 
   echo "  → re-cifrando secret: APP_KEY prod → APP_KEY staging (cmd/recrypt; el secreto nunca se imprime)"
   NEW_ENC=$(printf '%s' "$OLD_ENC" | OLD_KEY="$PROD_APP_KEY" NEW_KEY="$STG_APP_KEY" go run ./cmd/recrypt)
@@ -420,15 +517,34 @@ ADMIN_PASS=""
 rest "$STG_VENUE_URL" "$STG_VENUE_KEY" GET "organization_workers?email=eq.$ADMIN_EMAIL&select=id"
 ADMIN_ID=$(jfield id)
 if [ -n "$ADMIN_ID" ]; then
-  echo "  ⚠ admin $ADMIN_EMAIL ya existe ($ADMIN_ID) — conservo su password actual"
+  if [ -n "$(env_get "$ENV_STG" STAFF_ADMIN_PASSWORD)" ]; then
+    echo "  ⚠ admin $ADMIN_EMAIL ya existe ($ADMIN_ID) — conservo su password actual (ya está en $ENV_STG)"
+  else
+    # Re-run tras un fallo intermedio: el admin existe pero la password se
+    # perdió (no llegó a persistirse). Regenerar y re-hashear para no dejar
+    # smoke_staging.sh bloqueado.
+    echo "  ⚠ admin $ADMIN_EMAIL ya existe ($ADMIN_ID) pero $ENV_STG no tiene STAFF_ADMIN_PASSWORD"
+    echo "    → regenero password y actualizo su password_hash"
+    ADMIN_PASS=$("$PYBIN" -c "import secrets;print(secrets.token_urlsafe(18))")
+    ADMIN_HASH=$(printf '%s' "$ADMIN_PASS" | go run ./cmd/hashpwd)
+    [ -n "$ADMIN_HASH" ] || { echo "  ✘ cmd/hashpwd no devolvió hash"; exit 1; }
+    rest "$STG_VENUE_URL" "$STG_VENUE_KEY" PATCH "organization_workers?id=eq.$ADMIN_ID" \
+      "{\"password_hash\":\"$ADMIN_HASH\"}"
+    { [ "$REST_CODE" = "200" ] || [ "$REST_CODE" = "204" ]; } || { echo "  ✘ ERROR actualizando password_hash del admin (HTTP $REST_CODE):"; cat "$REST_BODY"; exit 1; }
+    persist_admin_creds
+    echo "  ✔ password del admin regenerada"
+  fi
 else
   ADMIN_PASS=$("$PYBIN" -c "import secrets;print(secrets.token_urlsafe(18))")
-  ADMIN_HASH=$(go run ./cmd/hashpwd "$ADMIN_PASS")
+  ADMIN_HASH=$(printf '%s' "$ADMIN_PASS" | go run ./cmd/hashpwd)
   [ -n "$ADMIN_HASH" ] || { echo "  ✘ cmd/hashpwd no devolvió hash"; exit 1; }
   rest "$STG_VENUE_URL" "$STG_VENUE_KEY" POST "organization_workers" \
     "{\"email\":\"$ADMIN_EMAIL\",\"first_name\":\"Damian\",\"last_name\":\"Perez\",\"password_hash\":\"$ADMIN_HASH\",\"role_id\":\"$ADMIN_ROLE_ID\",\"is_active\":true}"
   [ "$REST_CODE" = "201" ] || { echo "  ✘ ERROR creando admin (HTTP $REST_CODE):"; cat "$REST_BODY"; exit 1; }
   ADMIN_ID=$(jfield id)
+  # Persistir INMEDIATAMENTE: si algo posterior falla (flyctl, evento...)
+  # la password no se pierde y el re-run no bloquea smoke_staging.sh.
+  persist_admin_creds
   echo "  ✔ admin staff creado ($ADMIN_EMAIL, rol admin)"
 fi
 
@@ -458,6 +574,17 @@ else
   echo "  ✔ ticket type creado: General Q100 ($TICKET_ID)"
 fi
 
+# ── IDs locales — ANTES de Fly, para que un fallo de flyctl no los pierda ─
+cat > "$IDS_FILE" <<EOF
+# Generado por scripts/setup_staging.sh — lo leen smoke_staging.sh y otros.
+VENUE_ID=$VENUE_ID
+EVENT_ID=$EVENT_ID
+TICKET_TYPE_ID=$TICKET_ID
+ADMIN_EMAIL=$ADMIN_EMAIL
+EOF
+grep -qxF "$IDS_FILE" .gitignore 2>/dev/null || echo "$IDS_FILE" >> .gitignore
+echo "IDs escritos en $IDS_FILE (gitignored)"
+
 # ── 5. Secrets SUPABASE_* a Fly ──────────────────────────────────────
 echo "== 5. Secrets SUPABASE_* → Fly ($FLY_APP, --stage) =="
 command -v flyctl >/dev/null 2>&1 || export PATH="$PATH:$HOME/.fly/bin"
@@ -475,33 +602,6 @@ else
   echo "  ⚠ flyctl no está en PATH. Sube los 6 SUPABASE_* a mano (valores en $ENV_STG):"
   echo "    flyctl secrets set -a $FLY_APP --stage CENTRAL_SUPABASE_URL=... CENTRAL_SERVICE_KEY=... \\"
   echo "      CENTRAL_ANON_KEY=... DEFAULT_SUPABASE_URL=... DEFAULT_SERVICE_KEY=... DEFAULT_ANON_KEY=..."
-fi
-
-# ── IDs y credenciales locales ───────────────────────────────────────
-cat > "$IDS_FILE" <<EOF
-# Generado por scripts/setup_staging.sh — lo leen smoke_staging.sh y otros.
-VENUE_ID=$VENUE_ID
-EVENT_ID=$EVENT_ID
-TICKET_TYPE_ID=$TICKET_ID
-ADMIN_EMAIL=$ADMIN_EMAIL
-EOF
-grep -qxF "$IDS_FILE" .gitignore 2>/dev/null || echo "$IDS_FILE" >> .gitignore
-echo "IDs escritos en $IDS_FILE (gitignored)"
-
-# STAFF_ADMIN_* en .env.staging.local para que smoke_staging.sh haga login
-# (mismo convenio que .env.prod.local).
-if [ -n "$ADMIN_PASS" ]; then
-  if grep -q '^STAFF_ADMIN_EMAIL=' "$ENV_STG"; then
-    sed -i "s|^STAFF_ADMIN_EMAIL=.*|STAFF_ADMIN_EMAIL=$ADMIN_EMAIL|" "$ENV_STG"
-    sed -i "s|^STAFF_ADMIN_PASSWORD=.*|STAFF_ADMIN_PASSWORD=$ADMIN_PASS|" "$ENV_STG"
-  else
-    {
-      echo ""
-      echo "# Staff admin de staging (generado por scripts/setup_staging.sh)"
-      echo "STAFF_ADMIN_EMAIL=$ADMIN_EMAIL"
-      echo "STAFF_ADMIN_PASSWORD=$ADMIN_PASS"
-    } >> "$ENV_STG"
-  fi
 fi
 
 # ── Resumen ──────────────────────────────────────────────────────────

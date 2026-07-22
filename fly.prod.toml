@@ -36,7 +36,11 @@ primary_region = "dfw"   # Dallas — closest active region to Guatemala (mia de
   FRONTEND_URL = "https://pull-511-events.pages.dev"
   # Soft memory ceiling so the Go GC gets aggressive before Fly's OOM
   # killer does (PDF generation runs in unbounded goroutines).
-  GOMEMLIMIT = "460MiB"
+  # 2026-07-22: máquinas subidas a 1GB para el evento (flyctl scale memory
+  # 1024) y GOMEMLIMIT=900MiB seteado ADEMÁS como secret de Fly para efecto
+  # inmediato (los secrets pisan este [env]). Si algún día se baja la RAM,
+  # bajar también el secret o eliminarlo tras alinear este valor.
+  GOMEMLIMIT = "900MiB"
 
 [http_service]
   internal_port = 8080
