@@ -1,5 +1,11 @@
 # =============================================
-# Fly.io app config — Pull API v2 demo
+# Fly.io app config — Pull API v2 DEMO (Aurora Hall, cuenta de Diego)
+# Deploy (deliberado, nunca por defecto):
+#   flyctl deploy -c fly.demo.toml --remote-only
+# Este archivo se llamaba fly.toml; se renombró a propósito para que
+# `flyctl deploy` a secas FALLE en vez de deployar a la demo sin querer.
+# Entornos reales de 511 Events: fly.staging.toml y fly.prod.toml.
+# Ver ENVIRONMENTS.md en la raíz del workspace.
 # =============================================
 app = "pull-api-v2-demo"
 primary_region = "dfw"   # Dallas — closest active region to Guatemala (mia deprecated)
@@ -8,8 +14,13 @@ primary_region = "dfw"   # Dallas — closest active region to Guatemala (mia de
 
 [env]
   PORT = "8080"
+  # production a propósito: la demo es pública y necesita el comportamiento
+  # de seguridad de production (cookies secure, errores opacos, etc.).
   ENVIRONMENT = "production"
   DEMO_MODE = "true"
+  # Autoriza la combinación production+demo SOLO aquí (ver fail-safe en
+  # main.go). Prod y staging no deben definir esta variable jamás.
+  ALLOW_DEMO_MODE = "true"
   COOKIE_SAMESITE = "None"
   RESEND_FROM_EMAIL = "Pull Events <noreply@tickets.pullevents.com>"
 

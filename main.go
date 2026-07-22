@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"os"
 	"pull-api-v2/config"
 	"pull-api-v2/controllers"
 	"pull-api-v2/middleware"
@@ -17,7 +18,11 @@ func main() {
 	// FAIL-SAFE: en producción, DEMO_MODE=true convertiría /orders/simulate-
 	// payment en un emisor de tickets GRATIS (MockProcessor siempre aprueba).
 	// Mejor no arrancar que abrir esa puerta con dinero real en juego.
-	if config.IsProduction() && config.App.DemoMode {
+	// Excepción: la demo pública Aurora Hall corre a propósito con
+	// production+demo (necesita el comportamiento de seguridad de production);
+	// se declara con ALLOW_DEMO_MODE=true en su fly.demo.toml — ningún otro
+	// entorno debe definir esa variable.
+	if config.IsProduction() && config.App.DemoMode && os.Getenv("ALLOW_DEMO_MODE") != "true" {
 		log.Fatal("FATAL: DEMO_MODE=true con ENVIRONMENT=production — abortando (emitiría tickets gratis)")
 	}
 

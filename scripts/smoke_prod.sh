@@ -19,6 +19,25 @@ EMAIL="damian.perez@greenlock.tech"
 VKEY=$(grep "^DEFAULT_SERVICE_KEY=" .env.prod.local | cut -d= -f2-)
 PASS=$(grep "^STAFF_ADMIN_PASSWORD=" .env.prod.local | cut -d= -f2-)
 VURL="https://faioqaaaonucbnxpmpxx.supabase.co/rest/v1"
+CKEY=$(grep "^CENTRAL_SERVICE_KEY=" .env.prod.local | cut -d= -f2-)
+CURL_CENTRAL="https://mwuppgpmlynfxyghkpzv.supabase.co/rest/v1"
+
+# ── GUARD POST-CUTOVER ───────────────────────────────────────────────
+# Este script pasa una tarjeta por /orders/pay. Con la pasarela del venue
+# en environment=production eso sería un COBRO REAL (aunque la 4111 test
+# sería rechazada, cada intento cuenta como transacción real y dispara
+# los límites anti-carding). Solo se permite con la fila en test/sandbox.
+GW_ENV=$(curl -s "$CURL_CENTRAL/payment_gateway_credentials?select=environment&venue_id=eq.$VENUE" \
+  -H "apikey: $CKEY" -H "Authorization: Bearer $CKEY" \
+  | python -c "import sys,json;d=json.load(sys.stdin);print(d[0].get('environment','') if d else '')" 2>/dev/null)
+if [ "$GW_ENV" != "test" ] && [ "$GW_ENV" != "sandbox" ]; then
+  echo "ABORTADO: la pasarela del venue está en environment='$GW_ENV' (no test/sandbox)."
+  echo "Tras el cutover a Cybersource PRODUCCIÓN este smoke ya no debe correr:"
+  echo "usa el smoke de STAGING para probar pagos, y verifica prod con los"
+  echo "pasos no-monetarios (health, login, listados) a mano."
+  exit 1
+fi
+echo "(pasarela venue en environment=$GW_ENV — OK para smoke con tarjeta test)"
 
 PASS_N=0; FAIL_N=0
 ok()   { PASS_N=$((PASS_N+1)); echo "  ✔ $1"; }

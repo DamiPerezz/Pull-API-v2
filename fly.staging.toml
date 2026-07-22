@@ -1,0 +1,62 @@
+# =============================================
+# Fly.io app config — Pull API v2 STAGING (511 Events, pre-producción)
+# Deploy:  scripts/deploy_staging.sh   (o a mano:
+#          flyctl deploy -c fly.staging.toml --remote-only)
+#
+# Espejo de producción (mismo código, DEMO_MODE=false, flujo Cybersource
+# real) pero con dinero de MENTIRA: la fila payment_gateway_credentials
+# de su BD central staging queda SIEMPRE en environment=test (sandbox
+# apitest.cybersource.com, tarjeta 4111 1111 1111 1111).
+# Tras el cutover de prod a Cybersource producción, este es el ÚNICO
+# entorno donde probar pagos sin cobrar dinero real.
+#
+# Secretos (flyctl secrets set -a pull-api-v2-staging KEY=value):
+# JWT_SECRET y APP_KEY PROPIOS de staging (nunca los de prod — así un
+# token o backup de staging jamás abre prod), SUPABASE de los proyectos
+# staging, BREVO_API_KEY (cuenta compartida, remitente distinto),
+# PROXY_SHARED_SECRET propio de staging.
+# Ver ENVIRONMENTS.md en la raíz del workspace.
+# =============================================
+app = "pull-api-v2-staging"
+primary_region = "dfw"   # Dallas — closest active region to Guatemala (mia deprecated)
+
+[build]
+
+[env]
+  PORT = "8080"
+  # production a propósito: staging debe comportarse EXACTAMENTE como prod
+  # (cookies secure, errores opacos, validación de secretos). Lo que lo
+  # hace staging son sus credenciales: Supabase staging + Cybersource test.
+  ENVIRONMENT = "production"
+  DEMO_MODE = "false"
+  COOKIE_SAMESITE = "None"
+  RESEND_FROM_EMAIL = "Pull Events <noreply@tickets.pullevents.com>"
+  BREVO_FROM_EMAIL = "511 STAGING <info@pullevents.com>"
+  ALLOWED_ORIGINS = "https://staging.pull-511-events.pages.dev"
+  FRONTEND_URL = "https://staging.pull-511-events.pages.dev"
+  GOMEMLIMIT = "460MiB"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # A diferencia de prod: staging se APAGA solo cuando nadie lo usa
+  # (coste ~0) y arranca en ~1s con la primera request.
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 50
+    hard_limit = 80
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "15s"
+    method = "GET"
+    path = "/health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
