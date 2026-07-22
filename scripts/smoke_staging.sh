@@ -139,10 +139,12 @@ fi
 
 echo "== 6. Login cliente + wallet =="
 curl -s -o /dev/null -X POST "$API/user-auth/request-code" -H 'Content-Type: application/json' -d "{\"email\":\"$EMAIL\"}"
+sleep 1   # deja que el código quede commiteado antes de leerlo
 # Resolver el user_id DESPUÉS del request-code (si el paso 3 falló puede no
-# existir aún el public_user) y leer SU código (no el global más reciente —
-# con actividad concurrente se colaría el código de otro usuario).
-UID_TEST=$(curl -s "$VURL/public_users?select=id&email=eq.$EMAIL" -H "apikey: $VKEY" -H "Authorization: Bearer $VKEY" | "$PYBIN" -c "import sys,json;d=json.load(sys.stdin);print(d[0]['id'] if d else '')")
+# existir aún el public_user) y leer SU código. ORDER BY created_at desc:
+# con corridas repetidas puede haber >1 public_user con este email y sin
+# orden d[0] era arbitrario → cogía un user sin el código fresco → 400.
+UID_TEST=$(curl -s "$VURL/public_users?select=id&email=eq.$EMAIL&order=created_at.desc&limit=1" -H "apikey: $VKEY" -H "Authorization: Bearer $VKEY" | "$PYBIN" -c "import sys,json;d=json.load(sys.stdin);print(d[0]['id'] if d else '')")
 if [ -z "$UID_TEST" ]; then
   fail "no hay public_user para $EMAIL (¿falló el paso 3?) — paso 6 SALTADO"
 else
