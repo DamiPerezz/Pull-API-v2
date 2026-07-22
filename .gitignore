@@ -3,6 +3,7 @@
 .env.local
 .env.*.local
 .staging.ids
+.backups/
 *.pem
 *.key
 *_rsa

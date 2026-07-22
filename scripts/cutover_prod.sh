@@ -3,6 +3,12 @@
 # CUTOVER A PRODUCCIÓN — Cybersource/NeoNet (511 Events)
 # Cambia la fila de credenciales del venue de SANDBOX a PRODUCCIÓN.
 #
+# NOTA (modelo B — 2 cuentas Cybersource): el script canónico es
+# scripts/cutover_modelo_b.sh (entrada → cuenta del venue, fee 8% →
+# cuenta de Pull vía PLATFORM_FEE_VENUE_ID). Este script equivale a su
+# modo `cliente` (solo la fila del venue, sin tocar la fila Pull
+# Platform); para la prueba real E2E o el rollback usa el nuevo.
+#
 # ⚠️ SOLO ejecutar cuando: (1) tengas las credenciales REST de PRODUCCIÓN
 # generadas en el EBC2 (businesscenter.cybersource.com → Payment
 # Configuration → Key Management → Generate Key → REST), y (2) vayas a hacer
