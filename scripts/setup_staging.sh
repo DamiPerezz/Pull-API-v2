@@ -394,6 +394,13 @@ else
   echo "  ✔ venue creado: $VENUE_NAME ($VENUE_ID, slug $VENUE_SLUG, fee 8%)"
 fi
 
+# central_schema.sql trae venues SEED de ejemplo ("Test Venue", fee 5%). El
+# fallback "primer venue activo" del backend (pay_controller/legacy_compat)
+# puede pillar el seed en vez del nuestro → fee equivocado, gateway default
+# Stripe y 403 de venue en el staff. Desactivarlos SIEMPRE (idempotente).
+rest "$STG_CENTRAL_URL" "$STG_CENTRAL_KEY" PATCH "venues?slug=neq.$VENUE_SLUG&is_active=eq.true" '{"is_active": false}'
+echo "  ✔ venues seed del template desactivados (solo $VENUE_SLUG queda activo)"
+
 rest "$STG_CENTRAL_URL" "$STG_CENTRAL_KEY" GET "venue_database_configs?venue_id=eq.$VENUE_ID&select=id"
 DBCFG_ID=$(jfield id)
 if [ -n "$DBCFG_ID" ]; then
