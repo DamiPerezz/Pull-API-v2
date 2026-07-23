@@ -682,13 +682,31 @@ func ConfirmPayment(c *gin.Context) {
 		}
 
 		var pdfBytes []byte
+		ordNumForPDF := services.GetString(order, "order_number")
 		if services.PDF != nil {
-			if b, err := services.PDF.GenerateMultiTicketPDF(pdfTickets); err == nil {
-				pdfBytes = b
-				log.Printf("[Email/PDF] generated %d bytes for order=%s tickets=%d",
-					len(pdfBytes), services.GetString(order, "order_number"), len(pdfTickets))
-			} else {
-				log.Printf("[Email/PDF] FAILED for order=%s: %v", services.GetString(order, "order_number"), err)
+			// Reintentar: un fallo puntual de render (pico de memoria, deploy en
+			// curso) dejaría el email con el PDF vacío = ticket "defectuoso" para
+			// el comprador aunque el ticket sea válido en BD. 3 intentos.
+			var lastErr error
+			for attempt := 1; attempt <= 3; attempt++ {
+				b, err := services.PDF.GenerateMultiTicketPDF(pdfTickets)
+				if err == nil && len(b) > 0 {
+					pdfBytes = b
+					log.Printf("[Email/PDF] generated %d bytes for order=%s tickets=%d (intento %d)",
+						len(pdfBytes), ordNumForPDF, len(pdfTickets), attempt)
+					break
+				}
+				lastErr = err
+				log.Printf("[Email/PDF] intento %d/3 FALLÓ order=%s: %v", attempt, ordNumForPDF, err)
+				time.Sleep(time.Duration(attempt) * 400 * time.Millisecond)
+			}
+			// Si tras 3 intentos no hay PDF, NO enviar un email defectuoso (sin
+			// ticket): abortar el envío con ALERT para reenviar cuando el PDF
+			// vuelva. El ticket YA está en BD (escaneable) — solo falta el email.
+			if len(pdfBytes) == 0 {
+				log.Printf("[Email/PDF] ALERT sin PDF tras 3 intentos order=%s: %v — NO se envía email defectuoso, REENVIAR (cmd/resend %s)",
+					ordNumForPDF, lastErr, ordNumForPDF)
+				return fmt.Errorf("PDF vacío para order=%s: %w", ordNumForPDF, lastErr)
 			}
 		} else {
 			log.Printf("[Email/PDF] services.PDF is nil — InitPDFService never ran")

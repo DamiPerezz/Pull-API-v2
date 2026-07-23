@@ -835,11 +835,25 @@ func LegacyCreatePendingOrder(c *gin.Context) {
 		"p_id": req.TicketTypeID, "p_qty": req.Quantity,
 	})
 	if rpcErr != nil {
-		log.Printf("[CreatePendingOrder] ALERT reserve RPC failed tt=%s qty=%d: %v", req.TicketTypeID, req.Quantity, rpcErr)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "No se pudo reservar el aforo. Intenta de nuevo."})
-		return
-	}
-	if remaining, _ := rpcRes.(float64); remaining < 0 {
+		// FALLBACK a prueba de fallos: si la RPC no existe aún en esta BD (o la
+		// llamada falla), NO romper la compra — caer al método antiguo (check +
+		// incremento no atómico). Funcional aunque sin garantía anti-carrera; en
+		// cuanto la RPC esté aplicada, se usa el camino atómico. Nunca 500 por
+		// una función que falte.
+		log.Printf("[CreatePendingOrder] WARN reserve RPC no disponible (fallback no-atómico) tt=%s: %v", req.TicketTypeID, rpcErr)
+		avail := services.GetInt(ticketType, "available_quantity")
+		if req.Quantity > avail {
+			c.JSON(http.StatusConflict, gin.H{"error": "No quedan suficientes entradas disponibles.", "sold_out": true})
+			return
+		}
+		go func() {
+			bgCtx, bgCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer bgCancel()
+			venueDB.UpdateNoReturn(bgCtx, "ticket_types", map[string]interface{}{
+				"quantity_reserved": services.GetInt(ticketType, "quantity_reserved") + req.Quantity,
+			}, map[string]interface{}{"id": req.TicketTypeID})
+		}()
+	} else if remaining, _ := rpcRes.(float64); remaining < 0 {
 		c.JSON(http.StatusConflict, gin.H{"error": "No quedan suficientes entradas disponibles.", "sold_out": true})
 		return
 	}
