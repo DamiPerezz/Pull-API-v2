@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"pull-api-v2/config"
 	"pull-api-v2/middleware"
 	"pull-api-v2/models"
 	"pull-api-v2/services"
@@ -672,12 +673,20 @@ func ConfirmPayment(c *gin.Context) {
 				QRCode:        qrToken,
 				QRPNG:         qrPNG,
 			})
+			walletURL := ""
+			if services.ApplePassEnabled() {
+				// Enlace al .pkpass (vía el proxy → backend). Solo si Apple
+				// Wallet está configurado; si no, el email sale sin botón.
+				walletURL = fmt.Sprintf("%s/api/v1/tickets/apple-pass/%s?venue_id=%s",
+					config.App.FrontendURL, qrToken, venueID)
+			}
 			emailTickets = append(emailTickets, services.TicketData{
 				ID:             ticketID,
 				Type:           ticketTypeName,
 				OwnerName:      ownerName,
 				QRCode:         qrToken,
 				QRImageDataURL: qrDataURL,
+				WalletURL:      walletURL,
 			})
 		}
 

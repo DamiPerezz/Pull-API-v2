@@ -313,6 +313,7 @@ func (e *EmailService) SendTickets(ctx context.Context, to string, data TicketEm
 		ticketRows = append(ticketRows, map[string]interface{}{
 			"ID": tk.ID, "Type": tk.Type, "OwnerName": tk.OwnerName,
 			"QRCode": tk.QRCode, "QRImageDataURL": template.URL(tk.QRImageDataURL),
+			"WalletURL": tk.WalletURL,
 		})
 	}
 	payload := map[string]interface{}{
@@ -410,6 +411,7 @@ type TicketData struct {
 	OwnerName      string
 	QRCode         string
 	QRImageDataURL string
+	WalletURL      string // enlace al .pkpass (Apple Wallet); vacío = sin botón
 }
 
 // =============================================

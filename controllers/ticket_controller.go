@@ -199,6 +199,73 @@ func GetTicketByQR(c *gin.Context) {
 	})
 }
 
+// GetTicketApplePass genera y devuelve el .pkpass (Apple Wallet) de un ticket.
+// GET /tickets/apple-pass/:token?venue_id=...  (segmento estático para no
+// chocar con /tickets/qr/:token en el router de Gin). El iPhone lo abre en
+// Wallet por el Content-Type. El QR del pase = qr_token → se escanea igual.
+func GetTicketApplePass(c *gin.Context) {
+	if !services.ApplePassEnabled() {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Apple Wallet no disponible"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	qrToken := c.Param("token")
+	venueID := c.Query("venue_id")
+	if qrToken == "" || venueID == "" || !safeLookupCode(qrToken) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "token y venue_id requeridos"})
+		return
+	}
+	venueDB := services.DB.ForVenue(venueID)
+	if venueDB == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid venue"})
+		return
+	}
+	ticket, err := venueDB.QueryOne(ctx, "tickets", map[string]interface{}{
+		"select": "id,event_id,qr_token,ticket_type_name,owner_name,owner_last_name",
+		"where":  map[string]interface{}{"qr_token": qrToken},
+	})
+	if err != nil || ticket == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Ticket not found"})
+		return
+	}
+	owner := services.GetString(ticket, "owner_name")
+	if ln := services.GetString(ticket, "owner_last_name"); ln != "" {
+		owner += " " + ln
+	}
+	var eventName, eventDate, eventTime, venueName string
+	if eventID := services.GetString(ticket, "event_id"); eventID != "" {
+		if ev, _ := venueDB.QueryOne(ctx, "events", map[string]interface{}{
+			"select": "name,event_date,start_time,custom_location,location",
+			"where":  map[string]interface{}{"id": eventID},
+		}); ev != nil {
+			eventName = services.GetString(ev, "name")
+			eventDate = services.GetString(ev, "event_date")
+			eventTime = services.GetString(ev, "start_time")
+			if venueName = services.GetString(ev, "custom_location"); venueName == "" {
+				venueName = services.GetString(ev, "location")
+			}
+		}
+	}
+	pkpass, err := services.BuildPass(services.ApplePassData{
+		SerialNumber: services.GetString(ticket, "id"),
+		QRToken:      qrToken,
+		EventName:    eventName,
+		EventDate:    eventDate,
+		EventTime:    eventTime,
+		VenueName:    venueName,
+		OwnerName:    owner,
+		TicketType:   services.GetString(ticket, "ticket_type_name"),
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "No se pudo generar el pase"})
+		return
+	}
+	c.Header("Content-Disposition", `attachment; filename="entrada.pkpass"`)
+	c.Data(http.StatusOK, "application/vnd.apple.pkpass", pkpass)
+}
+
 // GetTicketPDF returns the PDF URL for a ticket
 // GET /api/v1/tickets/:id/pdf
 func GetTicketPDF(c *gin.Context) {

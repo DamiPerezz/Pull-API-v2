@@ -71,6 +71,8 @@ func main() {
 	// Initialize push: FCM (Android) + APNs (iOS, feature-flag por APNS_* vars).
 	services.InitPushService()
 	services.InitAPNs()
+	// Apple Wallet (.pkpass) — feature-flag por PASS_* vars.
+	services.InitApplePass()
 
 	// Start the 48h approval-expiry sweep for held private-event payments.
 	controllers.StartApprovalExpiryJob()
@@ -300,6 +302,9 @@ func setupTicketRoutes(v1 *gin.RouterGroup) {
 
 	// Public ticket lookup (by QR)
 	v1.GET("/tickets/qr/:token", middleware.RateLimitGeneral(), controllers.GetTicketByQR)
+	// Apple Wallet pass (.pkpass) — enlace del email/web. Feature-flag: 404 si
+	// PASS_* no está configurado.
+	v1.GET("/tickets/apple-pass/:token", middleware.RateLimitGeneral(), controllers.GetTicketApplePass)
 
 	// Staff ticket validation
 	validation := v1.Group("/validate")

@@ -4,6 +4,7 @@ go 1.21
 
 require (
 	github.com/boombuler/barcode v1.1.0
+	github.com/digitorus/pkcs7 v0.0.0-20250730155240-ffadbf3f398c
 	github.com/gin-gonic/gin v1.9.1
 	github.com/golang-jwt/jwt/v5 v5.2.0
 	github.com/google/uuid v1.6.0
@@ -11,6 +12,7 @@ require (
 	github.com/jung-kurt/gofpdf v1.16.2
 	github.com/stripe/stripe-go/v76 v76.25.0
 	golang.org/x/crypto v0.18.0
+	software.sslmate.com/src/go-pkcs12 v0.7.3
 )
 
 require (
