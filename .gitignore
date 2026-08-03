@@ -58,3 +58,6 @@ fly.state
 # Claves Apple (.p8 App Store Connect / APNs) — NUNCA a git
 *.p8
 *.p8.txt
+
+# Contraseña del .p12 de Apple Wallet (temporal, nunca a git)
+pkpass-pass.txt
