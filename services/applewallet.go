@@ -202,9 +202,11 @@ func (s *applePassService) passJSON(d ApplePassData) ([]byte, error) {
 	field := func(key, label, value string) map[string]interface{} {
 		return map[string]interface{}{"key": key, "label": label, "value": value}
 	}
+	// Separador ASCII: el JSON del pase viaja como UTF-8, pero algunos
+	// visores/logs mostraban mal el "·" — con guion no hay ambigüedad.
 	when := d.EventDate
 	if d.EventTime != "" {
-		when = d.EventDate + " · " + d.EventTime
+		when = d.EventDate + " - " + d.EventTime
 	}
 	pass := map[string]interface{}{
 		"formatVersion":       1,
