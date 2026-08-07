@@ -869,8 +869,27 @@ func LegacyCreatePendingOrder(c *gin.Context) {
 		}
 	}
 
+	// PRIVADO vs PÚBLICO. En un evento privado el cliente NO paga al solicitar:
+	// crea una SOLICITUD (awaiting_approval) que el staff aprueba o rechaza, y
+	// solo si la aprueban recibe el enlace de pago. (dLocal Go no puede retener
+	// dinero sin cobrarlo — ver DLOCAL-FLUJO-PRIVADO.md.)
+	needsApproval := false
+	if ev, _ := venueDB.QueryOne(ctx, "events", map[string]interface{}{
+		"select": "is_private,require_approval",
+		"where":  map[string]interface{}{"id": eventID},
+	}); ev != nil {
+		needsApproval = services.GetBool(ev, "is_private") || services.GetBool(ev, "require_approval")
+	}
+
 	paymentLinkCode, _ := generateRandomCode(16)
+	// Público: 30 min para pagar (carrito). Privado: 48h para que el staff
+	// decida — el sweeper de carritos abandonados NO toca awaiting_approval.
+	orderStatus := "pending"
 	expiresAt := time.Now().Add(30 * time.Minute)
+	if needsApproval {
+		orderStatus = "awaiting_approval"
+		expiresAt = time.Now().Add(48 * time.Hour)
+	}
 
 	// Persist per-attendee details (incl. instagram) in the order metadata so
 	// ConfirmPayment can carry them through to the ticket rows.
@@ -888,7 +907,7 @@ func LegacyCreatePendingOrder(c *gin.Context) {
 		"subtotal":       subtotal,
 		"total":          total,
 		"currency":       "GTQ",
-		"status":         "pending",
+		"status":         orderStatus,
 		"user_name":      req.UserName,
 		"user_email":     req.UserEmail,
 		"expires_at":     expiresAt.Format(time.RFC3339),
@@ -898,6 +917,27 @@ func LegacyCreatePendingOrder(c *gin.Context) {
 		releaseReserved() // no dejar el aforo reservado sin orden que lo respalde
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create order"})
 		return
+	}
+
+	// SOLICITUD a evento privado: avisar al cliente (sin cobro, sin QR) y al
+	// staff, que es quien decide. El QR solo se emite cuando pague tras la
+	// aprobación. Fire-and-forget acotado por la cola de tareas.
+	if needsApproval {
+		orderForEmail := order
+		services.RunBackground("private-request-notify", func(bgCtx context.Context) error {
+			if services.Push != nil {
+				services.Push.NotifyVenueStaff(bgCtx, venueID, "Nueva solicitud de entrada",
+					req.UserName+" solicita entrada — pendiente de aprobar",
+					"reservations", map[string]interface{}{
+						"type":     "order_pending_approval",
+						"order_id": services.GetString(orderForEmail, "id"),
+					})
+			}
+			if services.Email != nil {
+				sendApprovalStatusEmail(bgCtx, venueID, orderForEmail, total, "GTQ", "pending", false)
+			}
+			return nil
+		})
 	}
 
 	c.JSON(http.StatusCreated, gin.H{
@@ -912,6 +952,9 @@ func LegacyCreatePendingOrder(c *gin.Context) {
 		"total":             total,
 		"currency":          "GTQ",
 		"expires_at":        expiresAt.Format(time.RFC3339),
+		// La web usa esto para NO pedir la tarjeta y mostrar
+		// "solicitud enviada" en vez del formulario de pago.
+		"requires_approval": needsApproval,
 	})
 }
 

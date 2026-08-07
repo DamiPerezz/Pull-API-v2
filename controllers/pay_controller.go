@@ -669,6 +669,54 @@ func claimHeldOrder(ctx context.Context, venueDB *services.SupabaseClient, order
 // sendApprovalStatusEmail sends the private-event status email to the buyer.
 // kind: "pending" (awaiting approval), "rejected" (staff declined),
 // "expired" (48h passed). Resolves event + venue names for the copy.
+// buildApprovalEmailData reúne los datos del evento/venue para los emails del
+// flujo de aprobación. Devuelve también el destinatario ("" si no hay email).
+// Compartido por sendApprovalStatusEmail y sendApprovalApprovedEmail.
+func buildApprovalEmailData(ctx context.Context, venueID string, order map[string]interface{}, total float64, currency string) (services.ApprovalEmailData, string) {
+	venueDB := services.DB.ForVenue(venueID)
+	if venueDB == nil {
+		return services.ApprovalEmailData{}, ""
+	}
+	eventName, eventImage, eventDate, eventTime, eventLocation := "", "", "", "", ""
+	if eid := services.GetString(order, "event_id"); eid != "" {
+		if ev, _ := venueDB.QueryOne(ctx, "events", map[string]interface{}{
+			"select": "name,image,cover_image,start_datetime,end_datetime,location,address",
+			"where":  map[string]interface{}{"id": eid},
+		}); ev != nil {
+			services.EnrichEvent(ev)
+			eventName = services.GetString(ev, "name")
+			eventImage = services.GetString(ev, "image")
+			if eventImage == "" {
+				eventImage = services.GetString(ev, "cover_image")
+			}
+			eventDate = services.GetString(ev, "event_date")
+			eventTime = services.GetString(ev, "start_time")
+			eventLocation = services.GetString(ev, "location")
+			if eventLocation == "" {
+				eventLocation = services.GetString(ev, "address")
+			}
+		}
+	}
+	venueName := ""
+	if v, _ := services.DB.Central().QueryOne(ctx, "venues", map[string]interface{}{
+		"select": "name", "where": map[string]interface{}{"id": venueID},
+	}); v != nil {
+		venueName = services.GetString(v, "name")
+	}
+	return services.ApprovalEmailData{
+		CustomerName:  services.GetString(order, "user_name"),
+		EventName:     eventName,
+		EventImage:    eventImage,
+		EventDate:     eventDate,
+		EventTime:     eventTime,
+		VenueName:     venueName,
+		VenueLocation: eventLocation,
+		OrderNumber:   services.GetString(order, "order_number"),
+		Total:         fmt.Sprintf("%.2f", total),
+		Currency:      currency,
+	}, services.GetString(order, "user_email")
+}
+
 func sendApprovalStatusEmail(ctx context.Context, venueID string, order map[string]interface{}, total float64, currency, kind string, expired bool) {
 	venueDB := services.DB.ForVenue(venueID)
 	if venueDB == nil || services.Email == nil {

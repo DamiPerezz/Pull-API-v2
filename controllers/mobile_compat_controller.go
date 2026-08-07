@@ -651,10 +651,20 @@ func MobileApproveOrder(c *gin.Context) {
 	orderID := c.Param("orderId")
 
 	current, _ := venueDB.QueryOne(ctx, "orders", map[string]interface{}{
-		"select": "id,order_number,status,stripe_session_id,currency,metadata", "where": map[string]interface{}{"id": orderID},
+		"select": "id,order_number,status,stripe_session_id,currency,metadata,event_id,ticket_type_id,quantity,total,user_name,user_email",
+		"where":  map[string]interface{}{"id": orderID},
 	})
 	if current == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Order not found"})
+		return
+	}
+
+	// ── FLUJO PRIVADO dLOCAL GO (opción B) ──────────────────────────────
+	// La solicitud NO tiene dinero retenido (dLocal Go no sabe retener).
+	// Aprobar = marcarla approved_unpaid y mandarle el ENLACE DE PAGO con
+	// un plazo; el ticket se emite cuando pague. Ver DLOCAL-FLUJO-PRIVADO.md.
+	if services.GetString(current, "status") == "awaiting_approval" {
+		approveAwaitingOrder(c, ctx, venueDB, venueID, orderID, current)
 		return
 	}
 	if services.GetString(current, "status") == "confirmed" {
@@ -773,8 +783,14 @@ func MobileRejectOrder(c *gin.Context) {
 	// email them that the request was declined and the hold released.
 	orderID := c.Param("orderId")
 	if held, _ := venueDB.QueryOne(ctx, "orders", map[string]interface{}{
-		"select": "id,order_number,event_id,status,currency,total,user_name,user_email,metadata", "where": map[string]interface{}{"id": orderID},
+		"select": "id,order_number,event_id,status,currency,total,user_name,user_email,metadata,ticket_type_id,quantity", "where": map[string]interface{}{"id": orderID},
 	}); held != nil {
+		// FLUJO PRIVADO dLOCAL GO: una SOLICITUD sin pago no tiene nada que
+		// reversar — se cancela y se LIBERA el aforo que tenía reservado.
+		if services.GetString(held, "status") == "awaiting_approval" {
+			rejectAwaitingOrder(c, ctx, venueDB, venueID, orderID, reason, held)
+			return
+		}
 		// RACE GUARD: claim the hold before releasing so approve/expiry can't
 		// also act on it. Non-held (pending) orders skip the claim.
 		if services.GetString(held, "status") == "payment_authorized" && !claimHeldOrder(ctx, venueDB, orderID) {
