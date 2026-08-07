@@ -61,3 +61,6 @@ fly.state
 
 # Contraseña del .p12 de Apple Wallet (temporal, nunca a git)
 pkpass-pass.txt
+
+# Credenciales dLocal (nunca a git)
+.env.dlocal.local
