@@ -230,10 +230,20 @@ func CreateOrder(c *gin.Context) {
 
 // CheckoutRequest represents the checkout request
 type CheckoutRequest struct {
-	OrderID   string `json:"order_id" binding:"required,uuid"`
-	VenueID   string `json:"venue_id" binding:"required,uuid"`
+	OrderID string `json:"order_id" binding:"required,uuid"`
+	// VenueID es OPCIONAL: la web del comprador no lo tiene a mano en la
+	// página de pago. Si falta se resuelve por slug o, en despliegues de un
+	// solo venue (511 hoy), por el primer venue activo — mismo criterio que
+	// PayOrder. Exigirlo devolvía 400 y dejaba el checkout inservible.
+	VenueID   string `json:"venue_id"`
+	VenueSlug string `json:"venue_slug"`
 	ReturnURL string `json:"return_url"`
 	CancelURL string `json:"cancel_url"`
+	// Alias que manda la web (success_url/back_url).
+	SuccessURL string `json:"success_url"`
+	BackURL    string `json:"back_url"`
+	// Anti-carding: el código de la orden, igual que en PayOrder.
+	PaymentLinkCode string `json:"payment_link_code"`
 }
 
 // CreateCheckout initiates payment for an order
@@ -252,10 +262,34 @@ func CreateCheckout(c *gin.Context) {
 		return
 	}
 
-	venueDB := services.DB.ForVenue(req.VenueID)
+	// Resolver venue: id explícito > slug > primer venue activo (despliegue de
+	// un solo venue). La web del comprador no manda venue_id en la página de
+	// pago, y exigirlo dejaba el checkout inservible.
+	venueID := req.VenueID
+	if venueID == "" && req.VenueSlug != "" {
+		if id, err := resolveVenueIDFromSlug(ctx, req.VenueSlug); err == nil {
+			venueID = id
+		}
+	}
+	if venueID == "" {
+		if v, _ := services.DB.Central().QueryOne(ctx, "venues", map[string]interface{}{
+			"select": "id", "where": map[string]interface{}{"is_active": true, "deleted_at": "is.null"}, "limit": 1,
+		}); v != nil {
+			venueID = services.GetString(v, "id")
+		}
+	}
+	venueDB := services.DB.ForVenue(venueID)
 	if venueDB == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid venue"})
 		return
+	}
+
+	// La web manda success_url/back_url; el handler usa return_url/cancel_url.
+	if req.ReturnURL == "" {
+		req.ReturnURL = req.SuccessURL
+	}
+	if req.CancelURL == "" {
+		req.CancelURL = req.BackURL
 	}
 
 	// OPTIMIZATION: Parallel order + processor fetch
@@ -266,22 +300,21 @@ func CreateCheckout(c *gin.Context) {
 
 	wg.Add(2)
 
-	// Get order
+	// Get order. NO se filtra por status en la query: una solicitud privada
+	// APROBADA llega como `approved_unpaid` y también debe poder pagarse
+	// (es justo el enlace de pago del correo). El estado se valida abajo.
 	go func() {
 		defer wg.Done()
 		order, orderErr = venueDB.QueryOne(ctx, "orders", map[string]interface{}{
-			"select": "id,order_number,event_id,ticket_type_id,user_id,quantity,total,currency,status,user_email",
-			"where": map[string]interface{}{
-				"id":     req.OrderID,
-				"status": "pending",
-			},
+			"select": "id,order_number,event_id,ticket_type_id,user_id,quantity,total,currency,status,user_email,metadata",
+			"where":  map[string]interface{}{"id": req.OrderID},
 		})
 	}()
 
 	// Get payment processor
 	go func() {
 		defer wg.Done()
-		processor, processorErr = services.Payments.GetProcessor(ctx, req.VenueID)
+		processor, processorErr = services.Payments.GetProcessor(ctx, venueID)
 	}()
 
 	wg.Wait()
@@ -293,6 +326,21 @@ func CreateCheckout(c *gin.Context) {
 
 	if processorErr != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Payment gateway not configured"})
+		return
+	}
+
+	// Estados pagables: `pending` (compra pública normal) y `approved_unpaid`
+	// (solicitud privada YA aprobada — el enlace de pago del correo). Cualquier
+	// otro estado no debe llegar a la pasarela.
+	switch st := services.GetString(order, "status"); st {
+	case "pending", "approved_unpaid", "":
+		// ok
+	case "confirmed":
+		c.JSON(http.StatusOK, gin.H{"success": true, "already_paid": true,
+			"message": "Esta orden ya está pagada", "order_number": services.GetString(order, "order_number")})
+		return
+	default:
+		c.JSON(http.StatusConflict, gin.H{"error": "Esta orden no se puede pagar", "status": st})
 		return
 	}
 
@@ -316,7 +364,7 @@ func CreateCheckout(c *gin.Context) {
 		SuccessURL:    req.ReturnURL,
 		CancelURL:     req.CancelURL,
 		Metadata: map[string]string{
-			"venue_id":     req.VenueID,
+			"venue_id":     venueID,
 			"order_id":     services.GetString(order, "id"),
 			"event_id":     services.GetString(order, "event_id"),
 			"order_number": services.GetString(order, "order_number"),
