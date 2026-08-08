@@ -311,6 +311,9 @@ type RevenueReport struct {
 	BottleRevenue      float64 `json:"bottle_revenue"`
 
 	// By payment method
+	// dLocal Go es la pasarela ACTIVA desde ago-2026; stripe/neonet solo
+	// aparecen en transacciones históricas.
+	DLocalRevenue       float64 `json:"dlocal_revenue"`
 	StripeRevenue       float64 `json:"stripe_revenue"`
 	NeoNetRevenue       float64 `json:"neonet_revenue"`
 	MercadoPagoRevenue  float64 `json:"mercadopago_revenue"`

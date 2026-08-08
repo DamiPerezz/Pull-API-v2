@@ -25,9 +25,11 @@ func StartApprovalExpiryJob() {
 		defer ticker.Stop()
 		expireOverdueAuthorizations()
 		expireAbandonedPendingOrders()
+		expirePrivateFlowOrders()
 		for range ticker.C {
 			expireOverdueAuthorizations()
 			expireAbandonedPendingOrders()
+			expirePrivateFlowOrders()
 		}
 	}()
 	log.Printf("[ApprovalExpiry] job started (sweeps every 15m)")
@@ -106,6 +108,111 @@ func expireAbandonedPendingOrders() {
 			}
 			log.Printf("[PendingExpiry] carrito abandonado liberado order=%s venue=%s qty=%d",
 				services.GetString(order, "order_number"), venueID, qty)
+		}
+	}
+}
+
+// expirePrivateFlowOrders barre los DOS estados del flujo privado con dLocal:
+//
+//   - awaiting_approval : el staff nunca decidió. Caduca con `expires_at` (48 h).
+//   - approved_unpaid   : aprobada, pero el cliente no pagó su enlace. Caduca
+//     con `metadata.payment_deadline` (24 h por defecto).
+//
+// En ambos casos NO hay dinero de por medio (con dLocal Go no se retiene
+// nada), así que caducar es solo: marcar `expired` y DEVOLVER LA PLAZA. Sin
+// esto, cada solicitud olvidada bloquea aforo para siempre y el evento se
+// marca agotado con la sala medio vacía.
+//
+// El claim es atómico (UPDATE ... WHERE status=<el de partida>): si dos
+// máquinas barren a la vez, o si el staff aprueba justo en ese instante, solo
+// uno gana y el aforo se libera exactamente una vez.
+func expirePrivateFlowOrders() {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	venues, err := services.DB.Central().QueryCtx(ctx, "venues", map[string]interface{}{
+		"select": "id",
+		"where":  map[string]interface{}{"is_active": true, "deleted_at": "is.null"},
+	})
+	if err != nil {
+		log.Printf("[PrivateExpiry] no se pudieron listar los venues: %v", err)
+		return
+	}
+
+	now := time.Now()
+	for _, v := range venues {
+		venueID := services.GetString(v, "id")
+		venueDB := services.DB.ForVenue(venueID)
+		if venueDB == nil {
+			continue
+		}
+		orders, err := venueDB.QueryCtx(ctx, "orders", map[string]interface{}{
+			"select": "id,order_number,status,ticket_type_id,quantity,total,currency,user_name,user_email,expires_at,metadata",
+			"where":  map[string]interface{}{"status": "in.(awaiting_approval,approved_unpaid)"},
+			"limit":  2000,
+		})
+		if err != nil {
+			continue
+		}
+		for _, order := range orders {
+			status := services.GetString(order, "status")
+
+			// Cada estado mira su propio reloj.
+			var deadlineStr, reason string
+			if status == "approved_unpaid" {
+				if md, ok := order["metadata"].(map[string]interface{}); ok {
+					deadlineStr = services.GetString(md, "payment_deadline")
+				}
+				reason = "Plazo de pago agotado (solicitud aprobada sin pagar)"
+			} else {
+				deadlineStr = services.GetString(order, "expires_at")
+				reason = "Solicitud caducada sin respuesta del staff"
+			}
+			if deadlineStr == "" {
+				continue
+			}
+			deadline, ok := parseFlexTime(deadlineStr)
+			if !ok || now.Before(deadline) {
+				continue
+			}
+
+			orderID := services.GetString(order, "id")
+			res, uerr := venueDB.UpdateCtx(ctx, "orders", map[string]interface{}{
+				"status":              "expired",
+				"cancelled_at":        now.Format(time.RFC3339),
+				"cancellation_reason": reason,
+			}, map[string]interface{}{"id": orderID, "status": status})
+			if uerr != nil || len(res) == 0 {
+				continue // otro actor llegó antes (staff aprobó, cliente pagó…)
+			}
+
+			releaseOrderCapacity(ctx, venueDB, order)
+
+			// Solo avisamos a quien YA le habíamos prometido algo: al aprobado
+			// que no llegó a pagar. Al que nunca se le respondió no se le manda
+			// un "caducó" sin contexto.
+			if status == "approved_unpaid" && services.Email != nil {
+				orderCopy := order
+				total := services.GetFloat64(order, "total")
+				currency := services.GetString(order, "currency")
+				if currency == "" {
+					currency = "GTQ"
+				}
+				services.RunBackground("payment-expired-notify", func(bgCtx context.Context) error {
+					data, to := buildApprovalEmailData(bgCtx, venueID, orderCopy, total, currency)
+					if to == "" {
+						return nil
+					}
+					if e := services.Email.SendApprovalPaymentExpired(bgCtx, to, data, privatePaymentDeadlineHours()); e != nil {
+						log.Printf("[PrivateExpiry] ALERT email de caducidad NO enviado order=%s: %v",
+							services.GetString(orderCopy, "order_number"), e)
+					}
+					return nil
+				})
+			}
+
+			log.Printf("[PrivateExpiry] %s → expired, aforo liberado order=%s venue=%s qty=%d",
+				status, services.GetString(order, "order_number"), venueID, services.GetInt(order, "quantity"))
 		}
 	}
 }

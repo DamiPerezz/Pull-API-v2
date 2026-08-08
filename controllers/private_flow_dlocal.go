@@ -177,6 +177,78 @@ func approveAwaitingOrder(c *gin.Context, ctx context.Context, venueDB *services
 	})
 }
 
+// ResendPaymentLink reenvía el enlace de pago de una solicitud YA aprobada.
+// POST /orders/:orderId/resend-payment-link  (staff)
+// Idempotente: NO cambia el estado ni el plazo, solo vuelve a mandar el correo
+// (y devuelve la URL para que el staff pueda compartirla a mano). Sin esto, un
+// cliente que pierde el email se queda sin forma de pagar.
+func ResendPaymentLink(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	if role := c.GetString("role"); role != "admin" && role != "manager" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Solo un admin o manager puede reenviar el enlace de pago"})
+		return
+	}
+	venueID := c.GetString("venue_id")
+	venueDB := services.DB.ForVenue(venueID)
+	if venueDB == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid venue"})
+		return
+	}
+	orderID := c.Param("orderId")
+	order, _ := venueDB.QueryOne(ctx, "orders", map[string]interface{}{
+		"select": "id,order_number,status,total,currency,event_id,ticket_type_id,quantity,user_name,user_email,metadata",
+		"where":  map[string]interface{}{"id": orderID},
+	})
+	if order == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Order not found"})
+		return
+	}
+	if st := services.GetString(order, "status"); st != "approved_unpaid" {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":  "Solo se puede reenviar el enlace de una solicitud aprobada pendiente de pago",
+			"status": st,
+		})
+		return
+	}
+
+	payURL := buildPaymentLink(ctx, venueDB, order)
+	if payURL == "" {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "No se pudo construir el enlace de pago"})
+		return
+	}
+	// Plazo: el que ya tenía; si no se puede leer, se informa sin inventar.
+	deadline := time.Time{}
+	if md, ok := order["metadata"].(map[string]interface{}); ok {
+		if d, ok2 := parseFlexTime(services.GetString(md, "payment_deadline")); ok2 {
+			deadline = d
+		}
+	}
+	if deadline.IsZero() {
+		deadline = time.Now().Add(time.Duration(privatePaymentDeadlineHours()) * time.Hour)
+	}
+
+	total := services.GetFloat64(order, "total")
+	currency := services.GetString(order, "currency")
+	if currency == "" {
+		currency = "GTQ"
+	}
+	orderCopy := order
+	services.RunBackground("resend-payment-link", func(bgCtx context.Context) error {
+		sendApprovalApprovedEmail(bgCtx, venueID, orderCopy, total, currency, payURL, deadline)
+		return nil
+	})
+	log.Printf("[PrivateFlow] enlace de pago REENVIADO order=%s", services.GetString(order, "order_number"))
+
+	c.JSON(http.StatusOK, gin.H{
+		"success":          true,
+		"message":          "Enlace de pago reenviado al cliente",
+		"payment_url":      payURL,
+		"payment_deadline": deadline.Format(time.RFC3339),
+	})
+}
+
 // rejectAwaitingOrder rechaza una SOLICITUD sin pago: la cancela, libera el
 // aforo y avisa al cliente. No hay dinero que devolver.
 func rejectAwaitingOrder(c *gin.Context, ctx context.Context, venueDB *services.SupabaseClient, venueID, orderID, reason string, order map[string]interface{}) {

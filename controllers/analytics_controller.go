@@ -982,6 +982,10 @@ func GetRevenueReport(c *gin.Context) {
 
 		gateway := services.GetString(tx, "payment_gateway")
 		switch gateway {
+		case "dlocal":
+			// Pasarela activa: sin este case, TODA la facturación real caía
+			// fuera del desglose y el informe cuadraba a cero por pasarela.
+			report.DLocalRevenue += gross
 		case "stripe":
 			report.StripeRevenue += gross
 		case "neonet":

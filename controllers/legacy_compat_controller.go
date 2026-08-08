@@ -1925,13 +1925,14 @@ func LegacyGetOrderDetails(c *gin.Context) {
 	event := map[string]interface{}{}
 	if eid := services.GetString(order, "event_id"); eid != "" {
 		if ev, _ := venueDB.QueryOne(ctx, "events", map[string]interface{}{
-			"select": "id,name,start_datetime,end_datetime,image,location",
+			"select": "id,name,slug,start_datetime,end_datetime,image,location",
 			"where":  map[string]interface{}{"id": eid},
 		}); ev != nil {
 			services.EnrichEvent(ev)
 			event = map[string]interface{}{
 				"id":         services.GetString(ev, "id"),
 				"name":       services.GetString(ev, "name"),
+				"slug":       services.GetString(ev, "slug"),
 				"event_date": services.GetString(ev, "event_date"),
 				"start_time": services.GetString(ev, "start_time"),
 				"image":      services.GetString(ev, "image"),
@@ -1940,5 +1941,22 @@ func LegacyGetOrderDetails(c *gin.Context) {
 		}
 	}
 
-	c.JSON(http.StatusOK, gin.H{"order": order, "user": user, "event": event, "venue_id": venueID})
+	resp := gin.H{"order": order, "user": user, "event": event, "venue_id": venueID}
+
+	// Flujo privado dLocal: si la solicitud está aprobada esperando pago, el
+	// staff necesita poder VER y compartir el enlace (el cliente pierde el
+	// correo constantemente). Con el `payment_link_code` a secas no se puede
+	// reconstruir la URL desde el cliente.
+	if services.GetString(order, "status") == "approved_unpaid" {
+		if payURL := buildPaymentLink(ctx, venueDB, order); payURL != "" {
+			resp["payment_url"] = payURL
+		}
+		if md, ok := order["metadata"].(map[string]interface{}); ok {
+			if dl := services.GetString(md, "payment_deadline"); dl != "" {
+				resp["payment_deadline"] = dl
+			}
+		}
+	}
+
+	c.JSON(http.StatusOK, resp)
 }

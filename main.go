@@ -621,6 +621,9 @@ func setupMobileRoutes(v1 *gin.RouterGroup) {
 		// (LegacyGetOrderDetails); we don't double-register here.
 		authed.POST("/orders/:orderId/approve", middleware.ValidateUUIDParam("orderId"), controllers.MobileApproveOrder)
 		authed.POST("/orders/:orderId/reject", middleware.ValidateUUIDParam("orderId"), controllers.MobileRejectOrder)
+		// Flujo privado dLocal: reenviar el enlace de pago de una solicitud ya
+		// aprobada (el cliente perdió el correo). No cambia estado ni plazo.
+		authed.POST("/orders/:orderId/resend-payment-link", middleware.ValidateUUIDParam("orderId"), controllers.ResendPaymentLink)
 		authed.GET("/group-reservations/details/:reservationId", middleware.ValidateUUIDParam("reservationId"), controllers.MobileGetGroupReservationDetails)
 		authed.POST("/group-reservations/:id/approve", middleware.ValidateUUIDParam("id"), controllers.MobileApproveGroupReservation)
 		authed.POST("/group-reservations/:id/reject", middleware.ValidateUUIDParam("id"), controllers.MobileRejectGroupReservation)
@@ -702,7 +705,15 @@ func setupLegacyRoutes(v1 *gin.RouterGroup) {
 	// their data and pays their share (WebApp group-guest-complete page).
 	v1.GET("/group-reservations/guest/:guestId", middleware.RateLimitGeneral(), middleware.ValidateUUIDParam("guestId"), controllers.LegacyGetGroupGuest)
 	v1.POST("/group-reservations/guest/:guestId/complete", middleware.RateLimitCreate(), middleware.ValidateUUIDParam("guestId"), controllers.LegacyCompleteGroupGuest)
-	v1.POST("/group-reservations/guest/:guestId/pay", middleware.RateLimitCreate(), middleware.ValidateUUIDParam("guestId"), controllers.LegacyPayGroupGuest)
+	// OJO: /guest/:guestId/pay NO cobra — solo marca has_paid=true (era pago
+	// simulado de la demo). Con dinero real sería una entrada gratis, así que
+	// se registra SOLO en DEMO_MODE, igual que simulate-payment. Si algún día
+	// 511 usa reservas de grupo de pago, hay que mandarlo por el checkout de
+	// dLocal antes de reactivarlo. Verificado 2026-08-09: 0 reservas de grupo
+	// en producción, así que cerrarlo no rompe nada existente.
+	if config.App != nil && config.App.DemoMode {
+		v1.POST("/group-reservations/guest/:guestId/pay", middleware.RateLimitCreate(), middleware.ValidateUUIDParam("guestId"), controllers.LegacyPayGroupGuest)
+	}
 	v1.POST("/group-reservations/guest/:guestId/verify-access-code", middleware.RateLimitGeneral(), middleware.ValidateUUIDParam("guestId"), controllers.LegacyVerifyGroupGuestAccessCode)
 
 	// Orders (legacy paths)
