@@ -26,10 +26,12 @@ func StartApprovalExpiryJob() {
 		expireOverdueAuthorizations()
 		expireAbandonedPendingOrders()
 		expirePrivateFlowOrders()
+		reconcileStuckDLocalPayments()
 		for range ticker.C {
 			expireOverdueAuthorizations()
 			expireAbandonedPendingOrders()
 			expirePrivateFlowOrders()
+			reconcileStuckDLocalPayments()
 		}
 	}()
 	log.Printf("[ApprovalExpiry] job started (sweeps every 15m)")
@@ -110,6 +112,123 @@ func expireAbandonedPendingOrders() {
 				services.GetString(order, "order_number"), venueID, qty)
 		}
 	}
+}
+
+// Ventanas del reconciliador de pagos dLocal.
+//
+//	dlocalStuckAfter    : antes de esto no se toca nada — el comprador puede
+//	                      estar tecleando la tarjeta en la página de dLocal.
+//	dlocalGiveUpAfter   : si dLocal SIGUE diciendo PENDING pasado esto, se da
+//	                      el checkout por abandonado y se devuelve la plaza.
+const (
+	dlocalStuckAfter  = 20 * time.Minute
+	dlocalGiveUpAfter = 3 * time.Hour
+)
+
+// reconcileStuckDLocalPayments arregla las órdenes que se quedaron en
+// `processing`, que es donde caen todas las que empiezan un checkout de dLocal.
+// Hace DOS cosas, y las dos importan:
+//
+//  1. RESCATA COBROS SIN ENTRADA. Si el webhook de dLocal no llega (caída,
+//     timeout, DNS), hoy nadie se entera: el cliente pagó y se queda sin
+//     ticket. Aquí se vuelve a preguntar a dLocal por cada pago y, si dice
+//     PAID, se emiten los tickets por el mismo carril que el webhook.
+//
+//  2. DEVUELVE PLAZAS DE CHECKOUTS ABANDONADOS. Quien abre el checkout y
+//     cierra la pestaña deja su plaza retenida PARA SIEMPRE: ningún barrido
+//     miraba `processing`. Con aforo real eso agota el evento con la sala
+//     medio vacía.
+//
+// La verdad la tiene SIEMPRE dLocal: nunca se caduca una orden por el reloj
+// sin preguntar antes. Si dLocal no contesta, no se toca nada — es preferible
+// una plaza retenida de más que cancelar a alguien que sí pagó.
+func reconcileStuckDLocalPayments() {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	venues, err := services.DB.Central().QueryCtx(ctx, "venues", map[string]interface{}{
+		"select": "id",
+		"where":  map[string]interface{}{"is_active": true, "deleted_at": "is.null"},
+	})
+	if err != nil {
+		log.Printf("[dLocalRecon] no se pudieron listar los venues: %v", err)
+		return
+	}
+
+	now := time.Now()
+	for _, v := range venues {
+		venueID := services.GetString(v, "id")
+		venueDB := services.DB.ForVenue(venueID)
+		if venueDB == nil {
+			continue
+		}
+		orders, err := venueDB.QueryCtx(ctx, "orders", map[string]interface{}{
+			"select": "id,order_number,event_id,ticket_type_id,quantity,total,currency,status,user_name,user_email,metadata,stripe_session_id,paid_at,created_at,updated_at",
+			"where":  map[string]interface{}{"status": "processing"},
+			"limit":  1000,
+		})
+		if err != nil {
+			continue
+		}
+		for _, order := range orders {
+			paymentID := services.DLocalPaymentIDFromSession(services.GetString(order, "stripe_session_id"))
+			if paymentID == "" {
+				continue // no es un checkout de dLocal (o aún no tiene sesión)
+			}
+			started := dlocalCheckoutStartedAt(order)
+			if started.IsZero() || now.Sub(started) < dlocalStuckAfter {
+				continue // demasiado reciente: puede estar pagando ahora mismo
+			}
+
+			payment, err := dlocalGetPayment(ctx, venueID, paymentID)
+			if err != nil || payment == nil {
+				log.Printf("[dLocalRecon] no se pudo consultar el pago %s (order=%s): %v — se reintenta en el próximo barrido",
+					paymentID, services.GetString(order, "order_number"), err)
+				continue
+			}
+
+			outcome := applyDLocalPaymentToOrder(ctx, venueID, venueDB, order, payment)
+			log.Printf("[dLocalRecon] order=%s pago=%s dlocal=%s → %s (lleva %s en processing)",
+				services.GetString(order, "order_number"), paymentID, payment.Status, outcome,
+				now.Sub(started).Truncate(time.Minute))
+
+			// Sigue sin resolverse y ya pasó el límite duro: checkout abandonado.
+			// Se cierra y se devuelve la plaza, con claim atómico por si el
+			// comprador vuelve justo ahora.
+			if outcome == dlOutcomePending && now.Sub(started) >= dlocalGiveUpAfter {
+				res, uerr := venueDB.UpdateCtx(ctx, "orders", map[string]interface{}{
+					"status":              "expired",
+					"cancelled_at":        now.Format(time.RFC3339),
+					"cancellation_reason": "Checkout abandonado (sin resolución en dLocal)",
+				}, map[string]interface{}{"id": services.GetString(order, "id"), "status": "processing"})
+				if uerr != nil || len(res) == 0 {
+					continue
+				}
+				releaseOrderCapacity(ctx, venueDB, order)
+				log.Printf("[dLocalRecon] checkout abandonado → expired, aforo liberado order=%s qty=%d",
+					services.GetString(order, "order_number"), services.GetInt(order, "quantity"))
+			}
+		}
+	}
+}
+
+// dlocalCheckoutStartedAt devuelve cuándo empezó el INTENTO de pago. Con el
+// flujo privado, `created_at` no vale: una solicitud puede crearse hoy y
+// pagarse mañana, y usar la fecha de la orden caducaría un pago en curso.
+func dlocalCheckoutStartedAt(order map[string]interface{}) time.Time {
+	if md, ok := order["metadata"].(map[string]interface{}); ok {
+		if t, ok2 := parseFlexTime(services.GetString(md, "checkout_started_at")); ok2 {
+			return t
+		}
+	}
+	// Órdenes anteriores a que se sellara checkout_started_at.
+	if t, ok := parseFlexTime(services.GetString(order, "updated_at")); ok {
+		return t
+	}
+	if t, ok := parseFlexTime(services.GetString(order, "created_at")); ok {
+		return t
+	}
+	return time.Time{}
 }
 
 // expirePrivateFlowOrders barre los DOS estados del flujo privado con dLocal:

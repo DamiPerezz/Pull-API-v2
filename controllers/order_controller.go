@@ -380,7 +380,18 @@ func CreateCheckout(c *gin.Context) {
 		return
 	}
 
-	// Update order with payment session info (fire-and-forget)
+	// Update order with payment session info (fire-and-forget).
+	// `checkout_started_at` es el reloj del INTENTO de pago, no el de la orden:
+	// una solicitud privada puede crearse hoy y pagarse mañana, así que el
+	// reconciliador no puede usar created_at para decidir si un checkout se
+	// abandonó. Se preserva el metadata existente (payment_link_code).
+	checkoutMeta := map[string]interface{}{}
+	if md, ok := order["metadata"].(map[string]interface{}); ok {
+		for k, v := range md {
+			checkoutMeta[k] = v
+		}
+	}
+	checkoutMeta["checkout_started_at"] = time.Now().Format(time.RFC3339)
 	go func() {
 		bgCtx, bgCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer bgCancel()
@@ -388,6 +399,7 @@ func CreateCheckout(c *gin.Context) {
 			"status":            "processing",
 			"stripe_session_id": checkout.SessionID,
 			"payment_gateway":   processor.GetGateway().String(),
+			"metadata":          checkoutMeta,
 		}, map[string]interface{}{
 			"id": req.OrderID,
 		})
