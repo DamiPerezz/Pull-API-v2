@@ -425,6 +425,12 @@ func ConfirmPayment(c *gin.Context) {
 		return
 	}
 
+	// Pago YA verificado fuera de esta request: el webhook de dLocal consultó
+	// GET /v1/payments/{id} contra la pasarela antes de llegar aquí, así que no
+	// hace falta ni procesador ni una segunda ida y vuelta (ver
+	// controllers/dlocal_webhook.go). Si no hay nada registrado, camino normal.
+	preVerified, hasPreVerified := takeVerifiedPayment(sessionID)
+
 	// OPTIMIZATION: Parallel processor + ticket type fetch
 	var processor services.PaymentProcessor
 	var ticketType map[string]interface{}
@@ -433,13 +439,15 @@ func ConfirmPayment(c *gin.Context) {
 
 	ticketTypeID := services.GetString(order, "ticket_type_id")
 
-	wg.Add(2)
+	if !hasPreVerified {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			processor, processorErr = services.Payments.GetProcessor(ctx, venueID)
+		}()
+	}
 
-	go func() {
-		defer wg.Done()
-		processor, processorErr = services.Payments.GetProcessor(ctx, venueID)
-	}()
-
+	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		ticketType, _ = venueDB.QueryOne(ctx, "ticket_types", map[string]interface{}{
@@ -450,24 +458,29 @@ func ConfirmPayment(c *gin.Context) {
 
 	wg.Wait()
 
-	if processorErr != nil {
-		// Revert status on failure
-		venueDB.UpdateNoReturn(ctx, "orders", map[string]interface{}{
-			"status": "processing",
-		}, map[string]interface{}{"id": orderID})
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Payment gateway not configured"})
-		return
-	}
+	var paymentResult *models.PaymentResult
+	if hasPreVerified {
+		paymentResult = preVerified
+	} else {
+		if processorErr != nil {
+			// Revert status on failure
+			venueDB.UpdateNoReturn(ctx, "orders", map[string]interface{}{
+				"status": "processing",
+			}, map[string]interface{}{"id": orderID})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Payment gateway not configured"})
+			return
+		}
 
-	// Confirm payment with gateway
-	paymentResult, err := processor.ConfirmPayment(ctx, sessionID)
-	if err != nil {
-		// Revert status on failure
-		venueDB.UpdateNoReturn(ctx, "orders", map[string]interface{}{
-			"status": "processing",
-		}, map[string]interface{}{"id": orderID})
-		middleware.SafeError(c, http.StatusInternalServerError, "Failed to confirm payment", err)
-		return
+		// Confirm payment with gateway
+		paymentResult, err = processor.ConfirmPayment(ctx, sessionID)
+		if err != nil {
+			// Revert status on failure
+			venueDB.UpdateNoReturn(ctx, "orders", map[string]interface{}{
+				"status": "processing",
+			}, map[string]interface{}{"id": orderID})
+			middleware.SafeError(c, http.StatusInternalServerError, "Failed to confirm payment", err)
+			return
+		}
 	}
 
 	if !paymentResult.Success {

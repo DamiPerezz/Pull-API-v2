@@ -222,7 +222,22 @@ func PayOrder(c *gin.Context) {
 	}
 	charger, ok := processor.(services.DirectCardCharger)
 	if !ok {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gateway does not support direct card payments"})
+		// dLocal Go no acepta el PAN: sus cobros van por checkout alojado
+		// (POST /orders/checkout → redirect_url). Si la web sigue mandando la
+		// tarjeta aquí, el mensaje tiene que decir exactamente qué hacer, no un
+		// "no soportado" genérico que cueste media hora de depuración.
+		detail := "esta pasarela solo cobra por checkout alojado"
+		if processor.GetGateway() == models.GatewayDLocal {
+			detail = services.DLocalRawCardError().Error()
+		}
+		log.Printf("[PayOrder] gateway=%s NO soporta tarjeta cruda order=%s — la web debe usar el checkout alojado",
+			processor.GetGateway(), req.OrderID)
+		c.JSON(http.StatusNotImplemented, gin.H{
+			"error":               "Esta pasarela no acepta los datos de la tarjeta en nuestra web: el pago se hace en la página segura de la pasarela.",
+			"gateway":             processor.GetGateway().String(),
+			"use_hosted_checkout": true,
+			"detail":              detail,
+		})
 		return
 	}
 
@@ -391,6 +406,12 @@ func PayOrder(c *gin.Context) {
 		}
 	}
 
+	// La pasarela sale del PROCESADOR real, nunca escrita a mano: con dLocal
+	// conviviendo con NeoNet, un literal "neonet" etiquetaría mal los cobros y
+	// el carril de captura/reversa buscaría transacciones en la cuenta
+	// equivocada.
+	gatewayName := processor.GetGateway().String()
+
 	// Persistir el desglose de las dos transacciones en la orden.
 	metadata := orderMeta
 	metadata["payment_split"] = map[string]interface{}{
@@ -399,7 +420,7 @@ func PayOrder(c *gin.Context) {
 		"fee_percent":       feePercent,
 		"venue_transaction": charge1.TransactionID,
 		"fee_transaction":   feeTxID,
-		"gateway":           string(processor.GetGateway()),
+		"gateway":           gatewayName,
 		"fee_gateway_venue": feeGatewayVenue, // "" = cuenta del venue; id = cuenta de Pull
 		"captured":          capture, // false = funds held, awaiting approval
 	}
@@ -419,7 +440,7 @@ func PayOrder(c *gin.Context) {
 		// retenido huérfano.
 		if err := venueDB.UpdateNoReturn(ctx, "orders", map[string]interface{}{
 			"status":          "payment_authorized",
-			"payment_gateway": "neonet",
+			"payment_gateway": gatewayName,
 			"metadata":        metadata,
 		}, map[string]interface{}{"id": req.OrderID}); err != nil {
 			log.Printf("[PayOrder] ALERT: hold persist FAILED order=%s venueTx=%s feeTx=%s: %v — reversing",
@@ -487,7 +508,7 @@ func PayOrder(c *gin.Context) {
 		return venueDB.UpdateNoReturn(ctx, "orders", map[string]interface{}{
 			"status":            "processing",
 			"stripe_session_id": sessionID,
-			"payment_gateway":   "neonet",
+			"payment_gateway":   gatewayName,
 			"metadata":          metadata,
 		}, map[string]interface{}{"id": req.OrderID})
 	}

@@ -13,13 +13,19 @@ const (
 	GatewayStripe      PaymentGateway = "stripe"
 	GatewayNeoNet      PaymentGateway = "neonet"
 	GatewayMercadoPago PaymentGateway = "mercadopago"
-	GatewayCash        PaymentGateway = "cash"
-	GatewayTransfer    PaymentGateway = "transfer"
+	// GatewayDLocal es dLocal Go (docs.dlocalgo.com), la pasarela que sustituye
+	// a NeoNet/Cybersource. Cobra por CHECKOUT ALOJADO: el pago nace PENDING y
+	// se confirma por webhook — NO en la misma petición HTTP.
+	// OJO: el valor 'dlocal' tiene que existir en el enum `payment_gateway_type`
+	// de la BD (migración sql/dlocal_fase0.sql) antes de escribirlo en `orders`.
+	GatewayDLocal   PaymentGateway = "dlocal"
+	GatewayCash     PaymentGateway = "cash"
+	GatewayTransfer PaymentGateway = "transfer"
 )
 
 func (g PaymentGateway) IsValid() bool {
 	switch g {
-	case GatewayStripe, GatewayNeoNet, GatewayMercadoPago, GatewayCash, GatewayTransfer:
+	case GatewayStripe, GatewayNeoNet, GatewayMercadoPago, GatewayDLocal, GatewayCash, GatewayTransfer:
 		return true
 	}
 	return false
@@ -104,6 +110,19 @@ type GatewayCredentials struct {
 	// MercadoPago
 	MPPublicKey   string `json:"mercadopago_public_key,omitempty"`
 	MPAccessToken string `json:"mercadopago_access_token,omitempty"`
+
+	// dLocal Go. Mapeo con las columnas de `payment_gateway_credentials`:
+	//   DLocalAPIKey    <- access_key            (mitad pública del Bearer)
+	//   DLocalSecretKey <- secret_key_encrypted  (descifrado; NUNCA se loguea)
+	//   DLocalSplitCode <- split_code            (columna opcional; si no existe
+	//                      se cae a la env DLOCAL_SPLIT_CODE)
+	// El Bearer se arma como "<api_key>:<secret_key>" — ver services/dlocalgo.go.
+	DLocalAPIKey    string `json:"dlocal_api_key,omitempty"`
+	DLocalSecretKey string `json:"dlocal_secret_key,omitempty"`
+	DLocalSplitCode string `json:"dlocal_split_code,omitempty"`
+	// DLocalSmartFieldsKey es PÚBLICA por diseño (va al navegador). Hoy no se
+	// usa: el checkout es alojado. Queda para la fase SmartFields.
+	DLocalSmartFieldsKey string `json:"dlocal_smartfields_key,omitempty"`
 }
 
 // =============================================
@@ -214,11 +233,25 @@ type CheckoutParams struct {
 	Metadata       map[string]string
 }
 
-// CheckoutResult from payment gateway
+// CheckoutResult from payment gateway.
+//
+// SessionID es el identificador con el que la orden localiza después el pago:
+// se guarda en `orders.stripe_session_id` (columna reutilizada por todas las
+// pasarelas) y es lo que recibe PaymentProcessor.ConfirmPayment.
+// CheckoutURL es la URL a la que hay que mandar al comprador (en dLocal Go, el
+// `redirect_url` del checkout alojado).
 type CheckoutResult struct {
 	SessionID   string
 	CheckoutURL string
 	Gateway     PaymentGateway
+
+	// PaymentID es el id NATIVO del pago en la pasarela, sin prefijar (en dLocal
+	// Go, el `id` de POST /v1/payments). SessionID lo lleva prefijado; este campo
+	// evita tener que deshacer el prefijo a mano.
+	PaymentID string
+	// Status es el estado con el que NACE el pago ("PENDING" en dLocal Go).
+	// Recordatorio de que el checkout alojado NO confirma en la misma petición.
+	Status string
 }
 
 // PaymentResult after payment confirmation

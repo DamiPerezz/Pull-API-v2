@@ -132,29 +132,46 @@ func (r *PaymentRouter) loadPaymentConfig(ctx context.Context, venueID string) (
 		NeoNetTerminalID: GetString(result[0], "terminal_id"),
 		// MercadoPago
 		MPPublicKey: GetString(result[0], "mercadopago_public_key"),
+		// dLocal Go: comparte columnas con NeoNet — la API Key va en
+		// `access_key` y la Secret Key en `secret_key_encrypted` (se descifra
+		// abajo). `split_code` y `smartfields_key` son columnas OPCIONALES (hoy
+		// NO existen en la tabla): si faltan, GetString devuelve "" y el
+		// procesador cae a la env DLOCAL_SPLIT_CODE. `smartfields_key` es
+		// pública y solo hará falta en la fase de checkout transparente.
+		DLocalAPIKey:         GetString(result[0], "access_key"),
+		DLocalSplitCode:      GetString(result[0], "split_code"),
+		DLocalSmartFieldsKey: GetString(result[0], "smartfields_key"),
 	}
 
 	// Decrypt sensitive keys based on gateway
 	if secretKey := GetString(result[0], "secret_key_encrypted"); secretKey != "" {
-		if decrypted, err := r.crypto.Decrypt(secretKey); err == nil {
+		if r.crypto == nil {
+			// Sin APP_KEY no hay forma de leer la credencial. Antes esto era un
+			// panic por deref de nil en plena ruta del dinero.
+			log.Printf("[PaymentRouter] ALERT venue=%s tiene secret_key_encrypted pero el servicio de cifrado no está inicializado (¿falta APP_KEY?) — la pasarela quedará sin credenciales", venueID)
+		} else if decrypted, err := r.crypto.Decrypt(secretKey); err != nil {
+			log.Printf("[PaymentRouter] ALERT venue=%s no se pudo descifrar secret_key_encrypted: %v", venueID, err)
+		} else {
 			switch cfg.Gateway {
 			case models.GatewayStripe:
 				cfg.Credentials.StripeSecretKey = decrypted
 			case models.GatewayNeoNet:
 				cfg.Credentials.NeoNetSecretKey = decrypted
+			case models.GatewayDLocal:
+				cfg.Credentials.DLocalSecretKey = decrypted
 			}
 		}
 	}
 
 	// Decrypt MercadoPago access token (stored separately)
-	if mpToken := GetString(result[0], "mercadopago_access_token_encrypted"); mpToken != "" {
+	if mpToken := GetString(result[0], "mercadopago_access_token_encrypted"); mpToken != "" && r.crypto != nil {
 		if decrypted, err := r.crypto.Decrypt(mpToken); err == nil {
 			cfg.Credentials.MPAccessToken = decrypted
 		}
 	}
 
 	// Decrypt Stripe webhook secret
-	if stripeWebhook := GetString(result[0], "stripe_webhook_secret_encrypted"); stripeWebhook != "" {
+	if stripeWebhook := GetString(result[0], "stripe_webhook_secret_encrypted"); stripeWebhook != "" && r.crypto != nil {
 		if decrypted, err := r.crypto.Decrypt(stripeWebhook); err == nil {
 			cfg.Credentials.StripeWebhookSecret = decrypted
 		}
@@ -181,6 +198,9 @@ func (r *PaymentRouter) getDefaultConfig(venueID string) *models.VenuePaymentCon
 
 // decryptCredentials decrypts gateway credentials
 func (r *PaymentRouter) decryptCredentials(encrypted string) (*models.GatewayCredentials, error) {
+	if r.crypto == nil {
+		return nil, fmt.Errorf("crypto service not initialized (APP_KEY missing)")
+	}
 	decrypted, err := r.crypto.Decrypt(encrypted)
 	if err != nil {
 		return nil, err
@@ -219,6 +239,13 @@ func (r *PaymentRouter) GetProcessor(ctx context.Context, venueID string) (Payme
 		return nil, err
 	}
 
+	return processorForGateway(cfg, venueID)
+}
+
+// processorForGateway mapea la pasarela configurada a su procesador. Vive
+// separado de GetProcessor para poder probar el mapeo (sobre todo que lo
+// desconocido FALLA) sin base de datos.
+func processorForGateway(cfg *models.VenuePaymentConfig, venueID string) (PaymentProcessor, error) {
 	switch cfg.Gateway {
 	case models.GatewayStripe:
 		return NewStripeProcessor(cfg), nil
@@ -226,9 +253,14 @@ func (r *PaymentRouter) GetProcessor(ctx context.Context, venueID string) (Payme
 		return NewNeoNetProcessor(cfg), nil
 	case models.GatewayMercadoPago:
 		return NewMercadoPagoProcessor(cfg), nil
+	case models.GatewayDLocal:
+		return NewDLocalProcessor(cfg), nil
 	default:
-		// Default to Stripe
-		return NewStripeProcessor(cfg), nil
+		// FAIL-CLOSED. Antes esto caía a Stripe (que no está implementado): una
+		// pasarela mal escrita en la BD (typo, valor nuevo sin desplegar) salía
+		// por un carril que NO es el que el venue tiene contratado. Es la ruta
+		// del dinero: si no sabemos por dónde cobrar, no se cobra.
+		return nil, fmt.Errorf("gateway de pago no soportado: %q (venue %s) — valores válidos: stripe, neonet, mercadopago, dlocal", cfg.Gateway, venueID)
 	}
 }
 

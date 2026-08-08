@@ -275,6 +275,11 @@ func setupOrderRoutes(v1 *gin.RouterGroup) {
 		// Repoblar el checkout tras cancelar (la web lo llama al reintentar).
 		orders.GET("/cancelled/:orderId", middleware.RateLimitGeneral(), controllers.GetCancelledOrderData)
 		orders.GET("/:code", controllers.GetOrder)
+		// Vuelta del checkout alojado de dLocal: la web pregunta si el pago
+		// cuajó. Con `payment_link_code` además reconcilia contra dLocal (por
+		// si el webhook se perdió). El param se llama :code por obligación de
+		// gin — a este nivel ya existe /orders/:code.
+		orders.GET("/:code/payment-status", middleware.RateLimitGeneral(), controllers.GetOrderPaymentStatus)
 	}
 
 	// Staff order management
@@ -722,5 +727,12 @@ func setupWebhookRoutes(router *gin.Engine) {
 	{
 		webhooks.POST("/stripe/:venue_id", middleware.ValidateUUIDParam("venue_id"), controllers.HandleStripeWebhook)
 		webhooks.POST("/neonet/:venue_id", middleware.ValidateUUIDParam("venue_id"), controllers.HandleNeoNetWebhook)
+		// dLocal Go (checkout alojado): el pago nace PENDING y se confirma
+		// AQUÍ. Sin este endpoint el comprador paga y nunca recibe su entrada.
+		// Esta es la URL que va como `notification_url` al crear el pago:
+		//   <API_BASE_URL>/webhooks/dlocal/<venue_id>
+		// OJO: cuelga de la raíz, NO de /api/v1 → no pasa por el proxy de
+		// Cloudflare Pages; tiene que apuntar al backend directamente.
+		webhooks.POST("/dlocal/:venue_id", middleware.ValidateUUIDParam("venue_id"), controllers.HandleDLocalWebhook)
 	}
 }
