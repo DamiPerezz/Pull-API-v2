@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Deploy de STAGING — pull-api-v2-staging (espejo de prod, Cybersource sandbox)
+# Deploy de STAGING — pull-api-v2-staging (espejo de prod, dLocal sandbox)
 #
 #   bash scripts/deploy_staging.sh
 #

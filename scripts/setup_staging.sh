@@ -333,7 +333,7 @@ ALTER TABLE venue_database_configs ADD COLUMN IF NOT EXISTS migration_status TEX
 CREATE TABLE IF NOT EXISTS payment_gateway_credentials (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     venue_id UUID NOT NULL REFERENCES venues(id) ON DELETE CASCADE,
-    gateway TEXT NOT NULL DEFAULT 'neonet',
+    gateway TEXT NOT NULL DEFAULT 'dlocal',
     gateway_name TEXT,
     is_active BOOLEAN DEFAULT true,
     is_primary BOOLEAN DEFAULT true,
@@ -389,7 +389,7 @@ if [ -n "$VENUE_ID" ]; then
 else
   VENUE_ID=$(gen_uuid)
   rest "$STG_CENTRAL_URL" "$STG_CENTRAL_KEY" POST "venues" \
-    "{\"id\":\"$VENUE_ID\",\"organization_id\":\"$ORG_ID\",\"name\":\"$VENUE_NAME\",\"slug\":\"$VENUE_SLUG\",\"description\":\"Entorno staging de 511 Events (dinero de mentira, Cybersource sandbox)\",\"city\":\"Guatemala City\",\"country\":\"GT\",\"currency\":\"GTQ\",\"timezone\":\"America/Guatemala\",\"platform_fee_percent\":8,\"platform_fee_fixed\":0,\"primary_payment_gateway\":\"neonet\",\"use_vip_list_flow\":false,\"use_guest_list\":true,\"use_group_reservations\":true,\"is_active\":true}"
+    "{\"id\":\"$VENUE_ID\",\"organization_id\":\"$ORG_ID\",\"name\":\"$VENUE_NAME\",\"slug\":\"$VENUE_SLUG\",\"description\":\"Entorno staging de 511 Events (dinero de mentira, dLocal sandbox)\",\"city\":\"Guatemala City\",\"country\":\"GT\",\"currency\":\"GTQ\",\"timezone\":\"America/Guatemala\",\"platform_fee_percent\":8,\"platform_fee_fixed\":0,\"primary_payment_gateway\":\"dlocal\",\"use_vip_list_flow\":false,\"use_guest_list\":true,\"use_group_reservations\":true,\"is_active\":true}"
   [ "$REST_CODE" = "201" ] || { echo "  ✘ ERROR creando venue (HTTP $REST_CODE):"; cat "$REST_BODY"; exit 1; }
   echo "  ✔ venue creado: $VENUE_NAME ($VENUE_ID, slug $VENUE_SLUG, fee 8%)"
 fi
@@ -416,7 +416,7 @@ else
   echo "  ✔ venue_database_configs creado (service/anon keys cifradas)"
 fi
 
-# ── 3. Migrar la pasarela Cybersource SANDBOX desde prod ─────────────
+# ── 3. Migrar la pasarela SANDBOX desde prod ─────────────────────────
 echo "== 3. Pasarela sandbox (payment_gateway_credentials prod → staging) =="
 
 # Guard espejo EXACTO de services/payment_router.go:loadPaymentConfig
