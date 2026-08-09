@@ -5,13 +5,11 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
-	"pull-api-v2/config"
 	"pull-api-v2/middleware"
 	"pull-api-v2/models"
 	"pull-api-v2/services"
@@ -674,151 +672,18 @@ func ConfirmPayment(c *gin.Context) {
 	// bounded task queue (NOT a raw goroutine): PDF+QR rendering is the
 	// heaviest allocation in the app, and a purchase burst with unbounded
 	// goroutines can OOM the 512MB machine.
+	// Send confirmation email with PDF attached + inline QR codes. Runs on the
+	// bounded task queue (NOT a raw goroutine): PDF+QR rendering is the
+	// heaviest allocation in the app, and a purchase burst with unbounded
+	// goroutines can OOM the machine.
+	//
+	// El cuerpo vive en sendTicketsEmailForOrder (ticket_email.go) porque el
+	// endpoint de REENVÍO tiene que mandar exactamente el mismo correo: si se
+	// duplicara, el reenvío acabaría divergiendo del original justo cuando más
+	// importa (cliente que pagó y no recibió nada).
 	services.RunBackground("order-tickets-email", func(bgCtx context.Context) error {
-		if services.Email == nil {
-			return nil
-		}
-
-		// Resolve event + venue context for the email.
-		eventName := ""
-		eventDate := ""
-		eventTime := ""
-		eventImage := ""
-		venueName := ""
-		venueAddress := ""
-		if ev, _ := venueDB.QueryOne(bgCtx, "events", map[string]interface{}{
-			"select": "name,start_datetime,end_datetime,location,address,image,cover_image",
-			"where":  map[string]interface{}{"id": eventID},
-		}); ev != nil {
-			eventName = services.GetString(ev, "name")
-			eventImage = services.GetString(ev, "image")
-			if eventImage == "" {
-				eventImage = services.GetString(ev, "cover_image")
-			}
-			services.EnrichEvent(ev)
-			eventDate = services.GetString(ev, "event_date")
-			eventTime = services.GetString(ev, "start_time")
-			venueName = services.GetString(ev, "location")
-			venueAddress = services.GetString(ev, "address")
-		}
-		if vCentral, _ := services.DB.Central().QueryOne(bgCtx, "venues", map[string]interface{}{
-			"select": "name,address", "where": map[string]interface{}{"id": venueID},
-		}); vCentral != nil {
-			if venueName == "" {
-				venueName = services.GetString(vCentral, "name")
-			}
-			if venueAddress == "" {
-				venueAddress = services.GetString(vCentral, "address")
-			}
-		}
-
-		// Build per-ticket payload: PDF rows + QR images inline in the HTML.
-		pdfTickets := make([]services.TicketPDFData, 0, len(ticketData))
-		emailTickets := make([]services.TicketData, 0, len(ticketData))
-		for _, td := range ticketData {
-			qrToken := services.GetString(td, "qr_token")
-			ownerName := services.GetString(td, "owner_name")
-			if ln := services.GetString(td, "owner_last_name"); ln != "" {
-				ownerName += " " + ln
-			}
-			ticketID := qrToken // stand-in until the row insert returns an id
-
-			// Render the QR ONCE per ticket; the same PNG feeds both the
-			// inline email image and the PDF attachment.
-			var qrPNG []byte
-			qrDataURL := ""
-			if services.PDF != nil {
-				if b, err := services.PDF.QRCodePNG(qrToken, 200); err == nil {
-					qrPNG = b
-					qrDataURL = "data:image/png;base64," + base64.StdEncoding.EncodeToString(b)
-				}
-			}
-			pdfTickets = append(pdfTickets, services.TicketPDFData{
-				EventName:     eventName,
-				EventDate:     eventDate,
-				EventTime:     eventTime,
-				VenueName:     venueName,
-				VenueLocation: venueAddress,
-				TicketType:    ticketTypeName,
-				OwnerName:     ownerName,
-				OrderNumber:   services.GetString(order, "order_number"),
-				TicketID:      ticketID,
-				QRCode:        qrToken,
-				QRPNG:         qrPNG,
-			})
-			walletURL := ""
-			if services.ApplePassEnabled() {
-				// Enlace al .pkpass (vía el proxy → backend). Solo si Apple
-				// Wallet está configurado; si no, el email sale sin botón.
-				walletURL = fmt.Sprintf("%s/api/v1/tickets/apple-pass/%s?venue_id=%s",
-					config.App.FrontendURL, qrToken, venueID)
-			}
-			emailTickets = append(emailTickets, services.TicketData{
-				ID:             ticketID,
-				Type:           ticketTypeName,
-				OwnerName:      ownerName,
-				QRCode:         qrToken,
-				QRImageDataURL: qrDataURL,
-				WalletURL:      walletURL,
-			})
-		}
-
-		var pdfBytes []byte
-		ordNumForPDF := services.GetString(order, "order_number")
-		if services.PDF != nil {
-			// Reintentar: un fallo puntual de render (pico de memoria, deploy en
-			// curso) dejaría el email con el PDF vacío = ticket "defectuoso" para
-			// el comprador aunque el ticket sea válido en BD. 3 intentos.
-			var lastErr error
-			for attempt := 1; attempt <= 3; attempt++ {
-				b, err := services.PDF.GenerateMultiTicketPDF(pdfTickets)
-				if err == nil && len(b) > 0 {
-					pdfBytes = b
-					log.Printf("[Email/PDF] generated %d bytes for order=%s tickets=%d (intento %d)",
-						len(pdfBytes), ordNumForPDF, len(pdfTickets), attempt)
-					break
-				}
-				lastErr = err
-				log.Printf("[Email/PDF] intento %d/3 FALLÓ order=%s: %v", attempt, ordNumForPDF, err)
-				time.Sleep(time.Duration(attempt) * 400 * time.Millisecond)
-			}
-			// Si tras 3 intentos no hay PDF, NO enviar un email defectuoso (sin
-			// ticket): abortar el envío con ALERT para reenviar cuando el PDF
-			// vuelva. El ticket YA está en BD (escaneable) — solo falta el email.
-			if len(pdfBytes) == 0 {
-				log.Printf("[Email/PDF] ALERT sin PDF tras 3 intentos order=%s: %v — NO se envía email defectuoso, REENVIAR (cmd/resend %s)",
-					ordNumForPDF, lastErr, ordNumForPDF)
-				return fmt.Errorf("PDF vacío para order=%s: %w", ordNumForPDF, lastErr)
-			}
-		} else {
-			log.Printf("[Email/PDF] services.PDF is nil — InitPDFService never ran")
-		}
-
-		totalStr := fmt.Sprintf("%.2f", services.GetFloat64(order, "total"))
-		emailErr := services.Email.SendTickets(bgCtx, userEmail, services.TicketEmailData{
-			OrderNumber:   services.GetString(order, "order_number"),
-			CustomerName:  userName,
-			EventName:     eventName,
-			EventDate:     eventDate,
-			EventTime:     eventTime,
-			EventImage:    eventImage,
-			EventLocation: venueAddress,
-			VenueName:     venueName,
-			TicketType:    ticketTypeName,
-			Currency:      services.GetString(order, "currency"),
-			Total:         totalStr,
-			Tickets:       emailTickets,
-		}, pdfBytes)
-
-		// El QR viaja SOLO por email. Si el envío falla, el comprador YA pagó y
-		// los tickets YA están en la BD (reenviables): dejar rastro accionable
-		// LOUD en logs para reenviar durante el evento (cmd/resend). El propio
-		// número de orden basta para reenviar. Nunca dejar el fallo en silencio.
-		if emailErr != nil {
-			log.Printf("[Email] ALERT ticket email FAILED order=%s to=%s: %v — REENVIAR (cmd/resend %s)",
-				services.GetString(order, "order_number"), userEmail, emailErr, services.GetString(order, "order_number"))
-		}
-		return emailErr
+		return sendTicketsEmailForOrder(bgCtx, venueDB, venueID, eventID,
+			ticketTypeName, userEmail, userName, order, ticketData)
 	})
 
 	c.JSON(http.StatusOK, gin.H{

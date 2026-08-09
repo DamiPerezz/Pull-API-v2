@@ -18,7 +18,6 @@ primary_region = "dfw"   # Dallas — closest active region to Guatemala (mia de
   # to environment=production + prod keys for the live cutover.
   DEMO_MODE = "false"
   COOKIE_SAMESITE = "None"
-  RESEND_FROM_EMAIL = "Pull Events <noreply@tickets.pullevents.com>"
   # Browsers send an Origin header on the purchase POST; the proxy forwards
   # it, so the backend must whitelist the real web origins or it 403s with
   # "Origin not allowed". Include the pages.dev host and future custom domains.

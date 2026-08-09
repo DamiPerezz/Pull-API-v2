@@ -22,7 +22,6 @@ primary_region = "dfw"   # Dallas — closest active region to Guatemala (mia de
   # main.go). Prod y staging no deben definir esta variable jamás.
   ALLOW_DEMO_MODE = "true"
   COOKIE_SAMESITE = "None"
-  RESEND_FROM_EMAIL = "Pull Events <noreply@tickets.pullevents.com>"
 
 [http_service]
   internal_port = 8080

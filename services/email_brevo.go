@@ -16,10 +16,15 @@ import (
 // BREVO PROVIDER
 // =============================================
 //
-// Brevo (formerly Sendinblue) accepts up to 300 emails/day on the free plan
-// without requiring a verified custom domain, so it's our preferred provider
-// for the demo. The EmailService falls back to Resend automatically when the
-// BREVO_API_KEY env var is unset.
+// Brevo (antes Sendinblue) es el ÚNICO proveedor de correo desde el
+// 2026-08-09: se retiró el fallback a Resend por decisión de producto.
+//
+// OJO CON EL PLAN: el gratuito son 300 correos AL DÍA, y ahí entra todo
+// (entradas, solicitudes, avisos al staff, enlaces de pago). Agotada la cuota,
+// Brevo responde 429 y el correo NO SALE POR NINGÚN SITIO: el comprador paga y
+// se queda sin su QR. Antes de un evento con volumen, comprobar el plan:
+//
+//	curl -s https://api.brevo.com/v3/account -H "api-key: $BREVO_API_KEY"
 
 // sendViaBrevo posts the email payload to Brevo's transactional API. Returns
 // the Brevo messageId on success.

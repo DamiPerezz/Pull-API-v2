@@ -44,11 +44,8 @@ type Config struct {
 	StripePublishableKey  string
 	StripeWebhookSecret   string
 
-	// Email (Resend)
-	ResendAPIKey          string
-	ResendFromEmail       string
-
-	// Email (Brevo, alternative provider — 300/day free without domain verification)
+	// Email (Brevo) — ÚNICO proveedor. El fallback a Resend se retiró el
+	// 2026-08-09 por decisión de producto: si Brevo falla, el correo no sale.
 	BrevoAPIKey           string
 	BrevoFromEmail        string
 
@@ -124,11 +121,7 @@ func Load() {
 		StripePublishableKey: getEnv("STRIPE_PUBLISHABLE_KEY", ""),
 		StripeWebhookSecret:  getEnv("STRIPE_WEBHOOK_SECRET", ""),
 
-		// Email
-		ResendAPIKey:    getEnv("RESEND_API_KEY", ""),
-		ResendFromEmail: getEnv("RESEND_FROM_EMAIL", "Pull Events <noreply@tickets.pullevents.com>"),
-
-		// Brevo (alternative email provider)
+		// Email (Brevo, único proveedor)
 		BrevoAPIKey:    getEnv("BREVO_API_KEY", ""),
 		BrevoFromEmail: getEnv("BREVO_FROM_EMAIL", "Pull Events <noreply@pullevents.com>"),
 
@@ -237,8 +230,10 @@ func logConfig() {
 	if App.StripeSecretKey != "" {
 		log.Printf("Stripe: Configured")
 	}
-	if App.ResendAPIKey != "" {
-		log.Printf("Resend Email: Configured")
+	if App.BrevoAPIKey != "" {
+		log.Printf("Brevo Email: Configured")
+	} else {
+		log.Printf("Brevo Email: NO CONFIGURADO — no se enviará ningún correo (ni entradas)")
 	}
 	if App.RedisURL != "" {
 		log.Printf("Redis: Configured")

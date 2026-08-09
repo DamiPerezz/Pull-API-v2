@@ -624,6 +624,10 @@ func setupMobileRoutes(v1 *gin.RouterGroup) {
 		// Flujo privado dLocal: reenviar el enlace de pago de una solicitud ya
 		// aprobada (el cliente perdió el correo). No cambia estado ni plazo.
 		authed.POST("/orders/:orderId/resend-payment-link", middleware.ValidateUUIDParam("orderId"), controllers.ResendPaymentLink)
+		// Palanca de emergencia del evento: reenviar las entradas de una orden ya
+		// pagada (cuota de Brevo agotada, email mal escrito, correo perdido).
+		// No reemite nada: usa los tickets y QR que ya están en la BD.
+		authed.POST("/orders/:orderId/resend-tickets", middleware.ValidateUUIDParam("orderId"), controllers.ResendTicketsEmail)
 		authed.GET("/group-reservations/details/:reservationId", middleware.ValidateUUIDParam("reservationId"), controllers.MobileGetGroupReservationDetails)
 		authed.POST("/group-reservations/:id/approve", middleware.ValidateUUIDParam("id"), controllers.MobileApproveGroupReservation)
 		authed.POST("/group-reservations/:id/reject", middleware.ValidateUUIDParam("id"), controllers.MobileRejectGroupReservation)

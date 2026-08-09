@@ -33,7 +33,6 @@ primary_region = "dfw"   # Dallas — closest active region to Guatemala (mia de
   ENVIRONMENT = "production"
   DEMO_MODE = "false"
   COOKIE_SAMESITE = "None"
-  RESEND_FROM_EMAIL = "Pull Events <noreply@tickets.pullevents.com>"
   BREVO_FROM_EMAIL = "511 STAGING <info@pullevents.com>"
   ALLOWED_ORIGINS = "https://staging.pull-511-events.pages.dev"
   FRONTEND_URL = "https://staging.pull-511-events.pages.dev"

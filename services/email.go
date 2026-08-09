@@ -5,15 +5,14 @@ import (
 	"context"
 	"embed"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"html"
 	"html/template"
-	"io"
 	"io/fs"
 	"log"
 	"net/http"
 	"pull-api-v2/config"
+	"strings"
 	"sync"
 	"time"
 )
@@ -27,16 +26,27 @@ import (
 var emailTemplatesFS embed.FS
 
 // =============================================
-// EMAIL SERVICE
-// Uses Resend API for transactional emails
+// EMAIL SERVICE — Brevo, ÚNICO proveedor.
+//
+// Decisión de producto (2026-08-09): se usa Brevo y punto. Se quitó el
+// fallback a Resend que existía antes.
+//
+// CONSECUENCIA que hay que tener presente: no hay segundo proveedor. Si Brevo
+// rechaza un envío, ese correo NO sale por ningún otro sitio. Y el correo con
+// el QR ES la entrada — un cobro cuyo email falla es, para el comprador,
+// idéntico a que le hayan robado. Por eso aquí:
+//   - Un fallo de Brevo se propaga SIEMPRE como error. Nunca se devuelve un
+//     id falso: el llamante no debe poder marcar como entregado lo que no salió.
+//   - Se reintenta ante fallos transitorios (red, 429 de cuota, 5xx), que es
+//     exactamente lo que aparece al acercarse al tope diario del plan.
+//   - Si el plan de Brevo se queda sin crédito, esto se llena de ALERT en los
+//     logs. Es la señal de que hay que subir el plan, no un ruido a ignorar.
 // =============================================
 
 // EmailService handles email sending
 type EmailService struct {
-	apiKey    string
 	fromEmail string
 	fromName  string
-	baseURL   string
 	client    *http.Client
 }
 
@@ -52,25 +62,24 @@ var emailBufferPool = sync.Pool{
 
 // InitEmailService initializes the email service
 func InitEmailService() error {
-	if config.App.ResendAPIKey == "" {
-		log.Println("Email Service: No API key configured, emails will be logged only")
+	if config.App.BrevoAPIKey == "" {
+		log.Println("Email Service: BREVO_API_KEY sin configurar — los emails solo se logean, NO se envían")
 	}
 
-	// Parse from email (format: "Name <email>" or just "email")
-	fromEmail := config.App.ResendFromEmail
-	fromName := "Pull Events"
+	fromEmail := config.App.BrevoFromEmail
+	if fromEmail == "" {
+		fromEmail = "Pull Events <noreply@tickets.pullevents.com>"
+	}
 
 	Email = &EmailService{
-		apiKey:    config.App.ResendAPIKey,
 		fromEmail: fromEmail,
-		fromName:  fromName,
-		baseURL:   "https://api.resend.com",
+		fromName:  "Pull Events",
 		client: &http.Client{
 			Timeout: 30 * time.Second,
 		},
 	}
 
-	log.Println("Email Service: Initialized")
+	log.Println("Email Service: Initialized (Brevo)")
 	return nil
 }
 
@@ -104,7 +113,7 @@ type EmailTag struct {
 	Value string `json:"value"`
 }
 
-// EmailResponse from Resend API
+// EmailResponse: id que devuelve el proveedor tras aceptar el envío.
 type EmailResponse struct {
 	ID string `json:"id"`
 }
@@ -113,132 +122,74 @@ type EmailResponse struct {
 // SEND METHODS
 // =============================================
 
-// Send sends an email. When BREVO_API_KEY is configured we route via Brevo
-// (free 300/day without domain verification); otherwise we fall back to the
-// Resend transactional API.
-func (e *EmailService) Send(ctx context.Context, req EmailRequest) (string, error) {
-	// Brevo first (preferred for the demo deployment).
-	brevoAttempted := false
-	if config.App.BrevoAPIKey != "" {
-		brevoAttempted = true
-		id, err := e.sendViaBrevo(ctx, req)
-		if err == nil {
-			return id, nil
-		}
-		// Fall through to Resend if Brevo errored.
-		log.Printf("[Email] Brevo failed, falling back to Resend: %v", err)
-	}
+// emailSendAttempts es cuántas veces se intenta un envío antes de rendirse.
+// Existe porque Brevo es el ÚNICO proveedor: sin fallback, un 429 de cuota o
+// un 502 pasajero se llevaría por delante la entrada de alguien que ya pagó.
+const emailSendAttempts = 3
 
-	// Sin key de Resend: solo se puede "mockear" en desarrollo real (ningún
-	// proveedor configurado). Si Brevo ESTABA configurado y falló, esto es un
-	// fallo de entrega REAL — NUNCA devolver éxito falso, o el caller marca el
-	// ticket como entregado cuando el comprador se quedó sin su QR.
-	if e.apiKey == "" {
-		if brevoAttempted {
-			return "", fmt.Errorf("email NO enviado: Brevo falló y no hay RESEND_API_KEY de fallback")
-		}
+// Send envía un email por Brevo. Reintenta los fallos transitorios y NUNCA
+// devuelve éxito si el correo no salió.
+func (e *EmailService) Send(ctx context.Context, req EmailRequest) (string, error) {
+	// Sin proveedor configurado (desarrollo): se logea y ya. Esto solo es
+	// aceptable porque no hay NADA configurado; si Brevo está puesto y falla,
+	// más abajo se devuelve error de verdad.
+	if config.App.BrevoAPIKey == "" {
 		log.Printf("[Email] Would send to %v: %s (sin proveedor de email configurado)", req.To, req.Subject)
 		return "mock-email-id", nil
 	}
 
-	// Build request body
-	body := map[string]interface{}{
-		"from":    e.fromEmail, // Already in "Name <email>" format from config
-		"to":      req.To,
-		"subject": req.Subject,
-	}
+	var lastErr error
+	for attempt := 1; attempt <= emailSendAttempts; attempt++ {
+		id, err := e.sendViaBrevo(ctx, req)
+		if err == nil {
+			if attempt > 1 {
+				log.Printf("[Email] enviado en el intento %d to=%v subject=%q", attempt, req.To, req.Subject)
+			}
+			return id, nil
+		}
+		lastErr = err
 
-	if req.HTML != "" {
-		body["html"] = req.HTML
-	}
-	if req.Text != "" {
-		body["text"] = req.Text
-	}
-	if req.ReplyTo != "" {
-		body["reply_to"] = req.ReplyTo
-	}
-	if len(req.CC) > 0 {
-		body["cc"] = req.CC
-	}
-	if len(req.BCC) > 0 {
-		body["bcc"] = req.BCC
-	}
-	if len(req.Attachments) > 0 {
-		body["attachments"] = req.Attachments
-	}
-	if len(req.Tags) > 0 {
-		// Resend only accepts ASCII letters, numbers, underscores and dashes
-		// in tag names/values — anything else 422s the whole send.
-		body["tags"] = sanitizeResendTags(req.Tags)
-	}
-
-	// OPTIMIZED: Use buffer pool to reduce allocations
-	buf := emailBufferPool.Get().(*bytes.Buffer)
-	buf.Reset()
-	defer emailBufferPool.Put(buf)
-
-	if err := json.NewEncoder(buf).Encode(body); err != nil {
-		return "", fmt.Errorf("failed to encode email: %w", err)
-	}
-
-	// Create request
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", e.baseURL+"/emails", buf)
-	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
-	}
-
-	httpReq.Header.Set("Authorization", "Bearer "+e.apiKey)
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	// Send request
-	resp, err := e.client.Do(httpReq)
-	if err != nil {
-		return "", fmt.Errorf("failed to send email: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// OPTIMIZED: Handle errors without full body read for success case
-	if resp.StatusCode >= 400 {
-		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		// Log the rejection so it's visible in Fly logs, but don't surface it
-		// to callers (most call sites fire-and-forget; we don't want a quiet
-		// email failure to abort the surrounding business flow).
-		log.Printf("[Email] REJECTED to=%v subject=%q status=%d body=%s",
-			req.To, req.Subject, resp.StatusCode, string(errBody))
-		return "", fmt.Errorf("email API error %d: %s", resp.StatusCode, string(errBody))
-	}
-
-	// OPTIMIZED: Stream decode directly from response body
-	var emailResp EmailResponse
-	if err := json.NewDecoder(resp.Body).Decode(&emailResp); err != nil {
-		return "", fmt.Errorf("failed to parse response: %w", err)
-	}
-
-	log.Printf("[Email] Sent to %v: %s (ID: %s)", req.To, req.Subject, emailResp.ID)
-	return emailResp.ID, nil
-}
-
-// sanitizeResendTags maps arbitrary tag values to Resend's allowed charset
-// (ASCII letters, numbers, underscore, dash) by replacing anything else with
-// a dash.
-func sanitizeResendTags(tags []EmailTag) []EmailTag {
-	clean := func(s string) string {
-		out := make([]rune, 0, len(s))
-		for _, r := range s {
-			switch {
-			case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
-				out = append(out, r)
-			default:
-				out = append(out, '-')
+		// Un rechazo definitivo (destinatario inválido, plantilla mal formada,
+		// credenciales mal) no mejora reintentando: se corta ya.
+		if !isRetryableEmailError(err) {
+			break
+		}
+		if attempt < emailSendAttempts {
+			backoff := time.Duration(attempt) * 2 * time.Second
+			log.Printf("[Email] intento %d/%d falló (%v) — reintento en %s",
+				attempt, emailSendAttempts, err, backoff)
+			select {
+			case <-ctx.Done():
+				return "", fmt.Errorf("email NO enviado (contexto cancelado): %w", lastErr)
+			case <-time.After(backoff):
 			}
 		}
-		return string(out)
 	}
-	result := make([]EmailTag, len(tags))
-	for i, t := range tags {
-		result[i] = EmailTag{Name: clean(t.Name), Value: clean(t.Value)}
+
+	// Aquí el correo NO ha salido. Es un fallo de entrega REAL: se propaga
+	// siempre, para que quien llame no marque como entregado lo que no lo está.
+	log.Printf("[Email] ALERT NO ENVIADO tras %d intentos to=%v subject=%q: %v — si es un ticket, REENVIAR A MANO",
+		emailSendAttempts, req.To, req.Subject, lastErr)
+	return "", fmt.Errorf("email NO enviado por Brevo tras %d intentos: %w", emailSendAttempts, lastErr)
+}
+
+// isRetryableEmailError distingue el fallo pasajero (que sí conviene
+// reintentar) del rechazo definitivo. Brevo devuelve 429 al agotar la cuota
+// diaria del plan; se reintenta por si es un pico momentáneo, pero si el plan
+// está seco los 3 intentos fallarán y quedará el ALERT en los logs.
+func isRetryableEmailError(err error) bool {
+	if err == nil {
+		return false
 	}
-	return result
+	msg := err.Error()
+	for _, s := range []string{" 429", " 500", " 502", " 503", " 504", "timeout", "connection", "EOF", "no such host", "TLS"} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	// Errores de red sin código HTTP: el mensaje no trae "status", así que si
+	// no reconocemos un 4xx definitivo, se reintenta.
+	return !strings.Contains(msg, "status 4")
 }
 
 // =============================================
