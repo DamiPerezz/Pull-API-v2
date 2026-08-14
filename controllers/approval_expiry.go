@@ -282,7 +282,16 @@ func reconcileStuckDLocalPayments() {
 			// Sigue sin resolverse y ya pasó el límite duro: checkout abandonado.
 			// Se cierra y se devuelve la plaza, con claim atómico por si el
 			// comprador vuelve justo ahora.
-			if outcome == dlOutcomePending && now.Sub(started) >= dlocalGiveUpAfter {
+			//
+			// PERO NUNCA ANTES DEL PLAZO QUE LE PROMETIMOS. Una solicitud
+			// privada aprobada lleva 24 h en metadata.payment_deadline y así se
+			// le dijo por correo. En cuanto abre el formulario, la orden pasa a
+			// `processing` y este barrido es el ÚNICO que la mira: sin esta
+			// comprobación le cancelaríamos la plaza a las 3 h por haber
+			// ojeado el enlace, incumpliendo el plazo del propio email.
+			// (Pasa igual por el checkout alojado, no solo por SmartFields.)
+			if outcome == dlOutcomePending && now.Sub(started) >= dlocalGiveUpAfter &&
+				now.After(promisedPaymentDeadline(order)) {
 				res, uerr := venueDB.UpdateCtx(ctx, "orders", map[string]interface{}{
 					"status":              "expired",
 					"cancelled_at":        now.Format(time.RFC3339),
@@ -486,4 +495,22 @@ func expireOverdueAuthorizations() {
 			sendApprovalStatusEmail(ctx, venueID, order, services.GetFloat64(order, "total"), cur, "expired", true)
 		}
 	}
+}
+
+// promisedPaymentDeadline devuelve el plazo que se le PROMETIÓ al comprador en
+// el correo de aprobación (metadata.payment_deadline). Si la orden no tiene
+// plazo —una compra pública normal— devuelve el pasado, de modo que no cambia
+// nada: manda el límite de 3 h del reconciliador.
+//
+// Existe para que ningún barrido cancele una plaza antes de la hora que le
+// dimos por escrito al cliente.
+func promisedPaymentDeadline(order map[string]interface{}) time.Time {
+	md, ok := order["metadata"].(map[string]interface{})
+	if !ok {
+		return time.Time{}
+	}
+	if t, ok := parseFlexTime(services.GetString(md, "payment_deadline")); ok {
+		return t
+	}
+	return time.Time{}
 }
