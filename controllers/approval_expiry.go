@@ -26,11 +26,16 @@ func StartApprovalExpiryJob() {
 		expireOverdueAuthorizations()
 		expireAbandonedPendingOrders()
 		expirePrivateFlowOrders()
+		// El reparador va ANTES del reconciliador a propósito: así una orden
+		// confirmada-sin-entradas vuelve a `processing` y el reconciliador la
+		// reemite en ESTE mismo barrido, no en el siguiente.
+		repairConfirmedOrdersWithoutTickets()
 		reconcileStuckDLocalPayments()
 		for range ticker.C {
 			expireOverdueAuthorizations()
 			expireAbandonedPendingOrders()
 			expirePrivateFlowOrders()
+			repairConfirmedOrdersWithoutTickets()
 			reconcileStuckDLocalPayments()
 		}
 	}()
@@ -110,6 +115,88 @@ func expireAbandonedPendingOrders() {
 			}
 			log.Printf("[PendingExpiry] carrito abandonado liberado order=%s venue=%s qty=%d",
 				services.GetString(order, "order_number"), venueID, qty)
+		}
+	}
+}
+
+// repairConfirmedOrdersWithoutTickets busca el peor estado posible del sistema:
+// una orden marcada como PAGADA que no tiene NINGUNA entrada emitida. El
+// cliente pagó, tiene el cargo en su tarjeta, y no existe ni un QR a su nombre.
+//
+// Puede llegarse ahí por cualquier camino que confirme un pago, porque el flip
+// de la orden a `confirmed` ocurre ANTES de insertar las entradas: si algo
+// muere en ese hueco (contexto cancelado, caída de Supabase, deploy en
+// mitad), queda confirmada y vacía. Y nadie la rescata: el reconciliador solo
+// mira `processing`, y el webhook, al verla `confirmed`, se retira.
+//
+// El arreglo es devolverla a `processing`, que es el estado que SÍ vigila el
+// reconciliador: en el siguiente barrido volverá a preguntar a dLocal y, si el
+// pago está PAID, reemitirá las entradas por el carril de siempre.
+//
+// PRUDENCIA: solo se toca si el recuento de entradas se pudo hacer DE VERDAD y
+// dio cero. Ante cualquier duda (error de consulta) no se toca nada — mover una
+// orden buena a `processing` sería crear el problema que se intenta evitar.
+func repairConfirmedOrdersWithoutTickets() {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	venues, err := services.DB.Central().QueryCtx(ctx, "venues", map[string]interface{}{
+		"select": "id",
+		"where":  map[string]interface{}{"is_active": true, "deleted_at": "is.null"},
+	})
+	if err != nil {
+		return
+	}
+
+	for _, v := range venues {
+		venueID := services.GetString(v, "id")
+		venueDB := services.DB.ForVenue(venueID)
+		if venueDB == nil {
+			continue
+		}
+		orders, err := venueDB.QueryCtx(ctx, "orders", map[string]interface{}{
+			"select": "id,order_number,quantity,stripe_session_id,paid_at,user_email",
+			"where":  map[string]interface{}{"status": "confirmed"},
+			"limit":  1000,
+		})
+		if err != nil {
+			continue
+		}
+		for _, order := range orders {
+			orderID := services.GetString(order, "id")
+			orderNumber := services.GetString(order, "order_number")
+
+			// Solo órdenes que DEBERÍAN tener entradas y que pasaron por dLocal:
+			// así no se toca nada de otros flujos ni de datos históricos.
+			if services.GetInt(order, "quantity") <= 0 {
+				continue
+			}
+			if services.DLocalPaymentIDFromSession(services.GetString(order, "stripe_session_id")) == "" {
+				continue
+			}
+
+			tickets, terr := venueDB.QueryCtx(ctx, "tickets", map[string]interface{}{
+				"select": "id",
+				"where":  map[string]interface{}{"order_id": orderID},
+				"limit":  1,
+			})
+			if terr != nil {
+				continue // no se sabe: NO se toca
+			}
+			if len(tickets) > 0 {
+				continue // tiene entradas, todo bien
+			}
+
+			log.Printf("[RepairTickets] ALERT order=%s está CONFIRMADA y SIN ENTRADAS (cliente %s) — se devuelve a processing para reemitir",
+				orderNumber, services.GetString(order, "user_email"))
+
+			res, uerr := venueDB.UpdateCtx(ctx, "orders", map[string]interface{}{
+				"status": "processing",
+			}, map[string]interface{}{"id": orderID, "status": "confirmed"})
+			if uerr != nil || len(res) == 0 {
+				log.Printf("[RepairTickets] ALERT no se pudo devolver a processing order=%s: %v — EMITIR A MANO",
+					orderNumber, uerr)
+			}
 		}
 	}
 }

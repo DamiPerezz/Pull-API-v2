@@ -216,6 +216,71 @@ func SmartFieldsSession(c *gin.Context) {
 	}
 
 	order := target.Order
+
+	// GUARDIA ANTES DE ABRIR OTRO COBRO.
+	//
+	// Cada /session crea un pago nuevo en dLocal y pisa `stripe_session_id`.
+	// Si el pago ANTERIOR seguía vivo, se queda huérfano: nadie vuelve a
+	// mirarlo (el reconciliador solo conoce el último id). Y si ese pago
+	// huérfano ya estaba PAGADO, el comprador pagó y se queda sin entrada.
+	// Pasa con algo tan tonto como recargar la página de pago.
+	//
+	// Así que antes de crear nada, se le pregunta a dLocal por el pago previo.
+	if prevID := services.DLocalPaymentIDFromSession(services.GetString(order, "stripe_session_id")); prevID != "" {
+		if prev, perr := dlocalGetPayment(ctx, target.VenueID, prevID); perr == nil && prev != nil {
+			switch {
+			case prev.IsPaid():
+				// Ya estaba pagado: se emiten las entradas por el carril de
+				// siempre y NO se abre otro cobro. Contexto despegado: aquí ya
+				// hay dinero de por medio.
+				bgCtx, bgCancel := context.WithTimeout(context.Background(), 60*time.Second)
+				defer bgCancel()
+				outcome := applyDLocalPaymentToOrder(bgCtx, target.VenueID, target.VenueDB, order, prev)
+				log.Printf("[SmartFields] order=%s ya tenía el pago %s PAGADO → %s (no se abre otro cobro)",
+					services.GetString(order, "order_number"), prevID, outcome)
+				c.JSON(http.StatusOK, gin.H{
+					"success": true, "already_paid": true,
+					"message":      "Esta orden ya está pagada. Te enviamos las entradas por correo.",
+					"order_number": services.GetString(order, "order_number"),
+				})
+				return
+
+			case prev.Status == services.DLocalStatusPending:
+				// Sigue vivo: se REUTILIZA en vez de abrir otro. Así no se
+				// abandona un cobro que el comprador podría completar, ni se
+				// deja a dLocal con dos pagos abiertos por la misma entrada.
+				if tok := prevCheckoutToken(order); tok != "" {
+					log.Printf("[SmartFields] order=%s reutiliza el cobro %s (sigue PENDING)",
+						services.GetString(order, "order_number"), prevID)
+					c.JSON(http.StatusOK, gin.H{
+						"checkout_token": tok,
+						"api_key":        apiKey,
+						"payment_id":     prevID,
+						"session_id":     services.DLocalSessionID(prevID),
+						"amount":         services.GetFloat64(order, "total"),
+						"currency":       services.GetString(order, "currency"),
+						"country":        services.DLocalCountry(),
+						"order_number":   services.GetString(order, "order_number"),
+						"reused":         true,
+					})
+					return
+				}
+			}
+			// REJECTED/CANCELLED/EXPIRED: el intento anterior está muerto,
+			// se puede abrir otro sin dejar nada colgando.
+		} else if perr != nil {
+			// No se pudo preguntar. NO se abre otro cobro a ciegas: si el
+			// anterior estuviera pagado, crearíamos un segundo cobro sobre una
+			// entrada ya comprada. Mejor pedirle que reintente en un momento.
+			log.Printf("[SmartFields] ALERT no se pudo consultar el pago previo %s de order=%s: %v — no se abre otro cobro",
+				prevID, services.GetString(order, "order_number"), perr)
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": "No podemos verificar el estado de tu pago anterior. Inténtalo de nuevo en unos segundos.",
+			})
+			return
+		}
+	}
+
 	ticketTypeName := "Entradas"
 	if tt, _ := target.VenueDB.QueryOne(ctx, "ticket_types", map[string]interface{}{
 		"select": "name", "where": map[string]interface{}{"id": services.GetString(order, "ticket_type_id")},
@@ -357,9 +422,24 @@ func SmartFieldsConfirm(c *gin.Context) {
 		return
 	}
 
+	// CONTEXTO DESPEGADO DE LA REQUEST — imprescindible, no es cosmética.
+	//
+	// A partir de aquí la tarjeta YA está cobrada. Si siguiéramos con el
+	// contexto de la petición, bastaría con que el comprador cerrara la
+	// pestaña (Go cancela el contexto al desconectarse el cliente) para que
+	// muriera a media emisión: la orden ya habría hecho el flip atómico a
+	// `confirmed` y el INSERT de las entradas fallaría. Quedaría status
+	// confirmed, paid_at NULL, CERO entradas y el dinero cobrado — y nadie lo
+	// repararía: el reconciliador solo barre `processing` y el webhook, al ver
+	// `confirmed`, se retira sin tocar nada.
+	//
+	// Misma precaución (y mismo motivo) que en GetOrderPaymentStatus.
+	bgCtx, bgCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer bgCancel()
+
 	// MISMO carril que el webhook: idempotente, emite entradas una sola vez y
 	// libera aforo si el intento muere. No se duplica nada de esa lógica aquí.
-	outcome := applyDLocalPaymentToOrder(ctx, target.VenueID, target.VenueDB, order, payment)
+	outcome := applyDLocalPaymentToOrder(bgCtx, target.VenueID, target.VenueDB, order, payment)
 	paid := payment.IsPaid()
 
 	log.Printf("[SmartFields] confirmado order=%s pago=%s estado=%s → %s",
@@ -386,4 +466,14 @@ func SmartFieldsConfirm(c *gin.Context) {
 		"order_number": orderNumber,
 		"message":      message,
 	})
+}
+
+// prevCheckoutToken devuelve el merchant_checkout_token del intento anterior,
+// si /session llegó a guardarlo. Es lo único con lo que se puede reutilizar un
+// cobro que sigue PENDING (el payment_id NO sirve para confirmar).
+func prevCheckoutToken(order map[string]interface{}) string {
+	if md, ok := order["metadata"].(map[string]interface{}); ok {
+		return strings.TrimSpace(services.GetString(md, "dlocal_checkout_token"))
+	}
+	return ""
 }
