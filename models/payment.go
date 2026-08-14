@@ -231,6 +231,13 @@ type CheckoutParams struct {
 	CustomerEmail  string
 	CustomerName   string
 	Metadata       map[string]string
+
+	// Transparent pide a la pasarela un checkout TRANSPARENTE (SmartFields):
+	// el formulario de tarjeta se pinta en nuestra web y la tarjeta se
+	// tokeniza contra la pasarela sin pasar por nuestro backend.
+	// En dLocal Go activa `allow_transparent` y hace que la respuesta traiga
+	// MerchantCheckoutToken.
+	Transparent bool
 }
 
 // CheckoutResult from payment gateway.
@@ -252,6 +259,12 @@ type CheckoutResult struct {
 	// Status es el estado con el que NACE el pago ("PENDING" en dLocal Go).
 	// Recordatorio de que el checkout alojado NO confirma en la misma petición.
 	Status string
+
+	// MerchantCheckoutToken solo viene si se pidió Transparent: es lo que
+	// necesita el SDK de SmartFields en el navegador para tokenizar la
+	// tarjeta. NO es un secreto (viaja al cliente), pero SÍ es de un solo
+	// pago: identifica ESTE cobro concreto.
+	MerchantCheckoutToken string
 }
 
 // PaymentResult after payment confirmation

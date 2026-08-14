@@ -733,6 +733,11 @@ func setupLegacyRoutes(v1 *gin.RouterGroup) {
 	}
 	// Direct-card payment (NeoNet/Cybersource): two atomic sales per purchase.
 	v1.POST("/orders/pay", middleware.RateLimitPayment(), controllers.PayOrder)
+	// SmartFields (checkout transparente de dLocal): la ÚNICA vía con tarjeta
+	// en Guatemala — el checkout alojado solo ofrece efectivo allí.
+	// La tarjeta se tokeniza en el navegador; aquí solo llega un cardToken.
+	v1.POST("/orders/smartfields/session", middleware.RateLimitPayment(), controllers.SmartFieldsSession)
+	v1.POST("/orders/smartfields/confirm", middleware.RateLimitPayment(), controllers.SmartFieldsConfirm)
 	v1.GET("/orders/details/:orderId", controllers.LegacyGetOrderDetails)
 }
 

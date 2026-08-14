@@ -310,6 +310,17 @@ func (p *DLocalProcessor) CreateCheckout(ctx context.Context, params models.Chec
 			Email: strings.TrimSpace(params.CustomerEmail),
 		}
 	}
+	// SmartFields (checkout transparente). Se pide el mismo pago pero con
+	// allow_transparent, que hace que dLocal devuelva merchant_checkout_token
+	// para tokenizar la tarjeta en NUESTRA página.
+	//
+	// En Guatemala esto NO es una preferencia estética: el checkout alojado
+	// solo ofrece efectivo (la cobertura de la cuenta no lista tarjeta), y
+	// SmartFields es la única vía por la que sale el formulario de tarjeta.
+	// Verificado contra producción el 2026-08-13.
+	if params.Transparent {
+		req.AllowTransparent = true
+	}
 
 	payment, err := cli.CreatePayment(ctx, req)
 	if err != nil {
@@ -334,13 +345,55 @@ func (p *DLocalProcessor) CreateCheckout(ctx context.Context, params models.Chec
 	log.Printf("[dLocal] checkout creado order=%s pago=%s %.2f %s estado=%s split=%t",
 		orderID, paymentID, amount, currency, payment.Status, req.SplitCode != "")
 
+	// SmartFields sin token es un callejón sin salida: el navegador no puede
+	// tokenizar y el comprador se queda mirando un formulario muerto. Se falla
+	// aquí, dejando el id en el log para poder conciliar si acabara pagándose.
+	if params.Transparent && payment.MerchantCheckoutToken == "" {
+		log.Printf("[dLocal] ALERT pago %s (orden %s) creado SIN merchant_checkout_token pese a allow_transparent — revisar",
+			paymentID, orderID)
+		return nil, fmt.Errorf("dLocal no devolvió merchant_checkout_token para la orden %s (pago %s)", orderID, paymentID)
+	}
+
 	return &models.CheckoutResult{
-		SessionID:   DLocalSessionID(paymentID),
-		CheckoutURL: payment.RedirectURL,
-		Gateway:     models.GatewayDLocal,
-		PaymentID:   paymentID,
-		Status:      payment.Status,
+		SessionID:             DLocalSessionID(paymentID),
+		CheckoutURL:           payment.RedirectURL,
+		Gateway:               models.GatewayDLocal,
+		PaymentID:             paymentID,
+		Status:                payment.Status,
+		MerchantCheckoutToken: payment.MerchantCheckoutToken,
 	}, nil
+}
+
+// SmartFieldsKey devuelve la clave PÚBLICA de SmartFields (la que va al
+// navegador para inicializar el SDK). Sale de la fila cifrada del venue y, si
+// ahí no está, del entorno. NO es un secreto — la secret key jamás sale del
+// backend.
+func (p *DLocalProcessor) SmartFieldsKey() string {
+	if p != nil && p.config != nil && p.config.Credentials != nil {
+		if k := strings.TrimSpace(p.config.Credentials.DLocalSmartFieldsKey); k != "" {
+			return k
+		}
+	}
+	return strings.TrimSpace(os.Getenv("DLOCAL_SMARTFIELDS_KEY"))
+}
+
+// ConfirmCardToken cierra un pago transparente con el `cardToken` que generó
+// SmartFields en el navegador (POST /v1/payments/confirm/{checkout_token}).
+//
+// Devuelve el pago tal y como queda en dLocal. OJO: que la llamada no falle NO
+// significa que se haya cobrado — hay que mirar el estado. Un rechazo del banco
+// es una respuesta válida con status REJECTED, no un error.
+func (p *DLocalProcessor) ConfirmCardToken(ctx context.Context, checkoutToken, cardToken, installmentsID string) (*DLocalPayment, error) {
+	cli, err := p.client()
+	if err != nil {
+		return nil, err
+	}
+	checkoutToken = strings.TrimSpace(checkoutToken)
+	cardToken = strings.TrimSpace(cardToken)
+	if checkoutToken == "" || cardToken == "" {
+		return nil, fmt.Errorf("dLocal: faltan checkout_token o card_token para confirmar")
+	}
+	return cli.ConfirmPayment(ctx, checkoutToken, cardToken, strings.TrimSpace(installmentsID))
 }
 
 // =============================================================================
