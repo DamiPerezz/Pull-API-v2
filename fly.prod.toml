@@ -13,10 +13,25 @@ primary_region = "dfw"   # Dallas — closest active region to Guatemala (mia de
 [env]
   PORT = "8080"
   ENVIRONMENT = "production"
-  # Real gateway: NeoNet/Cybersource sandbox (credentials per-venue in
-  # central payment_gateway_credentials, environment=test). Switch that row
-  # to environment=production + prod keys for the live cutover.
+  # Pasarela real: dLocal Go. Las credenciales (API key + secret cifrada) van
+  # por venue en la tabla central payment_gateway_credentials, fila
+  # gateway=dlocal, environment=production. NeoNet/Cybersource quedó apagado.
   DEMO_MODE = "false"
+  # SmartFields (checkout transparente): en Guatemala es la ÚNICA vía con
+  # tarjeta — el checkout alojado de dLocal solo ofrece efectivo allí.
+  #
+  # Esta clave es PÚBLICA por diseño: viaja al navegador para inicializar el
+  # SDK (el propio ejemplo oficial de dLocal la lleva escrita en su HTML). NO
+  # es la secret key, que jamás sale del backend y sigue cifrada en la BD.
+  # Va aquí y no como secret de Fly justamente para no disfrazar de secreto
+  # algo que es público, y para que el siguiente dev sepa de dónde sale.
+  #
+  # El backend la busca primero en la columna `smartfields_key` de
+  # payment_gateway_credentials (HOY NO EXISTE esa columna) y luego aquí.
+  DLOCAL_SMARTFIELDS_KEY = "f6e50ad1-102c-4984-800a-5785b3a94851"
+  # País del cobro. Sin esto el backend asume GT igualmente, pero explícito
+  # es mejor: si algún día se vende en otro país, esto es lo que hay que tocar.
+  DLOCAL_COUNTRY = "GT"
   COOKIE_SAMESITE = "None"
   # Browsers send an Origin header on the purchase POST; the proxy forwards
   # it, so the backend must whitelist the real web origins or it 403s with
