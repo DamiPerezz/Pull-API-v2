@@ -163,14 +163,81 @@ func MobileCreateEventWithTickets(c *gin.Context) {
 		if quantity == 0 {
 			quantity = services.GetInt(tt, "initialQuantity")
 		}
+		// MESAS DE GRUPO: van a otra tabla (event_vip_ticket_types) y con
+		// precio POR GÉNERO, igual que hace MobileCreateTicketType. Hasta ahora
+		// este endpoint ignoraba `isGroup` y las metía como entradas normales:
+		// la mesa se publicaba como entrada individual, con el precio genérico
+		// en vez de los de hombre/mujer. La app SÍ manda esos campos
+		// (EventoNuevo: is_group, male_price, female_price, max_quantity), así
+		// que se perdían en silencio.
+		if services.GetBool(tt, "isGroup") || services.GetBool(tt, "is_group") {
+			maxGuests := services.GetInt(tt, "maxQuantity")
+			if maxGuests == 0 {
+				maxGuests = services.GetInt(tt, "max_quantity")
+			}
+			if maxGuests == 0 {
+				maxGuests = 10
+			}
+			priceMale := services.GetFloat64(tt, "malePrice")
+			if priceMale == 0 {
+				priceMale = services.GetFloat64(tt, "male_price")
+			}
+			priceFemale := services.GetFloat64(tt, "femalePrice")
+			if priceFemale == 0 {
+				priceFemale = services.GetFloat64(tt, "female_price")
+			}
+			// Sin precios por género se cae al precio general: mejor una mesa
+			// con el precio correcto en ambos campos que una mesa a cero.
+			if priceMale == 0 {
+				priceMale = price
+			}
+			if priceFemale == 0 {
+				priceFemale = price
+			}
+			vipPayload := map[string]interface{}{
+				"event_id":       eventID,
+				"name":           services.GetString(tt, "name"),
+				"description":    services.GetString(tt, "benefits"),
+				"price_male":     priceMale,
+				"price_female":   priceFemale,
+				"currency":       "GTQ",
+				"quantity_total": quantity,
+				"max_guests":     maxGuests,
+			}
+			row, terr := venueDB.InsertCtx(ctx, "event_vip_ticket_types", vipPayload)
+			if terr != nil {
+				log.Printf("[Mobile/CreateEventWithTickets] ALERT mesa de grupo %q NO creada: %v",
+					services.GetString(tt, "name"), terr)
+			} else if row != nil {
+				createdTickets = append(createdTickets, row)
+			}
+			continue
+		}
+
+		// Entradas normales. min/max por pedido los elige el staff; antes se
+		// forzaba 1/10 y se ignoraba lo que hubiera puesto.
+		minPer := services.GetInt(tt, "minQuantity")
+		if minPer == 0 {
+			minPer = services.GetInt(tt, "min_quantity")
+		}
+		if minPer == 0 {
+			minPer = 1
+		}
+		maxPer := services.GetInt(tt, "maxQuantity")
+		if maxPer == 0 {
+			maxPer = services.GetInt(tt, "max_quantity")
+		}
+		if maxPer == 0 {
+			maxPer = 10
+		}
 		ttPayload := map[string]interface{}{
 			"event_id":       eventID,
 			"name":           services.GetString(tt, "name"),
 			"price":          price,
 			"quantity_total": quantity,
 			"benefits":       splitBenefits(services.GetString(tt, "benefits")),
-			"min_per_order":  1,
-			"max_per_order":  10,
+			"min_per_order":  minPer,
+			"max_per_order":  maxPer,
 			"is_active":      true,
 			"is_visible":     true,
 		}
