@@ -301,8 +301,20 @@ func (p *DLocalProcessor) CreateCheckout(ctx context.Context, params models.Chec
 		NotificationURL: notificationURL,
 		SuccessURL:      successURL,
 		BackURL:         backURL,
-		PaymentType:     "CREDIT_CARD",
 		SplitCode:       p.splitCode(),
+	}
+	// `payment_type` FILTRA los métodos que dLocal deja usar en ese pago. Con
+	// "CREDIT_CARD" y una cuenta cuya cobertura en Guatemala no lista tarjeta,
+	// el pago nace SIN NINGÚN método: el checkout alojado mostraba la lista
+	// vacía y el confirm transparente respondía
+	// 400 {"code":406,"message":"Missing payment method"} — un mensaje que
+	// suena a problema de credenciales y despista.
+	//
+	// Con SmartFields NO se manda: el ejemplo y la documentación oficial del
+	// checkout transparente crean el pago sin él (solo allow_transparent), y
+	// el método ya queda determinado por la tarjeta que se tokeniza.
+	if !params.Transparent {
+		req.PaymentType = "CREDIT_CARD"
 	}
 	if params.CustomerEmail != "" || params.CustomerName != "" {
 		req.Payer = &DLocalPayer{
