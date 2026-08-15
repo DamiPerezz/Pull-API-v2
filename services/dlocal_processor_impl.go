@@ -383,17 +383,17 @@ func (p *DLocalProcessor) SmartFieldsKey() string {
 // Devuelve el pago tal y como queda en dLocal. OJO: que la llamada no falle NO
 // significa que se haya cobrado — hay que mirar el estado. Un rechazo del banco
 // es una respuesta válida con status REJECTED, no un error.
-func (p *DLocalProcessor) ConfirmCardToken(ctx context.Context, checkoutToken, cardToken, installmentsID string) (*DLocalPayment, error) {
+func (p *DLocalProcessor) ConfirmCardToken(ctx context.Context, checkoutToken string, req DLocalConfirmRequest) (*DLocalPayment, error) {
 	cli, err := p.client()
 	if err != nil {
 		return nil, err
 	}
 	checkoutToken = strings.TrimSpace(checkoutToken)
-	cardToken = strings.TrimSpace(cardToken)
-	if checkoutToken == "" || cardToken == "" {
+	req.CardToken = strings.TrimSpace(req.CardToken)
+	if checkoutToken == "" || req.CardToken == "" {
 		return nil, fmt.Errorf("dLocal: faltan checkout_token o card_token para confirmar")
 	}
-	return cli.ConfirmPayment(ctx, checkoutToken, cardToken, strings.TrimSpace(installmentsID))
+	return cli.ConfirmPayment(ctx, checkoutToken, req)
 }
 
 // =============================================================================

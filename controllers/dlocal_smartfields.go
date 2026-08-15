@@ -405,7 +405,16 @@ func SmartFieldsConfirm(c *gin.Context) {
 		return
 	}
 
-	payment, err := dl.ConfirmCardToken(ctx, checkoutToken, req.CardToken, req.InstallmentsID)
+	// Datos del comprador para el antifraude del emisor. Salen de la orden, no
+	// del navegador: así nadie puede mandar los de otro.
+	firstName, lastName := splitFullName(services.GetString(order, "user_name"))
+	payment, err := dl.ConfirmCardToken(ctx, checkoutToken, services.DLocalConfirmRequest{
+		CardToken:       strings.TrimSpace(req.CardToken),
+		ClientFirstName: firstName,
+		ClientLastName:  lastName,
+		ClientEmail:     services.GetString(order, "user_email"),
+		InstallmentsID:  strings.TrimSpace(req.InstallmentsID),
+	})
 	if err != nil {
 		// NO se sabe si hubo cobro: puede haber fallado la red DESPUÉS de que
 		// dLocal cobrara. Jamás se declara fallo aquí — se deja que el webhook
@@ -476,4 +485,19 @@ func prevCheckoutToken(order map[string]interface{}) string {
 		return strings.TrimSpace(services.GetString(md, "dlocal_checkout_token"))
 	}
 	return ""
+}
+
+// splitFullName parte "Damián Pérez García" en nombre y apellidos. dLocal los
+// pide por separado. Si solo hay una palabra, va toda como nombre: mandar un
+// apellido inventado sería peor para el antifraude que no mandar ninguno.
+func splitFullName(full string) (string, string) {
+	parts := strings.Fields(strings.TrimSpace(full))
+	switch len(parts) {
+	case 0:
+		return "", ""
+	case 1:
+		return parts[0], ""
+	default:
+		return parts[0], strings.Join(parts[1:], " ")
+	}
 }

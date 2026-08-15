@@ -201,15 +201,35 @@ func (c *dlocalGoClient) CreatePayment(ctx context.Context, req DLocalPaymentReq
 	return &p, nil
 }
 
+// DLocalConfirmRequest es el cuerpo de POST /v1/payments/confirm/{token}.
+//
+// OJO CON LOS NOMBRES: este endpoint usa camelCase (`cardToken`,
+// `clientEmail`, `installmentsId`), a diferencia del resto de la API de dLocal
+// Go, que usa snake_case. Mandar `token` o `installments_id` NO da un error
+// claro: dLocal responde 400 con {"code":406,"message":"Missing payment
+// method"}, que suena a un problema de configuración de la cuenta y manda a
+// buscar en el sitio equivocado. Verificado contra producción el 2026-08-15.
+// Fuente: ejemplo oficial bitbucket.org/directopago/dgo-smartfields-sample
+// (server.js, /api/confirm-payment).
+type DLocalConfirmRequest struct {
+	CardToken string `json:"cardToken"`
+
+	// Datos del comprador. dLocal los usa para el antifraude del emisor; sin
+	// ellos aumentan los rechazos. Se mandan solo si los tenemos.
+	ClientFirstName    string `json:"clientFirstName,omitempty"`
+	ClientLastName     string `json:"clientLastName,omitempty"`
+	ClientEmail        string `json:"clientEmail,omitempty"`
+	ClientDocumentType string `json:"clientDocumentType,omitempty"`
+	ClientDocument     string `json:"clientDocument,omitempty"`
+
+	InstallmentsID string `json:"installmentsId,omitempty"`
+}
+
 // ConfirmPayment confirma un pago transparente con el token de tarjeta que
 // generó SmartFields en el navegador
 // (POST /v1/payments/confirm/{merchant_checkout_token}).
-func (c *dlocalGoClient) ConfirmPayment(ctx context.Context, checkoutToken, cardToken string, installmentsID string) (*DLocalPayment, error) {
-	payload := map[string]interface{}{"token": cardToken}
-	if installmentsID != "" {
-		payload["installments_id"] = installmentsID
-	}
-	body, status, err := c.do(ctx, http.MethodPost, "/v1/payments/confirm/"+checkoutToken, payload)
+func (c *dlocalGoClient) ConfirmPayment(ctx context.Context, checkoutToken string, req DLocalConfirmRequest) (*DLocalPayment, error) {
+	body, status, err := c.do(ctx, http.MethodPost, "/v1/payments/confirm/"+checkoutToken, req)
 	if err != nil {
 		return nil, err
 	}
