@@ -22,6 +22,7 @@
 # desfasado y no acepta push (403); NO es referencia para rollbacks.
 # =============================================================================
 set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$(dirname "$0")/.."
 command -v flyctl >/dev/null 2>&1 || export PATH="$PATH:$HOME/.fly/bin"
 
@@ -80,8 +81,39 @@ else
   exit 1
 fi
 
-tag="prod-$(date +%Y%m%d-%H%M%S)"
-if git tag -a "$tag" -m "Deploy $APP commit $commit" && git push origin "$tag" --quiet; then
+# ── VERSIONADO x.x.xx ────────────────────────────────────────────────────────
+# El fichero VERSION (raíz del repo) manda. Formato MAYOR.MENOR.PARCHE, con el
+# parche a 2 dígitos: 1.0.00, 1.0.01, … 1.1.00, 2.0.00.
+#
+#   PARCHE  lo sube SOLO este script, en cada deploy verificado.
+#   MENOR   súbelo a mano cuando añadas algo nuevo visible para el usuario.
+#   MAYOR   súbelo a mano en un cambio grande o incompatible.
+#
+# Se etiqueta DESPUÉS del health check a propósito: una versión solo existe si
+# de verdad está viva. Si el deploy no verifica, no se gasta número.
+bump_version() {
+  local f="$ROOT/VERSION"
+  [ -f "$f" ] || echo "1.0.00" > "$f"
+  local cur M rest m p
+  cur=$(tr -d ' \r\n' < "$f")
+  M=${cur%%.*}; rest=${cur#*.}; m=${rest%%.*}; p=${rest##*.}
+  p=$((10#$p + 1))
+  # El parche son 2 dígitos: al llegar a 100 arrastra a MENOR y vuelve a 00.
+  # Sin esto la versión 100 saldría como "1.0.100" y rompería el formato.
+  if [ "$p" -gt 99 ]; then
+    m=$((10#$m + 1))
+    p=0
+  fi
+  printf "%s.%s.%02d" "$M" "$m" "$p"
+}
+
+version="$(bump_version)"
+tag="v${version}"
+echo "$version" > "$ROOT/VERSION"
+git add "$ROOT/VERSION" >/dev/null 2>&1 || true
+git commit -q -m "chore: version ${version}" >/dev/null 2>&1 || true
+git push -q origin HEAD >/dev/null 2>&1 || true
+if git tag -a "$tag" -m "Deploy $APP commit $commit (version $version)" && git push origin "$tag" --quiet; then
   echo ""
   echo "== DEPLOYADO: $commit → $APP  (tag: $tag) =="
 else
