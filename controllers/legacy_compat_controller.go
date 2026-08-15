@@ -1204,6 +1204,51 @@ func LegacyGuestListSignup(c *gin.Context) {
 		return
 	}
 
+	// TOPE DE LA LISTA.
+	//
+	// Las listas de invitados son INDEPENDIENTES del aforo de entradas: no
+	// reservan ni consumen plazas de ticket_types (regla de negocio, no
+	// deducible del código). Por eso `max_signups` es su ÚNICO límite — y esta
+	// vía, que es la que usa la WEB, no lo comprobaba: una lista de 50 admitía
+	// 500 altas y el local se encontraba la cola en la puerta.
+	//
+	// max_signups = 0 significa SIN límite.
+	glType, _ := venueDB.QueryOne(ctx, "guest_list_types", map[string]interface{}{
+		"select": "id,name,max_signups,is_active",
+		"where":  map[string]interface{}{"id": req.GuestListTypeID},
+	})
+	if glType == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Lista no encontrada"})
+		return
+	}
+	if !services.GetBool(glType, "is_active") {
+		c.JSON(http.StatusConflict, gin.H{"error": "Esta lista ya no admite inscripciones"})
+		return
+	}
+	if maxSignups := services.GetInt(glType, "max_signups"); maxSignups > 0 {
+		// Se cuentan las altas VIVAS (una rechazada no ocupa sitio).
+		actuales, cerr := venueDB.QueryCtx(ctx, "guest_list_signups", map[string]interface{}{
+			"select": "id",
+			"where": map[string]interface{}{
+				"guest_list_type_id": req.GuestListTypeID,
+				"status":             "in.(pending,approved,confirmed,checked_in)",
+			},
+			"limit": maxSignups + 1,
+		})
+		// Si la consulta falla NO se bloquea el alta: una lista gratis que
+		// admite uno de más es mucho menos grave que dejar fuera a alguien por
+		// un fallo de red.
+		if cerr == nil && len(actuales) >= maxSignups {
+			log.Printf("[GuestList] lista %q llena (%d/%d)",
+				services.GetString(glType, "name"), len(actuales), maxSignups)
+			c.JSON(http.StatusConflict, gin.H{
+				"error": "Esta lista ya está completa",
+				"full":  true,
+			})
+			return
+		}
+	}
+
 	code, _ := generateRandomCode(12)
 	// The schema has no dedicated instagram column, so we stash it inside the
 	// notes field with a discoverable prefix so admins/scripts can extract it.
@@ -1228,6 +1273,27 @@ func LegacyGuestListSignup(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create signup", "details": err.Error()})
 		return
 	}
+
+	// Mantener al día el contador que ve el staff en la app. No es la fuente de
+	// verdad —el tope se calcula contando altas vivas, arriba— pero si se queda
+	// congelado en 0 la app enseña "0 apuntados" con la lista llena.
+	services.RunBackground("guestlist-count", func(bgCtx context.Context) error {
+		vivos, cerr := venueDB.QueryCtx(bgCtx, "guest_list_signups", map[string]interface{}{
+			"select": "id",
+			"where": map[string]interface{}{
+				"guest_list_type_id": req.GuestListTypeID,
+				"status":             "in.(pending,approved,confirmed,checked_in)",
+			},
+			"limit": 5000,
+		})
+		if cerr != nil {
+			return nil
+		}
+		venueDB.UpdateNoReturn(bgCtx, "guest_list_types",
+			map[string]interface{}{"current_signups": len(vivos)},
+			map[string]interface{}{"id": req.GuestListTypeID})
+		return nil
+	})
 
 	// Fire-and-forget confirmation email.
 	go func() {
