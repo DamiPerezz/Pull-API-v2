@@ -425,8 +425,15 @@ func SmartFieldsConfirm(c *gin.Context) {
 		// NO se sabe si hubo cobro: puede haber fallado la red DESPUÉS de que
 		// dLocal cobrara. Jamás se declara fallo aquí — se deja que el webhook
 		// y el reconciliador digan la última palabra.
-		log.Printf("[SmartFields] ALERT confirmación indeterminada order=%s: %v — lo resolverá el webhook/reconciliador",
-			orderNumber, err)
+		// Se registra la FORMA del cardToken (largo y primeros caracteres), NUNCA
+		// entero. Sirve para distinguir de un vistazo un token de dLocal de otra
+		// cosa que se haya colado en su lugar: si el navegador manda un campo
+		// equivocado, dLocal responde "Missing payment method", que no señala
+		// para nada al token y hace perder horas.
+		ct := strings.TrimSpace(req.CardToken)
+		pista := fmt.Sprintf("len=%d prefijo=%q", len(ct), ct[:min(8, len(ct))])
+		log.Printf("[SmartFields] ALERT confirmación indeterminada order=%s cardToken(%s): %v — lo resolverá el webhook/reconciliador",
+			orderNumber, pista, err)
 		c.JSON(http.StatusAccepted, gin.H{
 			"success":       false,
 			"paid":          false,
