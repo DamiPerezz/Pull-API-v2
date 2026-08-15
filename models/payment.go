@@ -232,6 +232,13 @@ type CheckoutParams struct {
 	CustomerName   string
 	Metadata       map[string]string
 
+	// ExpiresInMinutes es el tiempo que el cobro debe seguir siendo pagable EN
+	// LA PASARELA. Debe cuadrar con el plazo que nosotros mantenemos por
+	// nuestro lado: si la pasarela lo acepta más tarde de lo que nosotros
+	// guardamos la plaza, se cobra una entrada ya revendida.
+	// 0 = no se le impone plazo a la pasarela.
+	ExpiresInMinutes int
+
 	// Transparent pide a la pasarela un checkout TRANSPARENTE (SmartFields):
 	// el formulario de tarjeta se pinta en nuestra web y la tarjeta se
 	// tokeniza contra la pasarela sin pasar por nuestro backend.

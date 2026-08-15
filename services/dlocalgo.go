@@ -143,6 +143,17 @@ type DLocalPaymentRequest struct {
 	BackURL         string `json:"back_url,omitempty"`
 	PaymentType     string `json:"payment_type,omitempty"` // p.ej. "CREDIT_CARD"
 
+	// Caducidad del cobro EN dLOCAL. Los dos campos van juntos o ninguno.
+	// ExpirationType: MINUTES | HOURS | DAYS.
+	//
+	// Es importante mandarlos: nosotros llevamos nuestro propio reloj (liberamos
+	// la plaza a las 3h, o al vencer el plazo de una solicitud privada). Si el
+	// pago sigue vivo en dLocal más tiempo que eso, un comprador puede pagar
+	// una entrada cuya plaza YA hemos revendido. Con efectivo es especialmente
+	// fácil, porque se paga en un comercio horas después.
+	ExpirationType  string `json:"expiration_type,omitempty"`
+	ExpirationValue int    `json:"expiration_value,omitempty"`
+
 	Payer *DLocalPayer `json:"payer,omitempty"`
 }
 

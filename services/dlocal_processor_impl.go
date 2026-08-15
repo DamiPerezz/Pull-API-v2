@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"strings"
+	"time"
 
 	"pull-api-v2/config"
 	"pull-api-v2/models"
@@ -71,6 +72,29 @@ func DLocalSessionID(paymentID string) string {
 // orden antigua no se queda sin poder confirmarse.
 func DLocalPaymentIDFromSession(sessionID string) string {
 	return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(sessionID), DLocalSessionPrefix))
+}
+
+// dlocalAttemptSep separa el id de la orden del número de intento dentro del
+// `order_id` que se le manda a dLocal. Se elige "~" porque no aparece en un
+// UUID ni en nuestros números de orden, así que el recorte no puede
+// equivocarse.
+const dlocalAttemptSep = "~"
+
+// nowUnixNano da un sufijo único por intento.
+func nowUnixNano() int64 { return time.Now().UnixNano() }
+
+// DLocalOrderRef recorta el sufijo de intento y devuelve el id de la orden tal
+// y como lo conoce nuestra base de datos.
+//
+// Lo usa el webhook para reencontrar la orden a partir del `order_id` que
+// devuelve dLocal. Sin esto, en cuanto el order_id lleva sufijo la búsqueda
+// por `id` falla y el pago se queda huérfano.
+func DLocalOrderRef(orderID string) string {
+	orderID = strings.TrimSpace(orderID)
+	if i := strings.Index(orderID, dlocalAttemptSep); i > 0 {
+		return orderID[:i]
+	}
+	return orderID
 }
 
 // ErrDLocalRefundPending indica que dLocal ACEPTÓ el reembolso pero todavía no
@@ -253,6 +277,17 @@ func (p *DLocalProcessor) CreateCheckout(ctx context.Context, params models.Chec
 		return nil, fmt.Errorf("dLocal necesita order_id para poder conciliar el pago con la orden")
 	}
 
+	// UN SUFIJO POR INTENTO. dLocal RECHAZA un order_id repetido con
+	// 400 {"code":5009,"message":"Order id is duplicated."} — comprobado contra
+	// su API. Mandando el UUID pelado, el SEGUNDO intento de pago de una orden
+	// (tarjeta rechazada, CVV mal, checkout caducado) fallaba al crearse y el
+	// comprador se quedaba SIN poder pagar nunca esa compra, con la plaza
+	// retenida. Es el fallo que más caro sale: pasa el primer día.
+	//
+	// Caben 128 caracteres (36 del UUID + sufijo va sobrado). El webhook
+	// recorta el sufijo para reencontrar la orden — ver dLocalOrderRef.
+	orderRef := fmt.Sprintf("%s%s%d", orderID, dlocalAttemptSep, nowUnixNano())
+
 	venueID := strings.TrimSpace(params.VenueID)
 	if venueID == "" && params.Metadata != nil {
 		venueID = strings.TrimSpace(params.Metadata["venue_id"])
@@ -296,7 +331,7 @@ func (p *DLocalProcessor) CreateCheckout(ctx context.Context, params models.Chec
 		Amount:          amount,
 		Currency:        currency,
 		Country:         DLocalCountry(),
-		OrderID:         orderID,
+		OrderID:         orderRef,
 		Description:     description,
 		NotificationURL: notificationURL,
 		SuccessURL:      successURL,
@@ -332,6 +367,17 @@ func (p *DLocalProcessor) CreateCheckout(ctx context.Context, params models.Chec
 	// Verificado contra producción el 2026-08-13.
 	if params.Transparent {
 		req.AllowTransparent = true
+	}
+	// Se le impone a dLocal el MISMO plazo que mantenemos nosotros. Sin esto su
+	// cobro vive 24h por defecto mientras nosotros devolvemos la plaza al aforo
+	// mucho antes: el comprador pagaría una entrada ya revendida. dLocal exige
+	// los dos campos juntos.
+	if m := params.ExpiresInMinutes; m > 0 {
+		if m%60 == 0 && m >= 60 {
+			req.ExpirationType, req.ExpirationValue = "HOURS", m/60
+		} else {
+			req.ExpirationType, req.ExpirationValue = "MINUTES", m
+		}
 	}
 
 	payment, err := cli.CreatePayment(ctx, req)

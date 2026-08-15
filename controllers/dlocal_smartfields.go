@@ -300,6 +300,10 @@ func SmartFieldsSession(c *gin.Context) {
 		SuccessURL:    strings.TrimSpace(req.SuccessURL),
 		CancelURL:     strings.TrimSpace(req.BackURL),
 		Transparent:   true,
+		// El cobro debe caducar en dLocal CUANDO caduca para nosotros:
+		//  - solicitud privada aprobada -> lo que quede de su plazo prometido
+		//  - compra pública            -> la ventana del reconciliador (3 h)
+		ExpiresInMinutes: dlocalExpiryMinutes(order),
 		Metadata: map[string]string{
 			"venue_id":     target.VenueID,
 			"order_id":     services.GetString(order, "id"),
@@ -467,6 +471,25 @@ func SmartFieldsConfirm(c *gin.Context) {
 	log.Printf("[SmartFields] confirmado order=%s pago=%s estado=%s → %s",
 		orderNumber, payment.PaymentID(), payment.Status, outcome)
 
+	// 3D SECURE. Si dLocal devuelve una redirect_url en la confirmación, el
+	// banco exige que el comprador se autentique ANTES de cobrar. Hay que
+	// mandarlo allí: si nos la callamos, el pago se queda a medias para
+	// siempre y el comprador ve "pendiente" esperando un correo que no llega.
+	// Hoy la mayoría de tarjetas lo piden.
+	if !paid && strings.TrimSpace(payment.RedirectURL) != "" {
+		log.Printf("[SmartFields] 3DS requerido order=%s — se manda al comprador a autenticar", orderNumber)
+		c.JSON(http.StatusOK, gin.H{
+			"success":         false,
+			"paid":            false,
+			"requires_action": true,
+			"redirect_url":    payment.RedirectURL,
+			"status":          payment.Status,
+			"order_number":    orderNumber,
+			"message":         "Tu banco necesita confirmar el pago. Te llevamos a su página.",
+		})
+		return
+	}
+
 	status := http.StatusOK
 	message := "Pago aprobado. Te enviamos las entradas por correo."
 	if !paid {
@@ -513,4 +536,22 @@ func splitFullName(full string) (string, string) {
 	default:
 		return parts[0], strings.Join(parts[1:], " ")
 	}
+}
+
+// dlocalExpiryMinutes calcula cuánto debe seguir vivo el cobro EN dLOCAL, para
+// que su reloj y el nuestro no se separen.
+//
+// Una solicitud privada aprobada tiene un plazo prometido por correo: se usa lo
+// que quede de él. Una compra pública normal no tiene plazo propio, así que se
+// usa la ventana del reconciliador — pasada esa, damos el checkout por
+// abandonado y devolvemos la plaza, así que dLocal tampoco debe aceptarlo.
+func dlocalExpiryMinutes(order map[string]interface{}) int {
+	if d := promisedPaymentDeadline(order); !d.IsZero() {
+		if restante := int(time.Until(d).Minutes()); restante > 0 {
+			return restante
+		}
+		// El plazo ya venció: se pide el mínimo para que dLocal no lo acepte.
+		return 1
+	}
+	return int(dlocalGiveUpAfter.Minutes())
 }

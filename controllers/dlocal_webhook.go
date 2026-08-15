@@ -387,11 +387,25 @@ func findOrderForDLocalPayment(ctx context.Context, venueDB *services.SupabaseCl
 		return row
 	}
 
-	if o := lookup("id", payment.OrderID); o != nil {
+	// El order_id que devuelve dLocal lleva un sufijo de INTENTO
+	// (`<uuid>~<nano>`), porque dLocal rechaza un order_id repetido y sin él un
+	// segundo intento de pago ni siquiera se puede crear. Hay que recortarlo
+	// antes de buscar, o la orden no aparece y el cobro queda huérfano.
+	// Se prueba también el valor crudo, por las órdenes anteriores al sufijo.
+	ref := services.DLocalOrderRef(payment.OrderID)
+	if o := lookup("id", ref); o != nil {
 		return o
 	}
-	if o := lookup("order_number", payment.OrderID); o != nil {
+	if o := lookup("order_number", ref); o != nil {
 		return o
+	}
+	if ref != payment.OrderID {
+		if o := lookup("id", payment.OrderID); o != nil {
+			return o
+		}
+		if o := lookup("order_number", payment.OrderID); o != nil {
+			return o
+		}
 	}
 	if o := lookup("stripe_session_id", services.DLocalSessionID(payment.PaymentID())); o != nil {
 		return o
