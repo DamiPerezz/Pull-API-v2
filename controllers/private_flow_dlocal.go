@@ -205,7 +205,16 @@ func ResendPaymentLink(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Order not found"})
 		return
 	}
-	if st := services.GetString(order, "status"); st != "approved_unpaid" {
+	// Se puede reenviar mientras la solicitud siga aprobada y sin pagar. OJO:
+	// eso incluye `processing`, porque EN CUANTO el cliente abre el formulario
+	// de pago la orden pasa a ese estado. Si solo se aceptara
+	// `approved_unpaid`, el caso más común —"lo abrí, no pagué, y ahora no
+	// encuentro el correo"— sería justo el que NO se puede desatascar.
+	// Lo que distingue a una solicitud privada aprobada es su plazo de pago.
+	st := services.GetString(order, "status")
+	aprobadaSinPagar := st == "approved_unpaid" ||
+		(st == "processing" && !promisedPaymentDeadline(order).IsZero())
+	if !aprobadaSinPagar {
 		c.JSON(http.StatusConflict, gin.H{
 			"error":  "Solo se puede reenviar el enlace de una solicitud aprobada pendiente de pago",
 			"status": st,
