@@ -355,6 +355,12 @@ func SmartFieldsSession(c *gin.Context) {
 		"currency":       services.GetString(order, "currency"),
 		"country":        services.DLocalCountry(),
 		"order_number":   services.GetString(order, "order_number"),
+		// El SDK necesita el nombre del titular al tokenizar
+		// (createCardToken(field, {name})). Sin él, dLocal acepta la
+		// tokenización pero luego rechaza el cobro con "Missing payment
+		// method". Se manda desde aquí y no desde el navegador para que sea
+		// SIEMPRE el de la orden.
+		"client_name": services.GetString(order, "user_name"),
 	})
 }
 
