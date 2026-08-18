@@ -158,23 +158,21 @@ func approvalPaymentExpiredHeading() string {
 	return "Se agotó el plazo para pagar"
 }
 
-// noChargeNote is the reassurance line shared by every negative email: in this
-// flow the customer never handed over card details.
-// noChargeNote acompaña a los correos negativos (rechazo y caducidad). Tiene
-// que explicar la RETENCIÓN, porque el comprador la ha visto en su banco y lo
-// que le preocupa es cuándo recupera el dinero.
+// noChargeNote acompaña a los correos negativos (rechazo y caducidad). Lleva el
+// importe DENTRO a propósito: el comprador ha visto ese número en su banco, y
+// repetírselo junto a la palabra "revertido" es lo que le deja tranquilo.
 //
-// Decía "nunca te pedimos los datos de tu tarjeta, así que no hay nada que
-// devolver" — cierto con dLocal, donde se solicitaba sin pagar. Con NeoNet es
-// falso y además alarmante: se lo mandábamos a alguien que sí metió su tarjeta
-// y sí tiene un importe apartado.
-//
-// El aviso de los días es importante: la retención desaparece de nuestro lado
-// al instante, pero el banco tarda en devolverla al saldo disponible. Sin
-// decirlo, el cliente cree que le hemos cobrado igual y llama al local.
-const noChargeNote = `Hemos hecho la reversión del cargo de tu tarjeta. ` +
-	`Puede tardar <strong style="color:#ffffff;">varios días hábiles</strong> en reflejarse en tu banco, ` +
-	`según tu entidad: es lo normal en reversiones de tarjeta.`
+// Y por eso termina diciendo que NO llame al banco: la reversión ya está hecha
+// de nuestro lado, y una llamada al banco no la acelera. Sin esa frase, la
+// mitad llama igual.
+func noChargeNote(total, currency string) string {
+	return fmt.Sprintf(
+		`Hemos revertido la autorización de <strong style="color:#ffffff;">%s %s</strong>: no se te cobra nada. `+
+			`Es posible que el cargo original haya aparecido en tu banco como un consumo normal — la reversión `+
+			`puede tardar en reflejarse en tu saldo disponible, según tu banco. Esto es normal en reversiones de `+
+			`tarjeta y <strong style="color:#ffffff;">no requiere que llames a tu banco</strong>.`,
+		total, currency)
+}
 
 // BuildApprovalPendingEmail renders the "request received, nothing charged"
 // email HTML. Exported so preview tooling can render it without sending.
@@ -196,21 +194,27 @@ func BuildApprovalPendingEmail(d ApprovalEmailData) string {
 			`Hemos recibido tu solicitud para <strong style="color:#ffffff;">%s</strong>. Es un evento privado, así que el equipo de %s tiene que darle el visto bueno antes de nada.`,
 			esc(d.EventName), esc(d.VenueName))) +
 		approvalAmountCard(emailAccentAmber, "IMPORTE AUTORIZADO", d.Total, d.Currency,
-			`Tu banco ha autorizado este cargo. Es posible que <strong style="color:#ffffff;">aparezca `+
-				`en tu app o estado de cuenta como un consumo normal</strong> (no como "pendiente"): `+
-				`es lo esperado, no es un error.`) +
+			`Tu banco ya autorizó este importe en tu tarjeta. Es posible que lo veas como un `+
+				`<strong style="color:#ffffff;">cargo normal</strong> (no como &ldquo;pendiente&rdquo;) en tu app `+
+				`bancaria o estado de cuenta — esto es esperado, <strong style="color:#ffffff;">aún no está `+
+				`confirmado</strong>.`) +
 		approvalHero(d) +
 		approvalDetailsCard(emailAccentAmber, d) +
+		// Los pasos son LOS MISMOS que ve en la web al marcar la casilla
+		// (i18n: page.private.step2..step4). Si el correo y la web cuentan la
+		// misma historia con palabras distintas, el comprador duda; y si se
+		// contradicen, llama. Al cambiar uno, cambia el otro.
 		emailInfoCard(
 			emailCardLabel("Cómo sigue")+
 				approvalSteps(
-					fmt.Sprintf(`El equipo de %s revisa tu solicitud (hasta %s).`, esc(d.VenueName), decision),
-					`Si te aceptan, el cargo queda confirmado y <strong style="color:#ffffff;">recibes tus entradas con el código QR</strong> por correo. No tienes que hacer nada más.`,
-					`Si te rechazan, o pasan las 48 h sin respuesta, <strong style="color:#ffffff;">se hace una reversión del cargo</strong>.`,
+					fmt.Sprintf(`%s revisa tu solicitud (hasta %s).`, esc(d.VenueName), decision),
+					`Si te <strong style="color:#ffffff;">aceptan</strong>: el cargo queda confirmado y recibes tus entradas con QR por correo.`,
+					fmt.Sprintf(
+						`Si te <strong style="color:#ffffff;">rechazan</strong> o pasan las %s: se hace una reversión del cargo. `+
+							`Puede tardar algunos días hábiles en reflejarse en tu banco, dependiendo de tu entidad.`,
+						decision),
 				)) +
-		emailFineprint(
-			`Una reversión puede tardar <strong style="color:#ffffff;">varios días hábiles</strong> en reflejarse en tu banco, ` +
-				`según tu entidad: es lo normal en reversiones de tarjeta. Te avisaremos por correo en cada paso.`)
+		emailFineprint(`Te avisaremos por correo en cada paso.`)
 
 	return renderEmailShell(emailShellData{
 		HTMLTitle:  "Solicitud recibida - Pull",
@@ -314,7 +318,8 @@ func BuildApprovalRejectedEmail(d ApprovalEmailData, expired bool) string {
 
 	body := emailGreeting("Hola ", esc(d.CustomerName)) +
 		emailParagraph(intro) +
-		approvalAmountCard(emailAccentRed, "TE HEMOS COBRADO", "0.00", d.Currency, noChargeNote) +
+		approvalAmountCard(emailAccentRed, "HEMOS REVERTIDO EL CARGO", "0.00", d.Currency,
+			noChargeNote(d.Total, d.Currency)) +
 		approvalHero(d) +
 		approvalDetailsCard(emailAccentRed, d) +
 		emailFineprint(closing)
