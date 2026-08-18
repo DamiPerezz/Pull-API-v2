@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"pull-api-v2/services"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 )
@@ -1562,16 +1564,25 @@ func MobileUploadEventImage(c *gin.Context) {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "La imagen supera 10MB"})
 		return
 	}
-	contentType := body.ContentType
-	if contentType == "" {
-		contentType = "image/jpeg"
-	}
-	ext := "jpg"
-	switch contentType {
-	case "image/png":
-		ext = "png"
-	case "image/webp":
-		ext = "webp"
+	// SEGURIDAD: `content_type` lo escribe el cliente y este bucket es PÚBLICO.
+	// Guardarlo tal cual permitía subir un fichero con content_type
+	// "text/html" y que Storage lo sirviera como página en el dominio de
+	// Supabase (XSS almacenado con nuestra service key). El tipo lo decide el
+	// CONTENIDO, igual que en MobileUploadVenueImage.
+	//
+	// Aquí NO rechazamos lo que no reconocemos: el wizard de eventos ya está
+	// verificado end-to-end y no quiero romperlo por un formato raro. Caemos a
+	// image/jpeg — que es justo lo que hacía antes con cualquier tipo
+	// desconocido — y lo dejamos en el log. Si se quiere ser estricto, el 400
+	// va aquí.
+	contentType, ext := "image/jpeg", "jpg"
+	if detected, derr := services.ValidateImageMagicBytes(raw); derr == nil {
+		if e, ok := imageExtByDetectedType[detected]; ok {
+			contentType, ext = detected, e
+		}
+	} else {
+		log.Printf("[Mobile/UploadEventImage] contenido no reconocido como imagen venue=%s declarado=%q: %v",
+			venueID, body.ContentType, derr)
 	}
 	// Ruta única por evento/tiempo. safeLookupCode del nombre no hace falta:
 	// generamos la ruta nosotros.
@@ -1588,7 +1599,247 @@ func MobileUploadEventImage(c *gin.Context) {
 		"success":   true,
 		"url":       url, // la app lee este
 		"image_url": url, // compat
-		"file_name": body.FileName,
+		// El nombre es texto libre del cliente y sólo vuelve como eco: se
+		// recorta para no reflejar en la respuesta lo que nos manden.
+		"file_name": clampEchoedName(body.FileName),
+	})
+}
+
+// imageExtByDetectedType traduce el tipo REAL de la imagen (el que sale de los
+// magic bytes) a la extensión con la que la guardamos. Es la única fuente de la
+// extensión: el `file_name` del cliente no se usa para construir la ruta porque
+// es texto libre y podría traer "../" o ".php".
+var imageExtByDetectedType = map[string]string{
+	"image/jpeg": "jpg",
+	"image/png":  "png",
+	"image/webp": "webp",
+	"image/gif":  "gif",
+}
+
+// maxVenueImageBytes es el tope de la imagen del venue ya decodificada.
+//
+// TRAMPA: el tope real lo pone antes middleware.BodySizeLimit(10MB) sobre el
+// cuerpo HTTP, y en la variante JSON el base64 infla un 33%, así que por esa
+// vía no entra una imagen de más de ~7,5MB. Este check queda igualmente porque
+// el límite del middleware es configurable y porque en multipart sí llegan
+// 10MB de imagen real.
+const maxVenueImageBytes = 10 * 1024 * 1024
+
+// readVenueImageUpload saca los bytes de la imagen del request, aceptando las
+// DOS formas en que llega:
+//
+//   - multipart/form-data con el fichero en el campo "image" — es lo que manda
+//     hoy la app (services/uploadService.js:uploadVenueImage).
+//   - JSON {image_base64, content_type, file_name} — la misma forma que
+//     /upload/event-image.
+//
+// TRAMPA: soportar sólo JSON dejaba el endpoint muerto (la app manda multipart
+// y ShouldBindJSON respondía 400 "Falta la imagen"); soportar sólo multipart
+// rompería a cualquier cliente que copie el flujo del evento. Se aceptan las
+// dos para que ninguno de los dos lados tenga que desplegar a la vez.
+//
+// Devuelve los bytes crudos y el nombre declarado por el cliente (sólo para
+// devolverlo como eco: NUNCA se usa para construir la ruta).
+func readVenueImageUpload(c *gin.Context) (raw []byte, declaredType, fileName string, err error) {
+	if strings.HasPrefix(c.ContentType(), "multipart/form-data") {
+		fh, ferr := c.FormFile("image")
+		if ferr != nil {
+			// TRAMPA: si el cuerpo se pasa del tope, ParseMultipartForm revienta
+			// AQUÍ con "http: request body too large" (lo pone el MaxBytesReader
+			// de BodySizeLimit). Sin distinguirlo le contestábamos "Falta la
+			// imagen" a alguien que sí mandó foto — sólo que de 15MB — y se
+			// vuelve loco buscando el campo que faltaba. BodySizeLimit ya corta
+			// antes por Content-Length; esto cubre el envío sin longitud
+			// declarada (chunked).
+			if strings.Contains(ferr.Error(), "too large") {
+				return nil, "", "", errVenueImageTooLarge
+			}
+			return nil, "", "", fmt.Errorf("falta el campo image")
+		}
+		// Cortamos por Size antes de leer: si no, un fichero enorme se copia
+		// entero a memoria/disco temporal antes de que lo rechacemos.
+		if fh.Size > maxVenueImageBytes {
+			return nil, "", "", errVenueImageTooLarge
+		}
+		f, oerr := fh.Open()
+		if oerr != nil {
+			return nil, "", "", fmt.Errorf("no se pudo leer el fichero")
+		}
+		defer f.Close()
+		// LimitReader con +1 byte: si llega justo al tope sabemos que había
+		// más y no truncamos en silencio una imagen a medias.
+		b, rerr := io.ReadAll(io.LimitReader(f, maxVenueImageBytes+1))
+		if rerr != nil {
+			return nil, "", "", fmt.Errorf("no se pudo leer el fichero")
+		}
+		if len(b) > maxVenueImageBytes {
+			return nil, "", "", errVenueImageTooLarge
+		}
+		return b, fh.Header.Get("Content-Type"), clampEchoedName(fh.Filename), nil
+	}
+
+	var body struct {
+		ImageBase64 string `json:"image_base64"`
+		ContentType string `json:"content_type"`
+		FileName    string `json:"file_name"`
+	}
+	if berr := c.ShouldBindJSON(&body); berr != nil || body.ImageBase64 == "" {
+		return nil, "", "", fmt.Errorf("falta la imagen")
+	}
+	b, derr := base64.StdEncoding.DecodeString(strings.TrimSpace(body.ImageBase64))
+	if derr != nil {
+		return nil, "", "", fmt.Errorf("imagen inválida")
+	}
+	if len(b) > maxVenueImageBytes {
+		return nil, "", "", errVenueImageTooLarge
+	}
+	return b, body.ContentType, clampEchoedName(body.FileName), nil
+}
+
+// clampEchoedName recorta el nombre que devolvemos como eco. Es texto libre del
+// cliente y sólo viaja de vuelta en el JSON; sin tope, un nombre de megas se
+// reflejaría entero en la respuesta.
+func clampEchoedName(name string) string {
+	const maxLen = 200
+	if len(name) <= maxLen {
+		return name
+	}
+	// TRAMPA: cortar por bytes parte por la mitad un carácter multibyte (una
+	// "ñ" o un emoji en el nombre del fichero) y el JSON de respuesta sale con
+	// UTF-8 inválido. Retrocedemos al último inicio de rune.
+	cut := maxLen
+	for cut > 0 && !utf8.RuneStart(name[cut]) {
+		cut--
+	}
+	return name[:cut]
+}
+
+// errVenueImageTooLarge se distingue del resto de errores de lectura porque es
+// el único que responde 413 en vez de 400.
+var errVenueImageTooLarge = fmt.Errorf("la imagen supera 10MB")
+
+// MobileUploadVenueImage handles POST /upload/venue-image.
+// Gemelo de MobileUploadEventImage pero para la imagen/logo del venue: mismo
+// tope de tamaño y misma respuesta con `url`. Acepta multipart (lo que manda
+// la app) y JSON base64 — ver readVenueImageUpload.
+//
+// Diferencias con el de evento, y por qué:
+//   - Va al bucket `venue-images` de la BD CENTRAL, no al del venue. El venue
+//     vive en central (`venues.image`) y ahí es donde está hoy el logo real.
+//     Ese bucket tiene que ser público — ver la trampa marcada abajo, que NO
+//     está verificada en staging ni en la demo.
+//   - Solo admin|manager (ver más abajo).
+//   - Valida el contenido de verdad (magic bytes), no lo que declare el cliente.
+//
+// NO persiste nada en `venues`: devolvemos la URL y el cliente la manda después
+// en PUT /venue/update {"image": "<url>"} (venueService.updateVenueImage hace
+// justo esas dos llamadas), igual que el flujo del evento manda la suya en el
+// payload de crear/editar evento.
+//
+// El `venue_id` que la app adjunta en el formulario se IGNORA a propósito: el
+// venue sale del token. Si lo leyéramos del body, un staff podría cambiarle la
+// foto a otro local.
+func MobileUploadVenueImage(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	// PERMISOS: mismo criterio que PUT /venue/update (venue_controller.go).
+	// Una subida abierta a cualquier staff autenticado deja que la cuenta de
+	// un portero llene el bucket y cambie la cara pública del venue.
+	if role := c.GetString("role"); role != "admin" && role != "manager" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Insufficient permissions"})
+		return
+	}
+
+	venueID := c.GetString("venue_id")
+	if venueID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
+		return
+	}
+
+	central := services.DB.Central()
+	if central == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database not available"})
+		return
+	}
+
+	raw, declaredType, fileName, err := readVenueImageUpload(c)
+	if err != nil {
+		if err == errVenueImageTooLarge {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "La imagen supera 10MB"})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Falta la imagen"})
+		return
+	}
+
+	// SEGURIDAD: el tipo lo decide el CONTENIDO. `content_type` y `file_name`
+	// los escribe el cliente, así que no sirven para decidir qué guardamos ni
+	// con qué extensión.
+	detected, err := services.ValidateImageMagicBytes(raw)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "El archivo no es una imagen válida (JPEG, PNG, WebP o GIF)"})
+		return
+	}
+	ext, ok := imageExtByDetectedType[detected]
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Formato de imagen no permitido"})
+		return
+	}
+	// Si lo declarado no cuadra con lo detectado NO rechazamos: los clientes
+	// móviles mandan "image/jpg" para un JPEG y bloquearlos por eso sería un
+	// falso positivo. Lo dejamos en el log y mandamos a Storage el tipo real.
+	if declared := strings.ToLower(strings.TrimSpace(declaredType)); declared != "" && declared != detected {
+		log.Printf("[Mobile/UploadVenueImage] content_type declarado=%q real=%q venue=%s", declared, detected, venueID)
+	}
+
+	// Ruta con marca de tiempo. TRAMPA GORDA: UploadPublicObject manda
+	// x-upsert:true, así que una ruta fija (venue-images/<slug>/logo.png)
+	// SOBRESCRIBE el logo anterior sin forma de recuperarlo. Con el unixnano
+	// cada subida es un objeto nuevo y la URL vieja sigue viva para quien la
+	// tenga cacheada o enlazada (emails ya enviados, por ejemplo).
+	slug := venueID // fallback: el id ya es un UUID, seguro dentro de una ruta
+	if v, _ := central.QueryOne(ctx, "venues", map[string]interface{}{
+		"select": "slug",
+		"where":  map[string]interface{}{"id": venueID},
+	}); v != nil {
+		if s := services.GetString(v, "slug"); s != "" {
+			// slugify() además sanea: el slug sale de la BD, pero un "../" ahí
+			// escaparía de la carpeta del venue. Ojo, si no queda ni un carácter
+			// útil slugify devuelve "event" — en ese caso preferimos el UUID
+			// antes que meter el logo del venue en una carpeta llamada "event".
+			if sl := slugify(s); sl != "" && sl != "event" {
+				slug = sl
+			}
+		}
+	}
+	path := fmt.Sprintf("%s/logo-%d.%s", slug, time.Now().UnixNano(), ext)
+
+	// TRAMPA A VERIFICAR EN CADA ENTORNO: devolvemos una URL /object/public/,
+	// así que esto sólo funciona si el bucket es PÚBLICO. En producción lo es
+	// (services/email_theme.go sirve el logo de los correos desde
+	// `venue-images/pull/logo-email.png` del central de prod), pero el resto
+	// del código lo trata como PRIVADO: storage_controller.go y
+	// enrichVenueWithSignedImageURL firman URLs temporales para leerlo. Si en
+	// staging/demo el bucket existe pero es privado, la subida devuelve 200 y
+	// la URL guardada en `venues.image` da 400 al abrirla — foto rota y sin
+	// error visible. ensureBucket() NO lo arregla: sólo crea el bucket si
+	// falta, sobre uno existente no cambia la visibilidad (y cambiarla desde
+	// aquí expondría de golpe las imágenes que hoy sólo se sirven firmadas).
+	// Comprobación: abrir la URL devuelta en el navegador tras la primera
+	// subida de cada entorno.
+	url, upErr := central.UploadPublicObject(ctx, VenueImagesBucketName, path, detected, raw)
+	if upErr != nil {
+		log.Printf("[Mobile/UploadVenueImage] upload failed venue=%s: %v", venueID, upErr)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "No se pudo subir la imagen. Intenta de nuevo."})
+		return
+	}
+	log.Printf("[Mobile/UploadVenueImage] OK venue=%s path=%s bytes=%d type=%s", venueID, path, len(raw), detected)
+	c.JSON(http.StatusOK, gin.H{
+		"success":   true,
+		"url":       url, // la app lee este
+		"image_url": url, // compat
+		"file_name": fileName,
 	})
 }
 

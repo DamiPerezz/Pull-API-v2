@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -50,10 +51,23 @@ type PushService struct {
 var Push *PushService
 
 // InitPushService initializes FCM from FCM_SERVICE_ACCOUNT_JSON.
+//
+// TRAMPA (esto dejaría los iPhone mudos sin una sola línea de error): `Push`
+// tiene que quedar SIEMPRE distinto de nil, aunque FCM no esté configurado. Los
+// tres sitios que notifican (order_controller, pay_controller,
+// legacy_compat_controller) hacen `if services.Push != nil` antes de llamar. Si
+// `Push` fuera nil por faltar FCM_SERVICE_ACCOUNT_JSON, NUNCA se entraría a
+// NotifyVenueStaff — y por tanto tampoco a la rama de APNs — con las 4 APNS_*
+// bien puestas y el arranque diciendo "[APNs] iOS push inicializado". iOS es una
+// plataforma independiente de Android: no puede depender de que exista el
+// secreto de la otra. Por eso el service existe siempre y es cada bloque (FCM /
+// APNs) el que decide si sabe enviar.
 func InitPushService() {
+	Push = &PushService{client: &http.Client{Timeout: 10 * time.Second}}
+
 	raw := os.Getenv("FCM_SERVICE_ACCOUNT_JSON")
 	if raw == "" {
-		log.Printf("[Push] FCM_SERVICE_ACCOUNT_JSON not set — push disabled (no-op)")
+		log.Printf("[Push] FCM_SERVICE_ACCOUNT_JSON not set — Android push desactivado (iOS/APNs va por su cuenta)")
 		return
 	}
 	var sa fcmServiceAccount
@@ -81,12 +95,17 @@ func InitPushService() {
 	if sa.TokenURI == "" {
 		sa.TokenURI = "https://oauth2.googleapis.com/token"
 	}
-	Push = &PushService{
-		sa:         &sa,
-		privateKey: key,
-		client:     &http.Client{Timeout: 10 * time.Second},
-	}
+	Push.sa = &sa
+	Push.privateKey = key
 	log.Printf("[Push] FCM push initialized (project=%s)", sa.ProjectID)
+}
+
+// fcmReady indica si la parte de Android está utilizable. Ojo: `Push` puede ser
+// no-nil y esto devolver false — es justo el caso de "solo iOS configurado"
+// (ver InitPushService). Todo lo que toque p.sa o p.privateKey tiene que pasar
+// por aquí antes, o es un nil deref.
+func (p *PushService) fcmReady() bool {
+	return p != nil && p.sa != nil && p.privateKey != nil
 }
 
 // getAccessToken returns a cached (or freshly minted) OAuth token for FCM.
@@ -181,11 +200,21 @@ func (p *PushService) sendOne(ctx context.Context, accessToken, token, title, bo
 // NotifyVenueStaff sends a push to every active staff device of a venue.
 // Fire-and-forget: errors are logged, dead tokens are deactivated.
 func (p *PushService) NotifyVenueStaff(ctx context.Context, venueID, title, body, channelID string, data map[string]interface{}) {
+	// Ahora que Push existe siempre (ver InitPushService), hay que cortar aquí
+	// cuando NINGUNA plataforma está configurada — típico en local — o cada
+	// compra pagaría una consulta a Supabase para no enviar nada.
+	if !p.fcmReady() && !apnsEnabled() {
+		return
+	}
 	venueDB := DB.ForVenue(venueID)
 	if venueDB == nil {
 		log.Printf("[Push] NotifyVenueStaff: invalid venue %s", venueID)
 		return
 	}
+	// device_type es OBLIGATORIO en el select: es lo único que separa iOS de
+	// Android. Si se cae de aquí, GetString devuelve "" y TODOS los tokens se
+	// irían por FCM — que no sabe entregar a un device token de APNs, así que
+	// los iPhone dejarían de recibir sin ningún error visible.
 	rows, err := venueDB.QueryCtx(ctx, "staff_push_tokens", map[string]interface{}{
 		"select": "push_token,device_type",
 		"where":  map[string]interface{}{"is_active": true},
@@ -205,7 +234,13 @@ func (p *PushService) NotifyVenueStaff(ctx context.Context, venueID, title, body
 			continue
 		}
 		seen[t] = true
-		if GetString(r, "device_type") == "ios" {
+		// Comparación tolerante a mayúsculas y espacios: este valor lo escribe
+		// el cliente (MobileRegisterPushToken guarda literal lo que manda la
+		// app). Hoy llega "ios" en minúsculas — es Platform.OS de React Native —
+		// pero si alguna versión mandara "iOS", ese token se iría por FCM y el
+		// iPhone dejaría de recibir SIN ningún error visible. Un fallo mudo así
+		// cuesta más de encontrar que lo que cuesta aceptar las dos formas.
+		if strings.EqualFold(strings.TrimSpace(GetString(r, "device_type")), "ios") {
 			iosTokens = append(iosTokens, t)
 		} else {
 			fcmTokens = append(fcmTokens, t)
@@ -225,9 +260,15 @@ func (p *PushService) NotifyVenueStaff(ctx context.Context, venueID, title, body
 	sent := 0
 
 	// --- Android / FCM ---
+	// Simétrico al feature-flag de APNs de abajo: si falta
+	// FCM_SERVICE_ACCOUNT_JSON, los tokens Android se saltan con una línea de
+	// log y los iOS se envían igual. Sin este guard sería un nil deref sobre
+	// p.sa dentro de getAccessToken — y en pánico dentro de RunBackground se
+	// lleva por delante todo el proceso.
 	if len(fcmTokens) > 0 {
-		accessToken, err := p.getAccessToken(ctx)
-		if err != nil {
+		if !p.fcmReady() {
+			log.Printf("[Push] %d token(s) Android sin enviar: FCM no configurado (falta FCM_SERVICE_ACCOUNT_JSON)", len(fcmTokens))
+		} else if accessToken, err := p.getAccessToken(ctx); err != nil {
 			log.Printf("[Push] cannot get FCM access token: %v", err)
 		} else {
 			for _, token := range fcmTokens {
@@ -240,6 +281,12 @@ func (p *PushService) NotifyVenueStaff(ctx context.Context, venueID, title, body
 					sent++
 					continue
 				}
+				// OJO: aquí vive la misma trampa que en la rama de APNs — un 400
+				// de FCM (INVALID_ARGUMENT) puede ser configuración y no un
+				// token muerto. Se deja como estaba porque Android lleva meses
+				// funcionando así; si algún día se apagan varios Android a la
+				// vez, empieza mirando esto (FCM manda el detalle en el cuerpo,
+				// que tampoco se está leyendo).
 				if status == http.StatusNotFound || status == http.StatusBadRequest {
 					deactivate(token)
 				}
@@ -249,25 +296,69 @@ func (p *PushService) NotifyVenueStaff(ctx context.Context, venueID, title, body
 	}
 
 	// --- iOS / APNs (feature-flag: solo si APNS_* está configurado) ---
+	// Sin las APNS_* esto no falla ni rompe nada: los tokens iOS simplemente se
+	// saltan (una línea de log) y Android ya se ha enviado arriba.
 	if len(iosTokens) > 0 {
 		if !apnsEnabled() {
-			log.Printf("[Push] %d token(s) iOS sin enviar: APNs no configurado (faltan APNS_* secrets)", len(iosTokens))
+			log.Printf("[Push] %d token(s) iOS sin enviar: APNs no configurado (faltan APNS_KEY_P8/KEY_ID/TEAM_ID/BUNDLE_ID)", len(iosTokens))
 		} else {
+			// Los BadDeviceToken no se resuelven aquí dentro: se apuntan y se
+			// deciden al final del lote, cuando ya se sabe si algún envío iOS
+			// llegó. El porqué, justo debajo del bucle.
+			var suspect []string
+			iosOK := 0
 			for _, token := range iosTokens {
-				status, err := apns.send(ctx, token, title, body, data)
+				status, reason, err := apns.send(ctx, token, title, body, data)
 				if err != nil {
 					log.Printf("[APNs] send error: %v", err)
 					continue
 				}
 				if status == http.StatusOK {
 					sent++
+					iosOK++
 					continue
 				}
-				// 410 Unregistered / 400 BadDeviceToken → token muerto.
-				if status == http.StatusGone || status == http.StatusBadRequest {
+				// TRAMPA (ya pisada una vez): NO desactivar por el código HTTP.
+				// Apple usa el mismo 400 para "este token no vale"
+				// (BadDeviceToken) y para "tu configuración está mal"
+				// (TopicDisallowed, InvalidProviderToken...). Desactivando por
+				// el 400 a secas, un APNS_BUNDLE_ID equivocado apagaría de golpe
+				// TODOS los iPhone del staff y habría que volver a registrarlos
+				// uno a uno abriendo la app en cada teléfono.
+				//
+				// El 410 sí es inequívoco (Apple solo lo usa para Unregistered:
+				// la app se desinstaló), así que vale aunque el cuerpo no se
+				// haya podido leer.
+				if apnsTokenIsDead(reason) || status == http.StatusGone {
 					deactivate(token)
+					log.Printf("[APNs] token desactivado — app desinstalada (HTTP %d reason=%q)", status, reason)
+					continue
 				}
-				log.Printf("[APNs] returned HTTP %d for a token", status)
+				if apnsTokenMaybeDead(reason) {
+					suspect = append(suspect, token)
+					continue
+				}
+				log.Printf("[APNs] ATENCIÓN: HTTP %d reason=%q — parece configuración, NO se desactiva ningún token. Revisa APNS_BUNDLE_ID (debe ser el bundle del build), APNS_KEY_ID/APNS_TEAM_ID y APNS_SANDBOX (dev vs producción).", status, reason)
+			}
+
+			// BadDeviceToken es ambiguo (token corrupto vs. APNS_SANDBOX o
+			// apns-topic equivocados). Solo se poda si OTRO envío del mismo lote
+			// sí llegó: eso demuestra que clave, topic y entorno están bien y que
+			// el problema es de ese teléfono concreto. Sin esa prueba se deja el
+			// token activo — el coste de equivocarse no es simétrico: dejar vivo
+			// un token muerto cuesta una fila y una línea de log por
+			// notificación; matar uno vivo apaga los iPhone del staff hasta que
+			// cada uno vuelva a abrir la app (el registro los reactiva, ver
+			// MobileRegisterPushToken), y eso puede caer en mitad de un evento.
+			if len(suspect) > 0 {
+				if iosOK > 0 {
+					for _, token := range suspect {
+						deactivate(token)
+					}
+					log.Printf("[APNs] %d token(s) desactivados por BadDeviceToken (el resto del lote sí llegó, así que la configuración es correcta)", len(suspect))
+				} else {
+					log.Printf("[APNs] ATENCIÓN: %d/%d token(s) iOS con BadDeviceToken y NINGÚN envío correcto — huele a configuración, NO se desactiva nada. Revisa APNS_SANDBOX (dev vs producción: los tokens NO son intercambiables), APNS_BUNDLE_ID y APNS_KEY_ID/APNS_TEAM_ID.", len(suspect), len(iosTokens))
+				}
 			}
 		}
 	}

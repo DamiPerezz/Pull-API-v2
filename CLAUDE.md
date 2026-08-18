@@ -609,8 +609,21 @@ Léelo antes de tocar cualquier cosa. No reincidas en estos:
 
 - [~] **EventoNuevo** — backend verificado vía API (arreglado: columnas
       fantasma, crea como `published`). El wizard de UI queda pendiente de
-      probar en dispositivo (image picker nativo) y `POST
-      /upload/event-image` sigue siendo stub (URL placeholder Unsplash).
+      probar en dispositivo (image picker nativo).
+      **CORREGIDO (2026-08-18): `POST /upload/event-image` YA NO es stub** —
+      esa nota estaba obsoleta. Sube de verdad al bucket `event-images` del
+      venue vía `SupabaseClient.UploadPublicObject` y devuelve la URL
+      pública. La única URL de Unsplash que queda en el repo es el fallback
+      de `services/email.go` para eventos sin imagen, que es otra cosa.
+      Gemelo para el local: `POST /upload/venue-image`
+      (`MobileUploadVenueImage`, solo admin|manager, bucket `venue-images`
+      de la BD central, ruta con marca de tiempo).
+      ⚠️ **Comprobar por entorno**: ambos endpoints devuelven una URL
+      `/object/public/`, o sea que el bucket tiene que ser PÚBLICO. En prod
+      lo es (el logo de los correos sale de `venue-images`), pero el resto
+      del código lo trata como privado (`storage_controller.go` firma URLs).
+      Si en staging/demo el bucket existe y es privado, la subida contesta
+      200 y la foto se ve rota. Abre la URL devuelta la primera vez.
 - [x] **EventoEditar** — VERIFICADO desde UI (2026-07-09).
 - [x] **Borrar evento** — VERIFICADO vía API (soft delete + undelete).
 - [x] **TicketsGestion** — VERIFICADO: UI + CRUD completo (regular y

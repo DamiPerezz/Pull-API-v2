@@ -869,10 +869,17 @@ func LegacyCreatePendingOrder(c *gin.Context) {
 		}
 	}
 
-	// PRIVADO vs PÚBLICO. En un evento privado el cliente NO paga al solicitar:
-	// crea una SOLICITUD (awaiting_approval) que el staff aprueba o rechaza, y
-	// solo si la aprueban recibe el enlace de pago. (dLocal Go no puede retener
-	// dinero sin cobrarlo — ver DLOCAL-FLUJO-PRIVADO.md.)
+	// PRIVADO vs PÚBLICO. Con NeoNet vuelve la RETENCIÓN: en un evento privado el
+	// cliente SÍ mete la tarjeta al solicitar, pero NO se le cobra — se le retiene
+	// el importe y solo se captura si el staff aprueba. Por eso la orden nace
+	// `pending` igual que una pública: es PayOrder quien, al retener, la pasa a
+	// `payment_authorized` y arranca el plazo de 48h.
+	//
+	// (Del 3 al 18 de agosto de 2026 esto funcionó al revés: dLocal Go no sabe
+	// retener dinero sin cobrarlo, así que la orden privada nacía en
+	// `awaiting_approval` y se pagaba después con un enlace. Ese desvío se retira
+	// junto con dLocal. Los estados `awaiting_approval` y `approved_unpaid` NO se
+	// borran del código: hay órdenes históricas que deben poder leerse.)
 	needsApproval := false
 	if ev, _ := venueDB.QueryOne(ctx, "events", map[string]interface{}{
 		"select": "is_private,require_approval",
@@ -882,14 +889,12 @@ func LegacyCreatePendingOrder(c *gin.Context) {
 	}
 
 	paymentLinkCode, _ := generateRandomCode(16)
-	// Público: 30 min para pagar (carrito). Privado: 48h para que el staff
-	// decida — el sweeper de carritos abandonados NO toca awaiting_approval.
+	// 30 min para meter la tarjeta, tanto en público como en privado: aquí la
+	// orden todavía es un carrito sin pagar en los dos casos. El reloj de las 48h
+	// NO empieza aquí — empieza cuando el dinero queda retenido, y lo pone
+	// PayOrder al pasar la orden a `payment_authorized`.
 	orderStatus := "pending"
 	expiresAt := time.Now().Add(30 * time.Minute)
-	if needsApproval {
-		orderStatus = "awaiting_approval"
-		expiresAt = time.Now().Add(48 * time.Hour)
-	}
 
 	// Persist per-attendee details (incl. instagram) in the order metadata so
 	// ConfirmPayment can carry them through to the ticket rows.

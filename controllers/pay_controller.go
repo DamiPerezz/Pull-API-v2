@@ -201,18 +201,30 @@ func PayOrder(c *gin.Context) {
 		return
 	}
 
-	// Split: venue share vs Pull's service fee, from the venue's configured
-	// fee percent (venues.platform_fee_percent — 8% for 511 Events). The
-	// order total was created as subtotal * (1 + fee).
+	// UN SOLO COBRO (18-ago-2026). Antes se hacían DOS cargos a la misma tarjeta
+	// —uno por la entrada y otro por la comisión del 8%— y el comprador veía dos
+	// apuntes en su extracto. Ahora se cobra (o se retiene) el total de una vez.
+	//
+	// El 8% NO desaparece: lo sigue pagando el comprador, porque el total ya se
+	// creó como subtotal * (1 + fee). Lo que cambia es que deja de viajar en una
+	// transacción aparte — entra entero por la cuenta del venue y Pull liquida su
+	// parte por fuera. Aquí el porcentaje solo se calcula para DEJARLO ANOTADO en
+	// la orden, no para cobrarlo por separado.
+	//
+	// Además de simplificar el extracto, esto elimina la pieza más frágil que
+	// tenía este handler: el rollback de "si el segundo cargo falla, deshaz el
+	// primero", que en público exigía un reembolso (la venta ya estaba liquidada)
+	// y en privado una reversa.
 	feePercent := 0.0
 	if venue, err := services.DB.GetVenue(ctx, venueID); err == nil && venue.PlatformFeePercent > 0 {
 		feePercent = venue.PlatformFeePercent
 	}
-	venueShare := total
-	feeShare := 0.0
+	// Lo que se le pide a la tarjeta, sin partir.
+	chargeAmount := total
+	// Desglose contable, informativo: feeIncluded va DENTRO de chargeAmount.
+	feeIncluded := 0.0
 	if feePercent > 0 {
-		venueShare = round2(total / (1 + feePercent/100))
-		feeShare = round2(total - venueShare)
+		feeIncluded = round2(total - round2(total/(1+feePercent/100)))
 	}
 
 	processor, err := services.Payments.GetProcessor(ctx, venueID)
@@ -241,24 +253,11 @@ func PayOrder(c *gin.Context) {
 		return
 	}
 
-	// El FEE de Pull puede cobrarse por OTRA cuenta merchant (la de Pull) si
-	// PLATFORM_FEE_VENUE_ID está configurado; sin configurar, va por la del
-	// venue (modo una-cuenta, como el sandbox actual). Se guarda en el split
-	// para que capturas/reversas posteriores usen el MISMO carril.
-	feeCharger := charger
-	feeGatewayVenue := ""
-	if feeShare > 0 {
-		feeProc, plat, ferr := services.Payments.GetFeeProcessor(ctx, venueID)
-		if ferr != nil {
-			log.Printf("[PayOrder] ALERT: fee gateway (plataforma=%s) mal configurado: %v", plat, ferr)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Payment gateway not configured"})
-			return
-		}
-		if fc, isFc := feeProc.(services.DirectCardCharger); isFc {
-			feeCharger = fc
-			feeGatewayVenue = plat
-		}
-	}
+	// (Aquí vivía la resolución de la SEGUNDA cuenta merchant, la de Pull, para
+	// cobrar el fee aparte. Ya no hace falta: hay un único cobro por la cuenta del
+	// venue. Las capturas y reversas de órdenes ANTIGUAS que sí tienen dos
+	// transacciones siguen funcionando — `feeChargerForSplit` resuelve su cuenta
+	// leyendo `fee_gateway_venue` del propio split guardado en la orden.)
 
 	// Billing info: sensible Guatemala defaults when the form doesn't ask.
 	userName := services.GetString(order, "user_name")
@@ -310,10 +309,14 @@ func PayOrder(c *gin.Context) {
 		return
 	}
 
-	// --- Transacción 1: parte del venue ---
+	// --- Cobro único: el total, comisión incluida ---
+	// El sufijo "-VENUE" del código de referencia se MANTIENE a propósito aunque
+	// ya no haya un "-FEE" que lo acompañe: los carriles de captura y reversa
+	// construyen "-VENUE-CAP" y "-VENUE-REL" a partir de él, y así las órdenes
+	// nuevas y las viejas se leen igual en el Business Center.
 	charge1, err := charger.ChargeCard(ctx, services.ChargeParams{
 		ReferenceCode: orderNumber + "-VENUE",
-		Amount:        venueShare,
+		Amount:        chargeAmount,
 		Currency:      currency,
 		Card:          card,
 		BillTo:        billTo,
@@ -327,15 +330,15 @@ func PayOrder(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "No se pudo procesar el pago. Intenta de nuevo."})
 		return
 	}
-	// La parte del VENUE debe autorizarse ENTERA: una autorización parcial
-	// (prepago sin saldo, o el trigger SDISCOUNT del sandbox) dejaría al
-	// local cobrando de menos → se trata como rechazo y se libera lo retenido.
-	venuePartial := charge1.Success && charge1.AuthorizedAmount > 0 && charge1.AuthorizedAmount < venueShare-0.005
+	// El importe debe autorizarse ENTERO: una autorización parcial (prepago sin
+	// saldo, o el trigger SDISCOUNT del sandbox) dejaría al local cobrando de
+	// menos → se trata como rechazo y se libera lo retenido.
+	venuePartial := charge1.Success && charge1.AuthorizedAmount > 0 && charge1.AuthorizedAmount < chargeAmount-0.005
 	if !charge1.Success || venuePartial {
 		if charge1.TransactionID != "" {
 			rbCtx, rbCancel := context.WithTimeout(context.Background(), 25*time.Second)
 			defer rbCancel()
-			if revErr := charger.ReverseCharge(rbCtx, charge1.TransactionID, orderNumber+"-VENUE-PARB", venueShare, currency); revErr != nil {
+			if revErr := charger.ReverseCharge(rbCtx, charge1.TransactionID, orderNumber+"-VENUE-PARB", chargeAmount, currency); revErr != nil {
 				log.Printf("[PayOrder] ALERT: venue partial/declined reversal failed order=%s tx=%s: %v", orderNumber, charge1.TransactionID, revErr)
 			}
 		}
@@ -348,63 +351,17 @@ func PayOrder(c *gin.Context) {
 		return
 	}
 
-	// --- Transacción 2: fee de servicio de Pull ---
-	var charge2 *services.ChargeResult
-	if feeShare > 0 {
-		charge2, err = feeCharger.ChargeCard(ctx, services.ChargeParams{
-			ReferenceCode: orderNumber + "-FEE",
-			Amount:        feeShare,
-			Currency:      currency,
-			Card:          card,
-			BillTo:        billTo,
-			Capture:       capture,
-		})
-		if err != nil || !charge2.Success {
-			// Rollback: deshacer la 1ª tx con un contexto PROPIO (no el de la
-			// request, casi agotado tras 2 llamadas lentas al gateway) para no
-			// dejar el cargo sin deshacer. CLAVE: en público (capture=true) la
-			// 1ª venta YA está LIQUIDADA → hay que REEMBOLSAR (refund), no
-			// reversar (un auth-reversal no deshace una venta capturada → el
-			// comprador quedaría cobrado sin ticket). En privado (capture=false)
-			// es una autorización retenida → reverse.
-			rbCtx, rbCancel := context.WithTimeout(context.Background(), 25*time.Second)
-			defer rbCancel()
-			if undoErr := undoVenueCharge(rbCtx, charger, capture, charge1.TransactionID, orderNumber+"-VENUE-RB", venueShare, currency); undoErr != nil {
-				log.Printf("[PayOrder] ALERT: fee charge failed AND venue undo (capture=%v) failed order=%s tx=%s: %v — REEMBOLSAR MANUAL EN EBC",
-					capture, orderNumber, charge1.TransactionID, undoErr)
-			} else {
-				log.Printf("[PayOrder] fee charge failed, venue charge undone (capture=%v) order=%s", capture, orderNumber)
-			}
-			// Si el fee quedó en autorización PARCIAL, también retiene dinero:
-			// liberarlo igual.
-			if charge2 != nil && charge2.TransactionID != "" {
-				if revErr := feeCharger.ReverseCharge(rbCtx, charge2.TransactionID, orderNumber+"-FEE-PARB", feeShare, currency); revErr != nil {
-					log.Printf("[PayOrder] ALERT: fee partial-auth reversal failed order=%s tx=%s: %v", orderNumber, charge2.TransactionID, revErr)
-				}
-			}
-			recordDeclinedAttempt()
-			msg := "No se pudo completar el pago. No se ha realizado ningún cargo."
-			if charge2 != nil && charge2.ErrorMessage != "" {
-				msg = charge2.ErrorMessage
-			}
-			c.JSON(http.StatusPaymentRequired, gin.H{"error": msg, "declined": true})
-			return
-		}
-	}
-
+	// (Aquí iba la SEGUNDA transacción, la del fee, con su rollback: si el
+	// segundo cargo fallaba había que deshacer el primero, y además de forma
+	// distinta según el caso —en público la venta ya estaba liquidada y tocaba
+	// REEMBOLSAR, en privado bastaba con reversar la autorización—. Todo ese
+	// camino desaparece con el cobro único: un solo cargo no puede quedarse a
+	// medias. Es la mayor ganancia de este cambio, más que el extracto limpio.)
+	//
+	// Las órdenes ANTIGUAS que sí tienen dos transacciones se siguen capturando y
+	// reversando bien: sus carriles leen `fee_transaction` del split guardado y
+	// solo actúan si viene informado.
 	feeTxID := ""
-	if charge2 != nil {
-		feeTxID = charge2.TransactionID
-		// Fee con autorización PARCIAL: se acepta recortado — matar una venta
-		// entera por el fee de Pull es peor negocio. Se registra el importe
-		// REAL autorizado para que capturas y reversas posteriores usen esa
-		// cifra (capturar más de lo autorizado = settlement Failed en el EBC).
-		if charge2.AuthorizedAmount > 0 && charge2.AuthorizedAmount < feeShare-0.005 {
-			log.Printf("[PayOrder] fee PARTIAL order=%s pedido=%.2f autorizado=%.2f — se captura lo autorizado",
-				orderNumber, feeShare, charge2.AuthorizedAmount)
-			feeShare = round2(charge2.AuthorizedAmount)
-		}
-	}
 
 	// La pasarela sale del PROCESADOR real, nunca escrita a mano: con dLocal
 	// conviviendo con NeoNet, un literal "neonet" etiquetaría mal los cobros y
@@ -412,16 +369,30 @@ func PayOrder(c *gin.Context) {
 	// equivocada.
 	gatewayName := processor.GetGateway().String()
 
-	// Persistir el desglose de las dos transacciones en la orden.
+	// Persistir el desglose en la orden. La clave sigue llamándose
+	// `payment_split` aunque ya no haya reparto: la leen las capturas, las
+	// reversas y los informes, y renombrarla dejaría ilegibles las órdenes
+	// anteriores a agosto de 2026. Los NOMBRES se mantienen; lo que cambia es
+	// que ahora hay una sola transacción.
+	//
+	// OJO al significado de cada importe, que es lo que hace que órdenes viejas y
+	// nuevas convivan sin tocar los carriles de captura/reversa:
+	//   venue_amount = lo que la pasarela tiene retenido o cobrado. Es la cifra
+	//                  que se captura y se reversa, así que ahora es el TOTAL.
+	//   fee_amount   = lo que se cobró en una transacción APARTE. Ahora es 0, y
+	//                  por eso los carriles no intentan capturar ningún fee.
+	//   fee_included = el 8% que va DENTRO de venue_amount. Es contable: sirve
+	//                  para liquidarle a Pull su parte. No se cobra por separado.
 	metadata := orderMeta
 	metadata["payment_split"] = map[string]interface{}{
-		"venue_amount":      venueShare,
-		"fee_amount":        feeShare,
+		"venue_amount":      chargeAmount,
+		"fee_amount":        0.0,
+		"fee_included":      feeIncluded,
 		"fee_percent":       feePercent,
 		"venue_transaction": charge1.TransactionID,
-		"fee_transaction":   feeTxID,
+		"fee_transaction":   feeTxID, // siempre "" desde el cobro único
 		"gateway":           gatewayName,
-		"fee_gateway_venue": feeGatewayVenue, // "" = cuenta del venue; id = cuenta de Pull
+		"fee_gateway_venue": "", // una sola cuenta: la del venue
 		"captured":          capture, // false = funds held, awaiting approval
 	}
 
@@ -447,19 +418,14 @@ func PayOrder(c *gin.Context) {
 				orderNumber, charge1.TransactionID, feeTxID, err)
 			rbCtx, rbCancel := context.WithTimeout(context.Background(), 25*time.Second)
 			defer rbCancel()
-			if revErr := charger.ReverseCharge(rbCtx, charge1.TransactionID, orderNumber+"-VENUE-RB", venueShare, currency); revErr != nil {
+			if revErr := charger.ReverseCharge(rbCtx, charge1.TransactionID, orderNumber+"-VENUE-RB", chargeAmount, currency); revErr != nil {
 				log.Printf("[PayOrder] ALERT: hold reversal ALSO failed order=%s tx=%s: %v", orderNumber, charge1.TransactionID, revErr)
-			}
-			if feeTxID != "" {
-				if revErr := feeCharger.ReverseCharge(rbCtx, feeTxID, orderNumber+"-FEE-RB", feeShare, currency); revErr != nil {
-					log.Printf("[PayOrder] ALERT: fee hold reversal ALSO failed order=%s tx=%s: %v", orderNumber, feeTxID, revErr)
-				}
 			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "No se pudo registrar el pago. No se ha realizado ningún cargo — intenta de nuevo."})
 			return
 		}
-		log.Printf("[PayOrder] HELD (awaiting approval) order=%s venue=%.2f fee=%.2f %s deadline=%s",
-			orderNumber, venueShare, feeShare, currency, deadline.Format(time.RFC3339))
+		log.Printf("[PayOrder] RETENIDO (pendiente de aprobación) order=%s total=%.2f (fee incluido %.2f) %s deadline=%s",
+			orderNumber, chargeAmount, feeIncluded, currency, deadline.Format(time.RFC3339))
 
 		// Notify staff (push) + email the buyer the "pending approval" notice
 		// (NO ticket/QR yet — that only goes out on approval).
@@ -524,7 +490,7 @@ func PayOrder(c *gin.Context) {
 		}
 	}
 
-	log.Printf("[PayOrder] both charges OK order=%s venue=%.2f fee=%.2f %s", orderNumber, venueShare, feeShare, currency)
+	log.Printf("[PayOrder] COBRADO order=%s total=%.2f (fee incluido %.2f) %s", orderNumber, chargeAmount, feeIncluded, currency)
 
 	// Delegar al carril compartido: emite tickets, email y push.
 	q := c.Request.URL.Query()

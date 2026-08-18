@@ -651,6 +651,10 @@ func setupMobileRoutes(v1 *gin.RouterGroup) {
 
 		// Upload (event image)
 		authed.POST("/upload/event-image", controllers.MobileUploadEventImage)
+		// Imagen/logo del venue. Ruta nueva: no choca con /upload/event-image
+		// ni con las de /secure-admin/venues/:id/images (otro grupo, otra auth).
+		// El handler filtra por rol admin|manager, igual que PUT /venue/update.
+		authed.POST("/upload/venue-image", controllers.MobileUploadVenueImage)
 
 		// Orders extras
 		authed.GET("/orders/search/:venueId", controllers.MobileOrdersSearch)

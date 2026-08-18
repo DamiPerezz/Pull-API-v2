@@ -26,8 +26,19 @@ Priority-ordered. First bug that surfaces is likely to be in the top block.
       (2026-07-09) after HANDOFF fix #15 (the endpoint had never worked:
       phantom columns). Creates as `published` now. UI wizard still not
       driven end-to-end: the required image picker opens a native file
-      dialog (untestable from web preview) and `POST /upload/event-image`
-      is still a stub returning a placeholder Unsplash URL.
+      dialog (untestable from web preview).
+      **CORRECTED (2026-08-18): `POST /upload/event-image` is NOT a stub** —
+      that note was stale. It really uploads to the venue's `event-images`
+      bucket via `SupabaseClient.UploadPublicObject` and returns the public
+      URL. The only Unsplash URL left in the repo is the no-image fallback
+      in `services/email.go`, which is unrelated.
+      Twin endpoint for the venue photo: `POST /upload/venue-image`
+      (`MobileUploadVenueImage`, admin|manager only, central `venue-images`
+      bucket). ⚠️ Both hand back an `/object/public/` URL, so the bucket must
+      be PUBLIC in that environment — prod is (the email logo lives there),
+      but `storage_controller.go` treats the same bucket as private and signs
+      URLs. If staging/demo has it private the upload still answers 200 and
+      the photo renders broken: open the returned URL once per environment.
 - [x] **EventoEditar (editar evento)** — VERIFIED from UI (2026-07-09) on a
       throwaway event: name/description/dress_code persisted via
       `PUT /event/update-event/:eventId`. Needed HANDOFF fixes #15-16
