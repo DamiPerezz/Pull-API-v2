@@ -924,26 +924,22 @@ func LegacyCreatePendingOrder(c *gin.Context) {
 		return
 	}
 
-	// SOLICITUD a evento privado: avisar al cliente (sin cobro, sin QR) y al
-	// staff, que es quien decide. El QR solo se emite cuando pague tras la
-	// aprobación. Fire-and-forget acotado por la cola de tareas.
-	if needsApproval {
-		orderForEmail := order
-		services.RunBackground("private-request-notify", func(bgCtx context.Context) error {
-			if services.Push != nil {
-				services.Push.NotifyVenueStaff(bgCtx, venueID, "Nueva solicitud de entrada",
-					req.UserName+" solicita entrada — pendiente de aprobar",
-					"reservations", map[string]interface{}{
-						"type":     "order_pending_approval",
-						"order_id": services.GetString(orderForEmail, "id"),
-					})
-			}
-			if services.Email != nil {
-				sendApprovalStatusEmail(bgCtx, venueID, orderForEmail, total, "GTQ", "pending", false)
-			}
-			return nil
-		})
-	}
+	// AQUÍ NO SE AVISA A NADIE, y es a propósito.
+	//
+	// Con el desvío de dLocal esta era la notificación buena: la orden nacía
+	// como solicitud ya decidible, porque no había pago de por medio. Con la
+	// retención ya no: aquí la orden acaba de nacer `pending` y el comprador
+	// todavía no ha metido la tarjeta. Avisar en este punto mandaba al staff a
+	// una lista vacía, y además duplicaba el aviso — porque PayOrder vuelve a
+	// notificar (esta vez sí) cuando la retención se ha hecho de verdad.
+	//
+	// El aviso al staff y el correo de "solicitud recibida" viven en
+	// pay_controller.go, en la rama `needsApproval`, justo después de que el
+	// dinero quede retenido. Ese es el primer instante en que hay algo que
+	// decidir y en que la retención existe.
+	//
+	// Si el comprador abandona antes de pagar, no se avisa a nadie: correcto,
+	// no hay nada que aprobar y la orden caduca sola en 30 minutos.
 
 	c.JSON(http.StatusCreated, gin.H{
 		"success":           true,
