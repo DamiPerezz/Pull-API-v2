@@ -580,6 +580,39 @@ func MobileValidateTicket(c *gin.Context) {
 	}
 	log.Printf("[Scan] OK venue=%s ticket=%s owner=%q worker=%s", venueID, ticketID, services.GetString(ticket, "owner_name"), req.WorkerID)
 
+	// LA ORDEN PASA A "DENTRO" cuando han entrado TODAS sus personas.
+	//
+	// El escaneo marca la ENTRADA (tickets.checked_in_at), pero la app filtra
+	// por el estado de la ORDEN. El filtro "Dentro (escaneadas)" existía desde
+	// siempre y NUNCA devolvía nada, porque ninguna orden llegaba a ese estado:
+	// hoy hay 28 entradas escaneadas en staging y 0 órdenes en `checked_in`.
+	//
+	// Se marca solo cuando están todas, no en el primer escaneo: en una compra
+	// de 4 entradas, decir que la orden está "dentro" con una sola persona
+	// dentro le mentiría al portero, que es justo quien mira esa lista.
+	//
+	// Fire-and-forget: si esto falla, el acceso YA está concedido y el ticket
+	// marcado. Lo único que se pierde es el rollup del filtro, y nunca vale
+	// dejar a alguien en la puerta por un contador.
+	if orderID := services.GetString(ticket, "order_id"); orderID != "" {
+		services.RunBackground("scan-order-rollup", func(bgCtx context.Context) error {
+			total, err1 := venueDB.CountCtx(bgCtx, "tickets", map[string]interface{}{"order_id": orderID})
+			dentro, err2 := venueDB.CountCtx(bgCtx, "tickets", map[string]interface{}{
+				"order_id": orderID, "checked_in_at": "not.is.null",
+			})
+			if err1 != nil || err2 != nil || total == 0 || dentro < total {
+				return nil
+			}
+			// Condicional sobre `confirmed`: no reabrimos ni pisamos una orden
+			// cancelada, reembolsada o ya marcada.
+			venueDB.UpdateNoReturn(bgCtx, "orders",
+				map[string]interface{}{"status": "checked_in"},
+				map[string]interface{}{"id": orderID, "status": "confirmed"})
+			log.Printf("[Scan] orden %s completa (%d/%d dentro) → checked_in", orderID, dentro, total)
+			return nil
+		})
+	}
+
 	// Enrich event info for the staff UI.
 	var event map[string]interface{}
 	if eid := services.GetString(ticket, "event_id"); eid != "" {
@@ -623,6 +656,21 @@ func MobileGetVenueOrders(c *gin.Context) {
 	where := map[string]interface{}{}
 	if status := c.Query("status"); status != "" && status != "All" {
 		where["status"] = status
+	}
+	// FILTRAR POR EVENTO. Con varios eventos abiertos a la vez, la lista de
+	// reservas los mezcla todos y en la puerta eso es inservible: el portero
+	// necesita ver SOLO el de esta noche.
+	//
+	// Va por el mismo guard que el resto de ids: este valor termina en un
+	// where-clause de PostgREST, y sin validar un `not.is.null` se leería como
+	// operador y devolvería órdenes de cualquier evento — el mismo agujero que
+	// hubo que cerrar en /orders/details.
+	if eventID := c.Query("event_id"); eventID != "" && eventID != "All" {
+		if !safeLookupCode(eventID) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "event_id inválido"})
+			return
+		}
+		where["event_id"] = eventID
 	}
 	limit := 20
 	if l := c.Query("limit"); l != "" {
