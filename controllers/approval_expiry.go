@@ -454,9 +454,14 @@ func expireOverdueAuthorizations() {
 		if venueDB == nil {
 			continue
 		}
+		// `ticket_type_id` y `quantity` son OBLIGATORIAS aunque este barrido no
+		// las mire directamente: sin ellas releaseOrderCapacity se sale por su
+		// guard y la plaza no vuelve nunca al aforo. Faltaban, y por eso cada
+		// caducidad a 48h se comía una plaza en silencio.
 		orders, err := venueDB.QueryCtx(ctx, "orders", map[string]interface{}{
-			"select": "id,order_number,event_id,currency,total,user_name,user_email,metadata",
-			"where":  map[string]interface{}{"status": "payment_authorized"},
+			"select": "id,order_number,event_id,currency,total,user_name,user_email,metadata," +
+				"ticket_type_id,quantity",
+			"where": map[string]interface{}{"status": "payment_authorized"},
 		})
 		if err != nil {
 			continue
@@ -478,13 +483,21 @@ func expireOverdueAuthorizations() {
 			if !claimHeldOrder(ctx, venueDB, orderID) {
 				continue
 			}
-			// Release the held authorizations (venue + fee).
+			// Liberar la retención en la pasarela (el dinero vuelve al cliente).
 			_, released := reverseHeldOrder(ctx, venueID, order)
 			venueDB.UpdateNoReturn(ctx, "orders", map[string]interface{}{
 				"status":              "expired",
 				"cancelled_at":        now.Format(time.RFC3339),
 				"cancellation_reason": "Autoexpirada: sin decisión del staff en 48h",
 			}, map[string]interface{}{"id": orderID})
+
+			// Y devolver la PLAZA al aforo, que es cosa distinta de liberar el
+			// dinero: lo primero se lo devuelve al comprador, esto se lo
+			// devuelve al local para que pueda revenderla. Sin esto, cada
+			// solicitud que caduca sin respuesta reduce el aforo real de forma
+			// permanente y la sala se "agota" a medias.
+			releaseOrderCapacity(ctx, venueDB, order)
+
 			log.Printf("[ApprovalExpiry] expired order=%s venue=%s released=%v",
 				services.GetString(order, "order_number"), venueID, released)
 

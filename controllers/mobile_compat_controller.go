@@ -760,8 +760,26 @@ func MobileApproveOrder(c *gin.Context) {
 	// tickets via the shared confirmation rail.
 	if sid, outcome := captureHeldOrder(ctx, venueID, current); outcome != notHeld {
 		if outcome == captureFailed {
-			// The gateway refused the capture (e.g. auth expired issuer-side).
-			// Leave the order as-is so staff can retry or reject.
+			// La pasarela rechazó la captura (típico: la autorización caducó en
+			// el emisor cerca de las 48h).
+			//
+			// HAY QUE DESHACER EL CLAIM. Unas líneas más arriba la orden pasó
+			// de `payment_authorized` a `processing` para que ni una aprobación
+			// simultánea ni el barrido la tocasen. Si nos vamos ahora sin
+			// devolverla, se queda en `processing` PARA SIEMPRE: desaparece de
+			// la lista del staff (que filtra por payment_authorized) y el
+			// barrido de 48h tampoco la mira, así que la retención del cliente
+			// no se libera nunca. Q297 retenidos, sin entrada y sin nadie que
+			// pueda actuar.
+			//
+			// El UPDATE es CONDICIONAL: solo devuelve a payment_authorized lo
+			// que siga en `processing`. Si otro proceso ya la movió, no se pisa.
+			if _, rErr := venueDB.UpdateCtx(ctx, "orders",
+				map[string]interface{}{"status": "payment_authorized"},
+				map[string]interface{}{"id": orderID, "status": "processing"}); rErr != nil {
+				log.Printf("[Mobile/ApproveOrder] ALERT: captura fallida Y no se pudo devolver la orden a payment_authorized order=%s: %v — queda en processing, resolver a mano",
+					orderID, rErr)
+			}
 			c.JSON(http.StatusBadGateway, gin.H{
 				"error": "No se pudo cobrar el pago retenido. La autorización pudo expirar; intenta de nuevo o rechaza la solicitud.",
 			})
@@ -851,9 +869,31 @@ func MobileRejectOrder(c *gin.Context) {
 	// the buyer is NOT charged (both the ticket and our fee are freed), and
 	// email them that the request was declined and the hold released.
 	orderID := c.Param("orderId")
-	if held, _ := venueDB.QueryOne(ctx, "orders", map[string]interface{}{
+	// `held` se declara FUERA del if porque al final hace falta para devolver
+	// el aforo (ver el bloque tras el UPDATE).
+	held, _ := venueDB.QueryOne(ctx, "orders", map[string]interface{}{
 		"select": "id,order_number,event_id,status,currency,total,user_name,user_email,metadata,ticket_type_id,quantity", "where": map[string]interface{}{"id": orderID},
-	}); held != nil {
+	})
+	if held != nil {
+		// GUARD: una orden YA COBRADA no se puede "rechazar".
+		//
+		// Escenario real: dos móviles con la misma solicitud abierta. El
+		// primero aprueba y se cobra; el segundo, con su pantalla vieja, pulsa
+		// Rechazar. Sin este guard la orden acababa en `cancelled` CON EL
+		// DINERO COBRADO, sin reembolso y sin avisar al cliente — y la
+		// recaudación del panel se quedaba corta en ese importe.
+		//
+		// `reverseHeldOrder` no salva: se retira en silencio si ya está
+		// capturado, y el UPDATE de abajo era incondicional. Su gemelo
+		// MobileApproveOrder sí tenía el guard simétrico; a este le faltaba.
+		if st := services.GetString(held, "status"); st == "confirmed" || st == "checked_in" || st == "refunded" {
+			c.JSON(http.StatusConflict, gin.H{
+				"error":  "Esta solicitud ya está cobrada y no se puede rechazar. Si hay que devolver el dinero, hazlo como reembolso.",
+				"status": st,
+			})
+			return
+		}
+
 		// FLUJO PRIVADO dLOCAL GO: una SOLICITUD sin pago no tiene nada que
 		// reversar — se cancela y se LIBERA el aforo que tenía reservado.
 		if services.GetString(held, "status") == "awaiting_approval" {
@@ -897,6 +937,22 @@ func MobileRejectOrder(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to reject"})
 		return
 	}
+
+	// DEVOLVER LA PLAZA AL AFORO. Sin esto, cada rechazo se comía una plaza
+	// para siempre y la web acabaría diciendo "agotado" con la sala a medias.
+	//
+	// En un evento privado rechazar NO es la excepción, es el uso normal, así
+	// que el error se acumula rápido. El camino de las solicitudes sin pago
+	// (rejectAwaitingOrder) siempre liberó; este, el de la retención, nunca lo
+	// hizo — no mordía mientras los rechazos iban por el otro carril.
+	//
+	// Se hace DESPUÉS del UPDATE y solo si la orden se canceló de verdad: si
+	// se liberase antes y el UPDATE fallara, la plaza volvería al aforo con la
+	// orden todavía viva, y se vendería dos veces.
+	if held != nil {
+		releaseOrderCapacity(ctx, venueDB, held)
+	}
+
 	c.JSON(http.StatusOK, gin.H{"success": true, "order": result[0]})
 }
 

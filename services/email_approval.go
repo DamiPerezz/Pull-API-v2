@@ -160,7 +160,20 @@ func approvalPaymentExpiredHeading() string {
 
 // noChargeNote is the reassurance line shared by every negative email: in this
 // flow the customer never handed over card details.
-const noChargeNote = `Nunca te pedimos los datos de tu tarjeta, así que no hay nada que devolver.`
+// noChargeNote acompaña a los correos negativos (rechazo y caducidad). Tiene
+// que explicar la RETENCIÓN, porque el comprador la ha visto en su banco y lo
+// que le preocupa es cuándo recupera el dinero.
+//
+// Decía "nunca te pedimos los datos de tu tarjeta, así que no hay nada que
+// devolver" — cierto con dLocal, donde se solicitaba sin pagar. Con NeoNet es
+// falso y además alarmante: se lo mandábamos a alguien que sí metió su tarjeta
+// y sí tiene un importe apartado.
+//
+// El aviso de los días es importante: la retención desaparece de nuestro lado
+// al instante, pero el banco tarda en devolverla al saldo disponible. Sin
+// decirlo, el cliente cree que le hemos cobrado igual y llama al local.
+const noChargeNote = `Hemos liberado la retención de tu tarjeta: no se te ha cobrado nada. ` +
+	`Según tu banco, el importe puede tardar unos días en volver a tu saldo disponible.`
 
 // BuildApprovalPendingEmail renders the "request received, nothing charged"
 // email HTML. Exported so preview tooling can render it without sending.
@@ -168,23 +181,35 @@ func BuildApprovalPendingEmail(d ApprovalEmailData) string {
 	esc := html.EscapeString
 	decision := approvalHoursPhrase(defaultApprovalDecisionHours, defaultApprovalDecisionHours)
 
+	// OJO AL TEXTO: describe una RETENCIÓN, no un cobro y no una solicitud sin
+	// pago. Es la diferencia entre que el comprador entienda su extracto o que
+	// llame al local pensando que le han cobrado dos veces.
+	//
+	// Hasta el 18-ago-2026 este correo decía "no te hemos pedido ningún dato de
+	// pago" y prometía un enlace para pagar después. Eso era cierto con dLocal,
+	// que no sabe retener. Con NeoNet el comprador SÍ mete la tarjeta al
+	// solicitar y el importe SÍ queda retenido — decirle lo contrario mientras
+	// ve el importe apartado en su banco es la peor combinación posible.
 	body := emailGreeting("Hola ", esc(d.CustomerName)) +
 		emailParagraph(fmt.Sprintf(
 			`Hemos recibido tu solicitud para <strong style="color:#ffffff;">%s</strong>. Es un evento privado, así que el equipo de %s tiene que darle el visto bueno antes de nada.`,
 			esc(d.EventName), esc(d.VenueName))) +
-		approvalAmountCard(emailAccentAmber, "TOTAL SI TE APRUEBAN", d.Total, d.Currency,
-			`Todavía <strong style="color:#ffffff;">no se te ha cobrado nada</strong>.`) +
+		approvalAmountCard(emailAccentAmber, "IMPORTE RETENIDO", d.Total, d.Currency,
+			`Este importe está <strong style="color:#ffffff;">retenido en tu tarjeta, no cobrado</strong>. `+
+				`Puede que lo veas apartado o "pendiente" en tu banco: es normal.`) +
 		approvalHero(d) +
 		approvalDetailsCard(emailAccentAmber, d) +
 		emailInfoCard(
 			emailCardLabel("Cómo sigue")+
 				approvalSteps(
 					fmt.Sprintf(`El equipo de %s revisa tu solicitud.`, esc(d.VenueName)),
-					`Si la aceptan, te mandamos un correo con un <strong style="color:#ffffff;">enlace para pagar</strong>.`,
-					`En cuanto pagues, recibes tus entradas con el código QR.`,
+					`Si la aceptan, se cobra el importe retenido y <strong style="color:#ffffff;">recibes tus entradas con el código QR</strong>. No tienes que hacer nada más.`,
+					`Si la rechazan, <strong style="color:#ffffff;">liberamos la retención</strong> y no se te cobra nada.`,
 				)) +
 		emailFineprint(fmt.Sprintf(
-			`No te hemos pedido ningún dato de pago y no se te cobrará nada por enviar esta solicitud. Si en <strong style="color:#ffffff;">%s</strong> no hay respuesta, la solicitud caduca sola y te avisamos.`,
+			`Una retención no es un cobro: el dinero sigue siendo tuyo, solo queda apartado mientras se decide. `+
+				`Si en <strong style="color:#ffffff;">%s</strong> no hay respuesta, la solicitud caduca sola, liberamos la retención y te avisamos. `+
+				`Al liberarse, tu banco puede tardar unos días en devolverlo a tu saldo disponible.`,
 			decision))
 
 	return renderEmailShell(emailShellData{
