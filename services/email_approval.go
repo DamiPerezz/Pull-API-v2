@@ -172,8 +172,9 @@ func approvalPaymentExpiredHeading() string {
 // El aviso de los días es importante: la retención desaparece de nuestro lado
 // al instante, pero el banco tarda en devolverla al saldo disponible. Sin
 // decirlo, el cliente cree que le hemos cobrado igual y llama al local.
-const noChargeNote = `Hemos liberado la retención de tu tarjeta: no se te ha cobrado nada. ` +
-	`Según tu banco, el importe puede tardar unos días en volver a tu saldo disponible.`
+const noChargeNote = `Hemos hecho la reversión del cargo de tu tarjeta. ` +
+	`Puede tardar <strong style="color:#ffffff;">varios días hábiles</strong> en reflejarse en tu banco, ` +
+	`según tu entidad: es lo normal en reversiones de tarjeta.`
 
 // BuildApprovalPendingEmail renders the "request received, nothing charged"
 // email HTML. Exported so preview tooling can render it without sending.
@@ -194,23 +195,22 @@ func BuildApprovalPendingEmail(d ApprovalEmailData) string {
 		emailParagraph(fmt.Sprintf(
 			`Hemos recibido tu solicitud para <strong style="color:#ffffff;">%s</strong>. Es un evento privado, así que el equipo de %s tiene que darle el visto bueno antes de nada.`,
 			esc(d.EventName), esc(d.VenueName))) +
-		approvalAmountCard(emailAccentAmber, "IMPORTE RETENIDO", d.Total, d.Currency,
-			`Este importe está <strong style="color:#ffffff;">retenido en tu tarjeta, no cobrado</strong>. `+
-				`Puede que lo veas apartado o "pendiente" en tu banco: es normal.`) +
+		approvalAmountCard(emailAccentAmber, "IMPORTE AUTORIZADO", d.Total, d.Currency,
+			`Tu banco ha autorizado este cargo. Es posible que <strong style="color:#ffffff;">aparezca `+
+				`en tu app o estado de cuenta como un consumo normal</strong> (no como "pendiente"): `+
+				`es lo esperado, no es un error.`) +
 		approvalHero(d) +
 		approvalDetailsCard(emailAccentAmber, d) +
 		emailInfoCard(
 			emailCardLabel("Cómo sigue")+
 				approvalSteps(
-					fmt.Sprintf(`El equipo de %s revisa tu solicitud.`, esc(d.VenueName)),
-					`Si la aceptan, se cobra el importe retenido y <strong style="color:#ffffff;">recibes tus entradas con el código QR</strong>. No tienes que hacer nada más.`,
-					`Si la rechazan, <strong style="color:#ffffff;">liberamos la retención</strong> y no se te cobra nada.`,
+					fmt.Sprintf(`El equipo de %s revisa tu solicitud (hasta %s).`, esc(d.VenueName), decision),
+					`Si te aceptan, el cargo queda confirmado y <strong style="color:#ffffff;">recibes tus entradas con el código QR</strong> por correo. No tienes que hacer nada más.`,
+					`Si te rechazan, o pasan las 48 h sin respuesta, <strong style="color:#ffffff;">se hace una reversión del cargo</strong>.`,
 				)) +
-		emailFineprint(fmt.Sprintf(
-			`Una retención no es un cobro: el dinero sigue siendo tuyo, solo queda apartado mientras se decide. `+
-				`Si en <strong style="color:#ffffff;">%s</strong> no hay respuesta, la solicitud caduca sola, liberamos la retención y te avisamos. `+
-				`Al liberarse, tu banco puede tardar unos días en devolverlo a tu saldo disponible.`,
-			decision))
+		emailFineprint(
+			`Una reversión puede tardar <strong style="color:#ffffff;">varios días hábiles</strong> en reflejarse en tu banco, ` +
+				`según tu entidad: es lo normal en reversiones de tarjeta. Te avisaremos por correo en cada paso.`)
 
 	return renderEmailShell(emailShellData{
 		HTMLTitle:  "Solicitud recibida - Pull",

@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"pull-api-v2/services"
 	"sync"
@@ -234,18 +235,37 @@ func GetTicketApplePass(c *gin.Context) {
 	if ln := services.GetString(ticket, "owner_last_name"); ln != "" {
 		owner += " " + ln
 	}
+	// COLUMNAS REALES. Aquí se pedían `event_date`, `start_time` y
+	// `custom_location`, y NINGUNA de las tres existe en la tabla `events`:
+	// las dos primeras las DERIVA EnrichEvent a partir de `start_datetime`, y
+	// la tercera nunca existió (la columna real es `location`).
+	//
+	// El resultado era un pase de Wallet en blanco, sin evento, sin fecha y
+	// sin lugar: PostgREST devolvía 42703, el error se descartaba con `_`, y
+	// `ev` quedaba nil, así que los cuatro campos se iban vacíos al pase sin
+	// que nada fallara de forma visible. El QR sí funcionaba, y por eso podía
+	// pasar mucho tiempo sin que nadie lo notara.
+	//
+	// Este es el mismo patrón que ya usa LegacyGetOrderDetails: seleccionar
+	// start_datetime y dejar que EnrichEvent haga el resto.
 	var eventName, eventDate, eventTime, venueName string
 	if eventID := services.GetString(ticket, "event_id"); eventID != "" {
-		if ev, _ := venueDB.QueryOne(ctx, "events", map[string]interface{}{
-			"select": "name,event_date,start_time,custom_location,location",
+		ev, evErr := venueDB.QueryOne(ctx, "events", map[string]interface{}{
+			"select": "id,name,start_datetime,end_datetime,location",
 			"where":  map[string]interface{}{"id": eventID},
-		}); ev != nil {
+		})
+		if evErr != nil {
+			// Que se vea. Un pase en blanco es un fallo silencioso muy caro:
+			// el cliente lo guarda en su móvil y solo se descubre en la puerta.
+			log.Printf("[ApplePass] ALERT no se pudo leer el evento %s del ticket %s: %v — el pase saldría sin datos",
+				eventID, services.GetString(ticket, "id"), evErr)
+		}
+		if ev != nil {
+			services.EnrichEvent(ev)
 			eventName = services.GetString(ev, "name")
 			eventDate = services.GetString(ev, "event_date")
 			eventTime = services.GetString(ev, "start_time")
-			if venueName = services.GetString(ev, "custom_location"); venueName == "" {
-				venueName = services.GetString(ev, "location")
-			}
+			venueName = services.GetString(ev, "location")
 		}
 	}
 	pkpass, err := services.BuildPass(services.ApplePassData{
