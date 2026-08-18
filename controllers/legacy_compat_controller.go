@@ -775,9 +775,26 @@ func LegacyCreatePendingOrder(c *gin.Context) {
 		return
 	}
 
+	// El `event_id` del WHERE es OBLIGATORIO, no un adorno.
+	//
+	// Sin él, el tipo de entrada se buscaba SOLO por id: bastaba mandar el
+	// event_id de un evento caro y el ticket_type_id de otro barato para
+	// comprar la entrada del primero al precio del segundo — y el aforo se
+	// descontaba del tipo prestado, así que se podía comprar incluso para un
+	// evento AGOTADO. Reproducido de punta a punta en staging el 18-ago-2026:
+	// entrada emitida y cobrada de un evento agotado, al precio de otro.
+	//
+	// El handler v2 (order_controller.go, "Validate event matches") siempre lo
+	// comprobó; este, que es el que usa la web, no. Se cierra en el propio
+	// WHERE en vez de con una comprobación posterior: así no hay forma de
+	// olvidarse de mirarla.
 	ticketType, _ := venueDB.QueryOne(ctx, "ticket_types", map[string]interface{}{
 		"select": services.TicketTypeSelectColumns,
-		"where":  map[string]interface{}{"id": req.TicketTypeID, "is_active": true},
+		"where": map[string]interface{}{
+			"id":        req.TicketTypeID,
+			"event_id":  eventID,
+			"is_active": true,
+		},
 	})
 	if ticketType == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Ticket type not found"})
@@ -1948,6 +1965,25 @@ func LegacyGetOrderDetails(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 	orderID := c.Param("orderId")
+
+	// GUARD OBLIGATORIO: esta ruta es PÚBLICA (la consulta el comprador para
+	// ver si su pago ya cuajó, sin haber iniciado sesión) y el id va directo a
+	// un where-clause de PostgREST.
+	//
+	// Sin este guard, `not.is.null` no se interpretaba como un id sino como un
+	// OPERADOR, y devolvía "la primera orden que no sea nula" — o sea, una
+	// orden ajena. Encadenando `not.in.(id1,id2,…)` se recorría la tabla
+	// entera. Verificado explotable el 18-ago-2026 en staging Y en producción:
+	// devolvía la fila completa, con el correo del comprador y el
+	// `payment_link_code` que permite pagar esa orden con otra tarjeta.
+	//
+	// El propio fichero ya documentaba esta trampa y aplicaba el guard en OTRO
+	// handler (línea ~687). A este se le olvidó.
+	if !safeLookupCode(orderID) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid order id"})
+		return
+	}
+
 	venueIDQuery := c.Query("venue_id")
 	venueID := venueIDQuery
 	if venueID == "" {
@@ -1966,9 +2002,21 @@ func LegacyGetOrderDetails(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid venue"})
 		return
 	}
+	// Columnas EXPLÍCITAS, nunca "*". Al ser una ruta pública, todo lo que se
+	// seleccione aquí queda expuesto a quien tenga el id.
+	//
+	// Quedan fuera a propósito:
+	//   payment_link_code — es la prueba de que quien paga creó la orden. Si se
+	//                       filtra, cualquiera puede pagar órdenes ajenas con
+	//                       tarjetas robadas y el contracargo se lo come el local.
+	//   metadata          — lleva dentro el desglose del cobro, los ids de
+	//                       transacción de la pasarela y los datos de cada
+	//                       asistente.
 	order, err := venueDB.QueryOne(ctx, "orders", map[string]interface{}{
-		"select": "*",
-		"where":  map[string]interface{}{"id": orderID},
+		"select": "id,order_number,status,quantity,unit_price,subtotal,total,currency," +
+			"event_id,ticket_type_id,user_name,user_email,user_phone," +
+			"payment_gateway,created_at,expires_at,approved_at,cancelled_at",
+		"where": map[string]interface{}{"id": orderID},
 	})
 	if err != nil || order == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Order not found"})
@@ -2010,20 +2058,16 @@ func LegacyGetOrderDetails(c *gin.Context) {
 
 	resp := gin.H{"order": order, "user": user, "event": event, "venue_id": venueID}
 
-	// Flujo privado dLocal: si la solicitud está aprobada esperando pago, el
-	// staff necesita poder VER y compartir el enlace (el cliente pierde el
-	// correo constantemente). Con el `payment_link_code` a secas no se puede
-	// reconstruir la URL desde el cliente.
-	if services.GetString(order, "status") == "approved_unpaid" {
-		if payURL := buildPaymentLink(ctx, venueDB, order); payURL != "" {
-			resp["payment_url"] = payURL
-		}
-		if md, ok := order["metadata"].(map[string]interface{}); ok {
-			if dl := services.GetString(md, "payment_deadline"); dl != "" {
-				resp["payment_deadline"] = dl
-			}
-		}
-	}
+	// AQUÍ SE DEVOLVÍA EL ENLACE DE PAGO, y se ha quitado (18-ago-2026).
+	//
+	// Era del desvío de dLocal: cuando una solicitud quedaba `approved_unpaid`,
+	// el staff necesitaba poder recuperar el enlace porque el cliente perdía el
+	// correo. Pero esta ruta NO pide autenticación, así que el enlace de pago
+	// —la llave para cobrar esa orden— quedaba a la vista de cualquiera.
+	//
+	// Con la retención ese estado ya no se crea: el comprador paga al
+	// solicitar. Y si algún día hace falta recuperar un enlace, tiene que salir
+	// de una ruta de staff autenticada, no de esta.
 
 	c.JSON(http.StatusOK, resp)
 }

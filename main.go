@@ -742,7 +742,11 @@ func setupLegacyRoutes(v1 *gin.RouterGroup) {
 	// La tarjeta se tokeniza en el navegador; aquí solo llega un cardToken.
 	v1.POST("/orders/smartfields/session", middleware.RateLimitPayment(), controllers.SmartFieldsSession)
 	v1.POST("/orders/smartfields/confirm", middleware.RateLimitPayment(), controllers.SmartFieldsConfirm)
-	v1.GET("/orders/details/:orderId", controllers.LegacyGetOrderDetails)
+	// Ruta PÚBLICA a propósito (el comprador consulta su orden sin iniciar
+	// sesión), pero con límite de peticiones: sin él, quien tenga un id válido
+	// puede sondear sin freno, y cualquier fallo futuro de validación se vuelve
+	// enumerable a gran escala.
+	v1.GET("/orders/details/:orderId", middleware.RateLimitGeneral(), controllers.LegacyGetOrderDetails)
 }
 
 func setupWebhookRoutes(router *gin.Engine) {
