@@ -2002,16 +2002,18 @@ func LegacyGetOrderDetails(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid venue"})
 		return
 	}
-	// Columnas EXPLÍCITAS, nunca "*". Al ser una ruta pública, todo lo que se
-	// seleccione aquí queda expuesto a quien tenga el id.
+	// Columnas EXPLÍCITAS, nunca "*". Al ser una ruta pública, todo lo que
+	// acabe en la RESPUESTA queda expuesto a quien tenga el id.
 	//
-	// Quedan fuera a propósito:
+	// Fuera del select por completo:
 	//   payment_link_code — es la prueba de que quien paga creó la orden. Si se
 	//                       filtra, cualquiera puede pagar órdenes ajenas con
 	//                       tarjetas robadas y el contracargo se lo come el local.
-	//   metadata          — lleva dentro el desglose del cobro, los ids de
-	//                       transacción de la pasarela y los datos de cada
-	//                       asistente.
+	//
+	// `metadata` SÍ se selecciona, pero NO se devuelve: dentro viven los datos
+	// de cada asistente (que el staff necesita en la puerta) junto al desglose
+	// del cobro y los ids de la pasarela (que no debe ver nadie). Se lee aquí,
+	// se saca solo lo publicable, y se borra del mapa antes de responder.
 	order, err := venueDB.QueryOne(ctx, "orders", map[string]interface{}{
 		// OJO al tocar esta lista: si se cuela una columna que NO existe,
 		// PostgREST devuelve 42703 y la respuesta se queda VACÍA — no falla de
@@ -2019,7 +2021,7 @@ func LegacyGetOrderDetails(c *gin.Context) {
 		// suena razonable y no existe. Verifica contra la tabla real antes de
 		// añadir nada.
 		"select": "id,order_number,status,quantity,unit_price,subtotal,total,currency," +
-			"event_id,ticket_type_id,user_name,user_email,user_phone," +
+			"event_id,ticket_type_id,user_name,user_email,user_phone,metadata," +
 			"payment_gateway,created_at,expires_at,cancelled_at",
 		"where": map[string]interface{}{"id": orderID},
 	})
@@ -2027,6 +2029,35 @@ func LegacyGetOrderDetails(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Order not found"})
 		return
 	}
+
+	// ASISTENTES: nombre, teléfono e Instagram de cada persona de la orden.
+	// El staff los necesita en la puerta y para reconocer a quién le abre.
+	// Se extraen del metadata ANTES de borrarlo, y se filtra a mano lo que se
+	// publica: aquí NO puede colarse nada del pago.
+	asistentes := []map[string]interface{}{}
+	if md, ok := order["metadata"].(map[string]interface{}); ok {
+		if raw, ok := md["tickets_data"].([]interface{}); ok {
+			for _, it := range raw {
+				t, ok := it.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				nombre := strings.TrimSpace(
+					services.GetString(t, "owner_name") + " " + services.GetString(t, "owner_last_name"))
+				a := map[string]interface{}{
+					"name":      nombre,
+					"email":     services.GetString(t, "owner_email"),
+					"phone":     services.GetString(t, "owner_phone"),
+					"prefix":    services.GetString(t, "owner_phone_prefix"),
+					"instagram": services.GetString(t, "owner_instagram"),
+					"gender":    services.GetString(t, "owner_gender"),
+				}
+				asistentes = append(asistentes, a)
+			}
+		}
+	}
+	// Y fuera: a partir de aquí `order` viaja al cliente.
+	delete(order, "metadata")
 
 	// The mobile ReservaDetalle screen reads nested `user` and `event`
 	// objects alongside the raw order row.
@@ -2040,6 +2071,26 @@ func LegacyGetOrderDetails(c *gin.Context) {
 		"surname": surname,
 		"email":   services.GetString(order, "user_email"),
 		"phone":   services.GetString(order, "user_phone"),
+	}
+	// El comprador es el primer asistente. De ahí salen el prefijo del
+	// teléfono y el Instagram, que en la fila de la orden no existen.
+	//
+	// `phone_prefix` lo lleva pintando la app desde siempre
+	// (ReservaDetalle: `{user_data.phone_prefix} {user_data.phone}`) pero el
+	// backend NUNCA lo devolvía, así que el número salía sin prefijo.
+	if len(asistentes) > 0 {
+		primero := asistentes[0]
+		if v, _ := primero["prefix"].(string); v != "" {
+			user["phone_prefix"] = v
+		}
+		if v, _ := primero["phone"].(string); v != "" && services.GetString(order, "user_phone") == "" {
+			user["phone"] = v
+		}
+		// Instagram solo si lo rellenó: es opcional en el formulario, y una
+		// arroba vacía en la ficha del cliente es ruido.
+		if v, _ := primero["instagram"].(string); strings.TrimSpace(v) != "" {
+			user["instagram"] = strings.TrimPrefix(strings.TrimSpace(v), "@")
+		}
 	}
 
 	event := map[string]interface{}{}
@@ -2061,7 +2112,15 @@ func LegacyGetOrderDetails(c *gin.Context) {
 		}
 	}
 
-	resp := gin.H{"order": order, "user": user, "event": event, "venue_id": venueID}
+	resp := gin.H{
+		"order":    order,
+		"user":     user,
+		"event":    event,
+		"venue_id": venueID,
+		// Todas las personas de la orden, no solo quien pagó: en una compra de
+		// 4 entradas el staff necesita ver a los 4 en la puerta.
+		"attendees": asistentes,
+	}
 
 	// AQUÍ SE DEVOLVÍA EL ENLACE DE PAGO, y se ha quitado (18-ago-2026).
 	//
