@@ -2013,9 +2013,14 @@ func LegacyGetOrderDetails(c *gin.Context) {
 	//                       transacción de la pasarela y los datos de cada
 	//                       asistente.
 	order, err := venueDB.QueryOne(ctx, "orders", map[string]interface{}{
+		// OJO al tocar esta lista: si se cuela una columna que NO existe,
+		// PostgREST devuelve 42703 y la respuesta se queda VACÍA — no falla de
+		// forma ruidosa, simplemente no hay orden. Pasó con `approved_at`, que
+		// suena razonable y no existe. Verifica contra la tabla real antes de
+		// añadir nada.
 		"select": "id,order_number,status,quantity,unit_price,subtotal,total,currency," +
 			"event_id,ticket_type_id,user_name,user_email,user_phone," +
-			"payment_gateway,created_at,expires_at,approved_at,cancelled_at",
+			"payment_gateway,created_at,expires_at,cancelled_at",
 		"where": map[string]interface{}{"id": orderID},
 	})
 	if err != nil || order == nil {
