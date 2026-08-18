@@ -610,6 +610,10 @@ func setupMobileRoutes(v1 *gin.RouterGroup) {
 		// Panel de control del evento (dinero cobrado/retenido + personas
 		// por estado) para el staff.
 		authed.GET("/event/stats/:eventId", middleware.ValidateUUIDParam("eventId"), controllers.MobileGetEventStats)
+		// Las personas detrás de cada contador del panel: el staff toca un
+		// número y ve quiénes son, con su contacto. Solo staff autenticado —
+		// aquí van datos personales de los asistentes.
+		authed.GET("/event/people/:eventId", middleware.ValidateUUIDParam("eventId"), controllers.MobileGetEventPeople)
 		authed.POST("/event/create-event", controllers.MobileCreateEvent)
 		authed.POST("/event/create-event-with-tickets", controllers.MobileCreateEventWithTickets)
 		authed.PUT("/event/update-event/:eventId", middleware.ValidateUUIDParam("eventId"), controllers.MobileUpdateEvent)
