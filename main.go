@@ -124,6 +124,8 @@ func main() {
 
 	// Health check
 	router.GET("/health", healthCheck)
+	// Para monitores externos: 503 si la base no responde. Ver readinessCheck.
+	router.GET("/health/ready", readinessCheck)
 
 	// API v1 routes
 	v1 := router.Group("/api/v1")
@@ -189,6 +191,43 @@ func healthCheck(c *gin.Context) {
 		"service":   "Pull API v2",
 		"databases": dbHealth,
 		"stats":     stats,
+	})
+}
+
+// readinessCheck — /health/ready. Igual que /health pero devuelve 503 si alguna
+// base de datos NO responde. Para monitores externos.
+//
+// POR QUÉ NO SE TOCA /health: ese lo consulta el health check de Fly cada 30 s
+// (fly.prod.toml) y Fly REINICIA la máquina cuando falla. Si /health empezara a
+// devolver 503 con la base caída, un parpadeo de Supabase provocaría un ciclo
+// de reinicios — convertiríamos un problema pasajero de la base en una caída
+// entera del servicio. Fly debe seguir viendo "el proceso vive".
+//
+// Un monitor externo quiere lo contrario: saber que no se puede vender AUNQUE
+// el proceso viva. Eso es esto.
+//
+// El 18-ago-2026 staging estuvo horas devolviendo 200 en /health con las dos
+// bases desconectadas. Nadie se habría enterado con una alerta por código HTTP.
+func readinessCheck(c *gin.Context) {
+	dbHealth := services.DB.HealthCheck()
+
+	listas := true
+	caidas := []string{}
+	for nombre, sana := range dbHealth {
+		if !sana {
+			listas = false
+			caidas = append(caidas, nombre)
+		}
+	}
+
+	codigo := 200
+	if !listas {
+		codigo = 503
+	}
+	c.JSON(codigo, gin.H{
+		"ready":     listas,
+		"databases": dbHealth,
+		"down":      caidas,
 	})
 }
 
