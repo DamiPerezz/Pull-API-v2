@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
@@ -337,6 +338,136 @@ func RefreshToken(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"token": newToken,
+	})
+}
+
+// =============================================
+// STAFF SELF-SERVICE PASSWORD CHANGE
+// =============================================
+
+// Password policy for staff-chosen passwords.
+//   - min 8 caracteres (contamos runas, no bytes: "contraseñita" son 12
+//     caracteres pero 13 bytes).
+//   - max 72 BYTES porque bcrypt ignora todo lo que pase de ahí; mejor un 400
+//     explícito que guardar un hash que sólo usa el principio.
+const (
+	minStaffPasswordRunes = 8
+	maxStaffPasswordBytes = 72
+)
+
+// ChangePasswordRequest is the body of POST /auth/change-password.
+// NO lleva el id del empleado a propósito: sale del JWT. Si viniera del
+// cuerpo, cualquiera con un token válido podría reescribir la contraseña de
+// otro miembro del staff.
+type ChangePasswordRequest struct {
+	CurrentPassword string `json:"current_password" binding:"required"`
+	NewPassword     string `json:"new_password" binding:"required"`
+}
+
+// ChangeOwnPassword lets a logged-in staff member replace their own password.
+// POST /api/v1/auth/change-password  (AuthenticateStaff + RateLimitAuth)
+//
+// Distinto de POST /employees/:id/reset-password (sólo admin, genera una
+// aleatoria y la devuelve): aquí la persona elige la suya y tiene que
+// demostrar que sabe la actual. Es el camino para que la dueña del local
+// cambie su propia contraseña sin depender de nadie.
+func ChangeOwnPassword(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	// SECURITY: identity comes from the validated JWT, never from the body.
+	staffID := c.GetString("staff_id")
+	venueID := c.GetString("venue_id")
+	if staffID == "" || venueID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
+		return
+	}
+
+	var req ChangePasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		middleware.SafeError(c, http.StatusBadRequest, "Faltan la contraseña actual y la nueva", err)
+		return
+	}
+
+	// Validamos la NUEVA antes de tocar la base de datos. No filtra nada sobre
+	// la actual (estos 400 no dependen de ella) y ahorra un bcrypt por
+	// petición basura.
+	if utf8.RuneCountInString(req.NewPassword) < minStaffPasswordRunes {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "La contraseña nueva debe tener al menos 8 caracteres"})
+		return
+	}
+	if len(req.NewPassword) > maxStaffPasswordBytes {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "La contraseña nueva es demasiado larga (máximo 72 bytes)"})
+		return
+	}
+	if req.NewPassword == req.CurrentPassword {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "La contraseña nueva debe ser distinta de la actual"})
+		return
+	}
+
+	venueDB := services.DB.ForVenue(venueID)
+	if venueDB == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid venue"})
+		return
+	}
+
+	staff, err := venueDB.QueryOne(ctx, "organization_workers", map[string]interface{}{
+		"select": "id,email,password_hash,is_active",
+		"where": map[string]interface{}{
+			"id":         staffID,
+			"deleted_at": "is.null",
+		},
+	})
+	if err != nil || staff == nil {
+		// El token es válido pero el trabajador ya no está (borrado desde otro
+		// dispositivo). No es un 500.
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
+		return
+	}
+	if !services.GetBool(staff, "is_active") {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Account is disabled"})
+		return
+	}
+
+	// Verificar la actual. Mensaje genérico (mismo texto que login) para no
+	// convertir esto en un oráculo; RateLimitAuth + RecordFailedLogin ponen el
+	// freno a la fuerza bruta con un token robado.
+	passwordHash := services.GetString(staff, "password_hash")
+	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.CurrentPassword)); err != nil {
+		if middleware.Security != nil {
+			middleware.Security.RecordFailedLogin(middleware.GetRealIP(c))
+		}
+		log.Printf("[Auth] change-password FAILED (wrong current password) staff=%s venue=%s", staffID, venueID)
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
+		return
+	}
+
+	newHash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
+	if err != nil {
+		middleware.SafeError(c, http.StatusInternalServerError, "No se pudo procesar la contraseña", err)
+		return
+	}
+
+	// Contraseña nueva = borrón y cuenta nueva en el contador de intentos.
+	if err := venueDB.UpdateNoReturn(ctx, "organization_workers", map[string]interface{}{
+		"password_hash":         string(newHash),
+		"failed_login_attempts": 0,
+		"locked_until":          nil,
+		"updated_at":            time.Now().Format(time.RFC3339),
+	}, map[string]interface{}{"id": staffID}); err != nil {
+		middleware.SafeError(c, http.StatusInternalServerError, "No se pudo actualizar la contraseña", err)
+		return
+	}
+
+	// NUNCA la contraseña en el log — sólo quién y cuándo.
+	log.Printf("[Auth] password CHANGED (self-service) staff=%s venue=%s", staffID, venueID)
+
+	// OJO: los JWT ya emitidos siguen siendo válidos hasta que expiren — no
+	// hay lista de revocación en v2. Cambiar la contraseña no cierra sesión en
+	// los demás dispositivos.
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "Contraseña actualizada",
 	})
 }
 

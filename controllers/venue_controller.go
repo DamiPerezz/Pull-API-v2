@@ -642,6 +642,13 @@ func UpdateVenueAdmin(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 
+	// Escritura: exige admin (o super_admin, comodín). Antes no miraba el rol
+	// ni una vez — un "viewer" podía reescribir el venue, credenciales de BD
+	// incluidas.
+	if !requirePlatformRole(c, platformRoleAdmin) {
+		return
+	}
+
 	venueID := c.Param("id")
 	if venueID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Venue ID is required"})
@@ -790,6 +797,11 @@ func CreateVenue(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 
+	// Escritura: exige admin (o super_admin, comodín).
+	if !requirePlatformRole(c, platformRoleAdmin) {
+		return
+	}
+
 	var req CreateVenueRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -904,6 +916,12 @@ type CreateVenueFullRequest struct {
 func CreateVenueFull(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 	defer cancel()
+
+	// Escritura: exige admin (o super_admin, comodín). Este handler además
+	// acepta credenciales Supabase del venue en el body — con más razón.
+	if !requirePlatformRole(c, platformRoleAdmin) {
+		return
+	}
 
 	var req CreateVenueFullRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1083,12 +1101,24 @@ func CreateVenueFull(c *gin.Context) {
 			// Log but don't fail - venue is created, db config can be added later
 			fmt.Printf("[WARN] Failed to encrypt service key for venue %s: %v\n", venueID, err)
 		} else {
+			// ⚠️ EL NOMBRE DE ESTA COLUMNA IMPORTA MUCHO. Tiene que ser
+			// "supabase_service_key_encrypted", que es lo que lee el router
+			// (services/database_router.go:277 y :289) y lo que escribe el otro
+			// camino de alta (linea ~738 de este mismo fichero).
+			//
+			// Estuvo escrito como "service_key_encrypted" (sin prefijo) hasta el
+			// 2026-08-20. Consecuencia: el router no encontraba la clave, caia
+			// por `return r.defaultDB` (database_router.go:225) — que en
+			// produccion es la BD del venue de 511 — y el cliente nuevo empezaba
+			// a escribir sus eventos y pedidos DENTRO de los datos de 511, sin
+			// un solo error visible. No llego a pasar porque todavia no hay un
+			// segundo cliente.
 			_, err = central.InsertCtx(ctx, "venue_database_configs", map[string]interface{}{
-				"venue_id":              venueID,
-				"supabase_url":          req.SupabaseURL,
-				"supabase_anon_key":     req.SupabaseAnonKey,
-				"service_key_encrypted": encryptedKey,
-				"is_active":             true,
+				"venue_id":                       venueID,
+				"supabase_url":                   req.SupabaseURL,
+				"supabase_anon_key":              req.SupabaseAnonKey,
+				"supabase_service_key_encrypted": encryptedKey,
+				"is_active":                      true,
 			})
 			if err != nil {
 				fmt.Printf("[WARN] Failed to create database config for venue %s: %v\n", venueID, err)
@@ -1118,6 +1148,13 @@ func CreateVenueFull(c *gin.Context) {
 func DeleteVenue(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 	defer cancel()
+
+	// SOLO super_admin: esto borra en cascada el venue y su historial contable
+	// (transacciones incluidas). Es irreversible y no había ninguna
+	// comprobación de rol.
+	if !requirePlatformRole(c, platformRoleSuperAdmin) {
+		return
+	}
 
 	venueID := c.Param("id")
 	if venueID == "" {
@@ -1289,6 +1326,12 @@ func DeleteVenue(c *gin.Context) {
 func UpdateVenueFees(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
+
+	// Escritura: exige admin (o super_admin, comodín). Esto cambia la comisión
+	// que se le cobra al cliente en cada venta — no es una lectura.
+	if !requirePlatformRole(c, platformRoleAdmin) {
+		return
+	}
 
 	venueID := c.Param("id")
 	if venueID == "" {

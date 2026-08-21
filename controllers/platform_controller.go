@@ -12,6 +12,52 @@ import (
 )
 
 // =============================================
+// CACHE Y TECHOS DEL PANEL CENTRAL
+// =============================================
+
+const (
+	// platformDashboardTTL — el dashboard se refresca solo en el panel; 60s
+	// basta para que no se note y quita la mayoría de las queries.
+	platformDashboardTTL = 60 * time.Second
+	// platformRevenueTTL — informes de dinero: cambian despacio y son las
+	// queries más caras.
+	platformRevenueTTL = 180 * time.Second
+	// platformAnalyticsTTL — igual que revenue, pero además agrega usuarios y
+	// eventos de toda la plataforma.
+	platformAnalyticsTTL = 180 * time.Second
+
+	// maxPlatformScanRows es el techo de filas de cualquier lectura agregada
+	// contra la BD central. No es paginación: es una red de seguridad para que
+	// una tabla que crece no se traiga entera a memoria (y a la factura de
+	// Supabase). Muy por encima del volumen real de hoy.
+	maxPlatformScanRows = 20000
+
+	// platformAnalyticsDefaultDays es la ventana por defecto de
+	// GetPlatformAnalytics cuando el cliente no pide otra. Antes no había
+	// ninguna: leía la tabla `transactions` COMPLETA en cada request.
+	platformAnalyticsDefaultDays = 90
+	// platformAnalyticsMaxDays acota lo que un cliente puede pedir con ?days=.
+	platformAnalyticsMaxDays = 730
+)
+
+// platformCacheKey construye la clave de cache de un endpoint del panel.
+//
+// IMPORTANTE: la clave incluye SIEMPRE el rol y todos los parámetros que
+// cambian el resultado. Si dos peticiones con ámbitos distintos comparten
+// clave, el segundo lector recibe el snapshot del primero — que en un panel
+// multi-tenant es una fuga de datos entre clientes, no un bug de rendimiento.
+// Los valores van separados por '|' (no aparece en UUIDs, fechas ni en los
+// group_by admitidos), así que dos combinaciones distintas no pueden colapsar
+// en la misma cadena.
+func platformCacheKey(prefix, role string, parts ...string) string {
+	key := prefix + "|role=" + role
+	for _, p := range parts {
+		key += "|" + p
+	}
+	return key
+}
+
+// =============================================
 // PLATFORM DASHBOARD (OPTIMIZED)
 // - Parallel queries for all data
 // - Single transaction query for all revenue stats
@@ -37,15 +83,25 @@ func GetPlatformDashboard(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
 	defer cancel()
 
-	role := c.GetString("role")
-	if role != "admin" && role != "analyst" {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Insufficient permissions"})
+	// super_admin incluido: es el rol más alto del enum y el único que existe
+	// hoy en staging/prod — sin él, el panel entero devolvía 403.
+	if !requirePlatformRole(c, platformRoleAdmin, platformRoleAnalyst) {
 		return
 	}
+	role := c.GetString("role")
 
 	central := services.DB.Central()
 	if central == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Central database not available"})
+		return
+	}
+
+	// Cache: el dashboard son 4 queries a la central y el panel refresca solo.
+	// La clave lleva el rol (el ámbito visible depende de él) — ver
+	// platformCacheKey.
+	cacheKey := platformCacheKey("platform:dashboard", role)
+	if cached, ok := services.AppCache.Get(cacheKey); ok {
+		c.JSON(http.StatusOK, cached)
 		return
 	}
 
@@ -71,6 +127,7 @@ func GetPlatformDashboard(c *gin.Context) {
 		defer wg.Done()
 		result, _ := central.QueryCtx(ctx, "venues", map[string]interface{}{
 			"select": "id,name,is_active",
+			"limit":  maxPlatformScanRows,
 		})
 		mu.Lock()
 		venues = result
@@ -82,6 +139,7 @@ func GetPlatformDashboard(c *gin.Context) {
 		defer wg.Done()
 		result, _ := central.QueryCtx(ctx, "organizations", map[string]interface{}{
 			"select": "id",
+			"limit":  maxPlatformScanRows,
 		})
 		mu.Lock()
 		orgs = result
@@ -99,6 +157,7 @@ func GetPlatformDashboard(c *gin.Context) {
 				"status":     "completed",
 				"created_at": "gte." + thirtyDaysAgo,
 			},
+			"limit": maxPlatformScanRows,
 		})
 		mu.Lock()
 		allTx = result
@@ -110,8 +169,13 @@ func GetPlatformDashboard(c *gin.Context) {
 		defer wg.Done()
 		result, _ := central.QueryCtx(ctx, "transactions", map[string]interface{}{
 			"select": "id,venue_id,transaction_type,gross_amount,platform_fee_amount,currency,payment_gateway,status,created_at",
-			"order":  "created_at.desc",
-			"limit":  10,
+			// Acotado también por fecha: sin el filtro, PostgREST ordena la
+			// tabla entera para devolver 10 filas.
+			"where": map[string]interface{}{
+				"created_at": "gte." + thirtyDaysAgo,
+			},
+			"order": "created_at.desc",
+			"limit": 10,
 		})
 		mu.Lock()
 		recentTx = result
@@ -185,7 +249,7 @@ func GetPlatformDashboard(c *gin.Context) {
 		topVenues = topVenues[:5]
 	}
 
-	c.JSON(http.StatusOK, PlatformDashboardResponse{
+	resp := PlatformDashboardResponse{
 		TotalVenues:        totalVenues,
 		ActiveVenues:       activeVenues,
 		TotalOrganizations: len(orgs),
@@ -195,7 +259,10 @@ func GetPlatformDashboard(c *gin.Context) {
 		TotalRevenue:       totalRevenue,
 		RecentTransactions: recentTx,
 		TopVenues:          topVenues,
-	})
+	}
+
+	services.AppCache.Set(cacheKey, resp, platformDashboardTTL)
+	c.JSON(http.StatusOK, resp)
 }
 
 // =============================================
@@ -210,11 +277,10 @@ func GetPlatformRevenue(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
 	defer cancel()
 
-	role := c.GetString("role")
-	if role != "admin" && role != "analyst" {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Insufficient permissions"})
+	if !requirePlatformRole(c, platformRoleAdmin, platformRoleAnalyst) {
 		return
 	}
+	role := c.GetString("role")
 
 	central := services.DB.Central()
 	if central == nil {
@@ -226,6 +292,15 @@ func GetPlatformRevenue(c *gin.Context) {
 	startDateStr := c.Query("start_date")
 	endDateStr := c.Query("end_date")
 	groupBy := c.DefaultQuery("group_by", "day")
+
+	// Cache: la clave lleva el rol y TODOS los parámetros que cambian el
+	// resultado. Omitir uno haría que dos rangos distintos compartieran
+	// snapshot.
+	cacheKey := platformCacheKey("platform:revenue", role, startDateStr, endDateStr, groupBy)
+	if cached, ok := services.AppCache.Get(cacheKey); ok {
+		c.JSON(http.StatusOK, cached)
+		return
+	}
 
 	now := time.Now()
 	startDate := now.AddDate(0, 0, -30)
@@ -260,6 +335,7 @@ func GetPlatformRevenue(c *gin.Context) {
 				"status":     "completed",
 				"created_at": "gte." + startDate.Format(time.RFC3339),
 			},
+			"limit": maxPlatformScanRows,
 		})
 		mu.Lock()
 		transactions = result
@@ -270,6 +346,7 @@ func GetPlatformRevenue(c *gin.Context) {
 		defer wg.Done()
 		result, _ := central.QueryCtx(ctx, "venues", map[string]interface{}{
 			"select": "id,name",
+			"limit":  maxPlatformScanRows,
 		})
 		mu.Lock()
 		venues = result
@@ -384,7 +461,7 @@ func GetPlatformRevenue(c *gin.Context) {
 		})
 	}
 
-	c.JSON(http.StatusOK, gin.H{
+	resp := gin.H{
 		"period": gin.H{
 			"start_date": startDate.Format("2006-01-02"),
 			"end_date":   endDate.AddDate(0, 0, -1).Format("2006-01-02"),
@@ -400,7 +477,10 @@ func GetPlatformRevenue(c *gin.Context) {
 		"revenue_by_venue":   venueData,
 		"revenue_by_gateway": gatewayData,
 		"revenue_by_type":    typeData,
-	})
+	}
+
+	services.AppCache.Set(cacheKey, resp, platformRevenueTTL)
+	c.JSON(http.StatusOK, resp)
 }
 
 // safeDivFloat performs safe division
@@ -423,9 +503,7 @@ func GetPlatformTransactions(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 
-	role := c.GetString("role")
-	if role != "admin" && role != "analyst" && role != "support" {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Insufficient permissions"})
+	if !requirePlatformRole(c, platformRoleAdmin, platformRoleAnalyst, platformRoleSupport) {
 		return
 	}
 
@@ -510,9 +588,13 @@ func GetPlatformTransactions(c *gin.Context) {
 
 	go func() {
 		defer wg.Done()
+		// Query de conteo: trae solo `id`, pero seguía siendo un scan sin
+		// techo. El límite es una red de seguridad muy por encima del volumen
+		// real; si alguna vez se alcanza, `total` se satura en ese número.
 		result, _ := central.QueryCtx(ctx, "transactions", map[string]interface{}{
 			"select": "id",
 			"where":  whereClause,
+			"limit":  maxPlatformScanRows,
 		})
 		mu.Lock()
 		countResult = result
@@ -523,6 +605,7 @@ func GetPlatformTransactions(c *gin.Context) {
 		defer wg.Done()
 		result, _ := central.QueryCtx(ctx, "venues", map[string]interface{}{
 			"select": "id,name",
+			"limit":  maxPlatformScanRows,
 		})
 		mu.Lock()
 		venues = result
@@ -567,9 +650,7 @@ func GetTransactionDetails(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	role := c.GetString("role")
-	if role != "admin" && role != "analyst" && role != "support" {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Insufficient permissions"})
+	if !requirePlatformRole(c, platformRoleAdmin, platformRoleAnalyst, platformRoleSupport) {
 		return
 	}
 

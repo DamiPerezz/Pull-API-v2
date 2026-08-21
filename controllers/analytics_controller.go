@@ -13,6 +13,12 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// maxVenueScanRows es el techo de filas de las lecturas agregadas contra la BD
+// de un venue. No es paginación: es una red de seguridad para que una tabla
+// que crece (orders, tickets) no se traiga entera a memoria en cada request.
+// Muy por encima del volumen de un evento real.
+const maxVenueScanRows = 20000
+
 // =============================================
 // DASHBOARD ENDPOINTS (ULTRA-OPTIMIZED)
 // =============================================
@@ -562,6 +568,29 @@ func GetEventAnalytics(c *gin.Context) {
 
 // GetVenueAnalytics returns overall venue performance analytics
 // GET /staff/analytics/venue
+//
+// TODO(panel-venue): ESTE HANDLER SIGUE DEVOLVIENDO DATOS FALSOS. Se arregló
+// el mecanismo (los filtros ya van dentro de "where" y por tanto se aplican de
+// verdad), pero las consultas piden columnas que NO EXISTEN en la BD del
+// venue. Una columna inexistente da 42703 y `QueryCtx` devuelve la lista
+// VACÍA sin error visible, así que las cifras salen a cero en vez de salir
+// mal. Antes salían mal en silencio; ahora salen a cero. Las dos cosas están
+// rotas: no consumas este endpoint hasta reescribirlo.
+//
+// Columnas fantasma → columna real (schema en sql/venue_template.sql):
+//   - TODAS las tablas: `venue_id` NO EXISTE. La tenencia ES la base de datos
+//     por venue (services.DB.ForVenue), no una columna.
+//   - orders.status = "paid" no es válido. El enum order_status es
+//     pending|processing|confirmed|failed|cancelled → el estado pagado es
+//     "confirmed".
+//   - orders.total_amount → `total`. orders.gateway_fee no existe
+//     (`platform_fee` sí).
+//   - events.event_datetime → `start_datetime`.
+//   - tickets.is_checked_in → no existe; el check-in es `checked_in_at`
+//     (NOT NULL = presentado).
+//   - group_reservations.total_paid → no existe (`total`, `deposit_amount`).
+//   - vip_list_reservations: el flujo VIP list está RETIRADO (producto,
+//     2026-07). Esta query sobra entera.
 func GetVenueAnalytics(c *gin.Context) {
 	claims, exists := c.Get("staff")
 	if !exists {
@@ -631,10 +660,16 @@ func GetVenueAnalytics(c *gin.Context) {
 
 	wg.Add(7)
 
+	// NOTA: los filtros van dentro de "where". A nivel raíz, buildQueryParams
+	// los IGNORA en silencio (services/supabase.go) y la consulta devolvía la
+	// tabla entera sin filtrar. Ver el TODO de la cabecera del handler: las
+	// columnas que se piden aquí siguen siendo, muchas de ellas, inexistentes.
 	go func() {
 		defer wg.Done()
 		result, _ := client.QueryOne(ctx, "venues", map[string]interface{}{
-			"id": venueID,
+			"where": map[string]interface{}{
+				"id": venueID,
+			},
 		})
 		mu.Lock()
 		venue = result
@@ -644,9 +679,12 @@ func GetVenueAnalytics(c *gin.Context) {
 	go func() {
 		defer wg.Done()
 		result, _ := client.QueryCtx(ctx, "orders", map[string]interface{}{
-			"venue_id":   venueID,
-			"status":     "paid",
-			"created_at": "gte." + startDateRFC,
+			"where": map[string]interface{}{
+				"venue_id":   venueID,
+				"status":     "paid",
+				"created_at": "gte." + startDateRFC,
+			},
+			"limit": maxVenueScanRows,
 		})
 		mu.Lock()
 		orders = result
@@ -656,8 +694,11 @@ func GetVenueAnalytics(c *gin.Context) {
 	go func() {
 		defer wg.Done()
 		result, _ := client.QueryCtx(ctx, "events", map[string]interface{}{
-			"venue_id":       venueID,
-			"event_datetime": "gte." + startDateRFC,
+			"where": map[string]interface{}{
+				"venue_id":       venueID,
+				"event_datetime": "gte." + startDateRFC,
+			},
+			"limit": maxVenueScanRows,
 		})
 		mu.Lock()
 		events = result
@@ -667,9 +708,12 @@ func GetVenueAnalytics(c *gin.Context) {
 	go func() {
 		defer wg.Done()
 		result, _ := client.QueryCtx(ctx, "group_reservations", map[string]interface{}{
-			"venue_id":   venueID,
-			"status":     "confirmed",
-			"created_at": "gte." + startDateRFC,
+			"where": map[string]interface{}{
+				"venue_id":   venueID,
+				"status":     "confirmed",
+				"created_at": "gte." + startDateRFC,
+			},
+			"limit": maxVenueScanRows,
 		})
 		mu.Lock()
 		reservations = result
@@ -679,8 +723,11 @@ func GetVenueAnalytics(c *gin.Context) {
 	go func() {
 		defer wg.Done()
 		result, _ := client.QueryCtx(ctx, "vip_list_reservations", map[string]interface{}{
-			"venue_id":   venueID,
-			"created_at": "gte." + startDateRFC,
+			"where": map[string]interface{}{
+				"venue_id":   venueID,
+				"created_at": "gte." + startDateRFC,
+			},
+			"limit": maxVenueScanRows,
 		})
 		mu.Lock()
 		vipLists = result
@@ -690,9 +737,12 @@ func GetVenueAnalytics(c *gin.Context) {
 	go func() {
 		defer wg.Done()
 		result, _ := client.QueryCtx(ctx, "guest_list_signups", map[string]interface{}{
-			"venue_id":   venueID,
-			"status":     "approved",
-			"created_at": "gte." + startDateRFC,
+			"where": map[string]interface{}{
+				"venue_id":   venueID,
+				"status":     "approved",
+				"created_at": "gte." + startDateRFC,
+			},
+			"limit": maxVenueScanRows,
 		})
 		mu.Lock()
 		guestListSignups = result
@@ -702,9 +752,12 @@ func GetVenueAnalytics(c *gin.Context) {
 	go func() {
 		defer wg.Done()
 		result, _ := client.QueryCtx(ctx, "tickets", map[string]interface{}{
-			"venue_id":      venueID,
-			"is_checked_in": true,
-			"checked_in_at": "gte." + startDateRFC,
+			"where": map[string]interface{}{
+				"venue_id":      venueID,
+				"is_checked_in": true,
+				"checked_in_at": "gte." + startDateRFC,
+			},
+			"limit": maxVenueScanRows,
 		})
 		mu.Lock()
 		tickets = result
@@ -893,12 +946,21 @@ func GetRevenueReport(c *gin.Context) {
 
 	wg.Add(4)
 
+	// *** FUGA ENTRE CLIENTES (arreglada aquí) ***
+	// Estas dos consultas van contra la BD CENTRAL, que es COMPARTIDA por
+	// todos los venues. Los filtros iban a nivel raíz y buildQueryParams los
+	// descartaba en silencio: el informe de un venue traía las transacciones
+	// de TODOS. Con un solo cliente pasaba inadvertido; con el segundo, un
+	// venue vería la facturación del otro. Van dentro de "where".
 	go func() {
 		defer wg.Done()
 		result, _ := central.QueryCtx(ctx, "transactions", map[string]interface{}{
-			"venue_id":   venueID,
-			"status":     "completed",
-			"created_at": "gte." + startDateRFC,
+			"where": map[string]interface{}{
+				"venue_id":   venueID,
+				"status":     "completed",
+				"created_at": "gte." + startDateRFC,
+			},
+			"limit": maxVenueScanRows,
 		})
 		mu.Lock()
 		transactions = result
@@ -908,21 +970,35 @@ func GetRevenueReport(c *gin.Context) {
 	go func() {
 		defer wg.Done()
 		result, _ := central.QueryCtx(ctx, "transactions", map[string]interface{}{
-			"venue_id":         venueID,
-			"transaction_type": "refund",
-			"created_at":       "gte." + startDateRFC,
+			"where": map[string]interface{}{
+				"venue_id":         venueID,
+				"transaction_type": "refund",
+				"created_at":       "gte." + startDateRFC,
+			},
+			"limit": maxVenueScanRows,
 		})
 		mu.Lock()
 		refunds = result
 		mu.Unlock()
 	}()
 
+	// Las dos de abajo van contra la BD del venue (ForVenue), donde no hay
+	// fuga posible — pero los filtros se descartaban igual, así que `status` y
+	// `created_at` tampoco se aplicaban.
+	//
+	// Se quita `venue_id`: esa columna NO EXISTE en la BD del venue (la
+	// tenencia ES la base de datos, ver sql/venue_template.sql). Mientras el
+	// filtro se ignoraba daba igual; ahora que se aplica de verdad, dejarlo
+	// haría fallar la consulta con 42703 y `QueryCtx` devolvería lista vacía
+	// SIN error visible — el mapa de nombres de evento se quedaría en blanco.
 	go func() {
 		defer wg.Done()
 		result, _ := client.QueryCtx(ctx, "group_reservations", map[string]interface{}{
-			"venue_id":   venueID,
-			"status":     "confirmed",
-			"created_at": "gte." + startDateRFC,
+			"where": map[string]interface{}{
+				"status":     "confirmed",
+				"created_at": "gte." + startDateRFC,
+			},
+			"limit": maxVenueScanRows,
 		})
 		mu.Lock()
 		reservations = result
@@ -933,8 +1009,8 @@ func GetRevenueReport(c *gin.Context) {
 		defer wg.Done()
 		// Get all events for this venue to build name map (eliminates N+1 query)
 		result, _ := client.QueryCtx(ctx, "events", map[string]interface{}{
-			"select":   "id,name",
-			"venue_id": venueID,
+			"select": "id,name",
+			"limit":  maxVenueScanRows,
 		})
 		mu.Lock()
 		events = result
@@ -1057,6 +1133,29 @@ func GetPlatformAnalytics(c *gin.Context) {
 	weekStart := todayStart.AddDate(0, 0, -7)
 	monthStart := todayStart.AddDate(0, -1, 0)
 
+	// Ventana de la consulta. Antes NO había ninguna: se leía la tabla
+	// `transactions` entera, sin select y sin limit, en cada request. Con la
+	// ventana, los totales que devuelve este endpoint son "de los últimos N
+	// días", no "de siempre" — por eso se publica `window_days` en la
+	// respuesta, para que el panel lo pueda rotular.
+	windowDays := platformAnalyticsDefaultDays
+	if d, err := strconv.Atoi(c.Query("days")); err == nil && d > 0 {
+		windowDays = d
+	}
+	if windowDays > platformAnalyticsMaxDays {
+		windowDays = platformAnalyticsMaxDays
+	}
+	windowStart := todayStart.AddDate(0, 0, -windowDays)
+
+	// Cache: la clave lleva el rol y la ventana. Sin la ventana, un ?days=7 y
+	// un ?days=365 compartirían snapshot.
+	role := c.GetString("role")
+	cacheKey := platformCacheKey("platform:analytics", role, strconv.Itoa(windowDays))
+	if cached, ok := services.AppCache.Get(cacheKey); ok {
+		c.JSON(http.StatusOK, cached)
+		return
+	}
+
 	// =============================================
 	// PARALLEL QUERY EXECUTION (4 queries in parallel)
 	// =============================================
@@ -1071,10 +1170,21 @@ func GetPlatformAnalytics(c *gin.Context) {
 
 	wg.Add(4)
 
+	// *** La consulta más cara del repo (arreglada aquí) ***
+	// Leía `transactions` COMPLETA: sin select (o sea `*`, decenas de
+	// columnas), sin limit y sin filtro de fecha. Además `status` iba a nivel
+	// raíz, así que buildQueryParams lo descartaba y ni siquiera filtraba por
+	// completadas. Ahora: select explícito con las 4 columnas que se usan,
+	// filtro dentro de "where", ventana de fecha y techo de filas.
 	go func() {
 		defer wg.Done()
 		result, _ := central.QueryCtx(ctx, "transactions", map[string]interface{}{
-			"status": "completed",
+			"select": "venue_id,gross_amount,platform_fee_amount,created_at",
+			"where": map[string]interface{}{
+				"status":     "completed",
+				"created_at": "gte." + windowStart.Format(time.RFC3339),
+			},
+			"limit": maxPlatformScanRows,
 		})
 		mu.Lock()
 		allTransactions = result
@@ -1085,6 +1195,7 @@ func GetPlatformAnalytics(c *gin.Context) {
 		defer wg.Done()
 		result, _ := central.QueryCtx(ctx, "venues", map[string]interface{}{
 			"select": "id,name,is_active",
+			"limit":  maxPlatformScanRows,
 		})
 		mu.Lock()
 		venues = result
@@ -1093,8 +1204,12 @@ func GetPlatformAnalytics(c *gin.Context) {
 
 	go func() {
 		defer wg.Done()
+		// Techo de filas: `users` es la tabla que más crece de la central y
+		// aquí solo se cuenta. Si alguna vez se alcanza el techo, los
+		// contadores de usuarios se saturan en ese número.
 		result, _ := central.QueryCtx(ctx, "users", map[string]interface{}{
 			"select": "id,last_login_at,created_at",
+			"limit":  maxPlatformScanRows,
 		})
 		mu.Lock()
 		users = result
@@ -1105,6 +1220,7 @@ func GetPlatformAnalytics(c *gin.Context) {
 		defer wg.Done()
 		result, _ := central.QueryCtx(ctx, "events_summary", map[string]interface{}{
 			"select": "id,event_datetime,status",
+			"limit":  maxPlatformScanRows,
 		})
 		mu.Lock()
 		events = result
@@ -1134,6 +1250,7 @@ func GetPlatformAnalytics(c *gin.Context) {
 		ActiveVenues: activeVenues,
 		TotalUsers:   len(users),
 		TotalEvents:  len(events),
+		WindowDays:   windowDays,
 	}
 
 	for _, tx := range allTransactions {
@@ -1242,6 +1359,7 @@ func GetPlatformAnalytics(c *gin.Context) {
 		dashboard.TopVenues = dashboard.TopVenues[:10]
 	}
 
+	services.AppCache.Set(cacheKey, dashboard, platformAnalyticsTTL)
 	c.JSON(http.StatusOK, dashboard)
 }
 
@@ -1274,10 +1392,21 @@ func GetSalesByPeriod(c *gin.Context) {
 	now := time.Now()
 	startDate := now.AddDate(0, 0, -days)
 
+	// Filtros dentro de "where": a nivel raíz buildQueryParams los descartaba
+	// y esto sumaba TODAS las órdenes del venue, pagadas o no.
+	//   - `venue_id` fuera: no existe en la BD del venue (la tenencia ES la
+	//     base de datos). Aplicado de verdad daría 42703 → lista vacía.
+	//   - "paid" no es un valor del enum order_status
+	//     (pending|processing|confirmed|payment_authorized|payment_failed|
+	//     checked_in|cancelled|refunded|expired). El estado pagado es
+	//     "confirmed", que es el que escribe order_controller.go al cobrar.
 	orders, _ := client.QueryCtx(ctx, "orders", map[string]interface{}{
-		"venue_id":   venueID,
-		"status":     "paid",
-		"created_at": "gte." + startDate.Format(time.RFC3339),
+		"select": "quantity,total,status,created_at",
+		"where": map[string]interface{}{
+			"status":     "confirmed",
+			"created_at": "gte." + startDate.Format(time.RFC3339),
+		},
+		"limit": maxVenueScanRows,
 	})
 
 	salesMap := make(map[string]*models.DailySales)
@@ -1305,7 +1434,9 @@ func GetSalesByPeriod(c *gin.Context) {
 		}
 		salesMap[key].Orders++
 		salesMap[key].Tickets += services.GetInt(order, "quantity")
-		salesMap[key].Revenue += services.GetFloat64(order, "total_amount")
+		// `total`, no `total_amount`: esa columna no existe en `orders` y
+		// GetFloat64 devolvía 0, así que la facturación salía plana a cero.
+		salesMap[key].Revenue += services.GetFloat64(order, "total")
 	}
 
 	// Convert to slice
@@ -1347,10 +1478,15 @@ func GetCheckInAnalytics(c *gin.Context) {
 
 	client := services.DB.ForVenue(venueID)
 
-	// Verify event exists
+	// Verify event exists. El filtro va dentro de "where" (a nivel raíz se
+	// descartaba y esto devolvía el PRIMER evento de la tabla, fuese cual
+	// fuese el :id pedido). `venue_id` fuera: no existe en la BD del venue, la
+	// tenencia ya la da services.DB.ForVenue(venueID).
 	event, err := client.QueryOne(ctx, "events", map[string]interface{}{
-		"id":       eventID,
-		"venue_id": venueID,
+		"select": "id",
+		"where": map[string]interface{}{
+			"id": eventID,
+		},
 	})
 	if err != nil || event == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Event not found"})
@@ -1370,22 +1506,39 @@ func GetCheckInAnalytics(c *gin.Context) {
 
 	wg.Add(3)
 
+	// `event_id`/`status` van dentro de "where" (a nivel raíz se descartaban:
+	// se contaban los check-ins de TODOS los eventos del venue, no los del
+	// :id pedido). Y `is_checked_in` fuera del select: esa columna no existe
+	// en ninguna de las tres tablas, y una columna inexistente en el select da
+	// 42703 → lista vacía sin error visible. El check-in real es
+	// `checked_in_at` NOT NULL.
 	go func() {
 		defer wg.Done()
 		result, _ := client.QueryCtx(ctx, "tickets", map[string]interface{}{
-			"select":   "id,is_checked_in,checked_in_at",
-			"event_id": eventID,
+			"select": "id,checked_in_at",
+			"where": map[string]interface{}{
+				"event_id": eventID,
+			},
+			"limit": maxVenueScanRows,
 		})
 		mu.Lock()
 		tickets = result
 		mu.Unlock()
 	}()
 
+	// TODO(panel-venue): esta query siempre devuelve vacío. `vip_list_guests`
+	// no tiene columna `event_id` (cuelga de vip_list_reservations vía
+	// `reservation_id`), así que el filtro da 42703. Da igual de momento: el
+	// flujo VIP list está RETIRADO (decisión de producto 2026-07). Cuando se
+	// limpie el código muerto, esta consulta se va entera.
 	go func() {
 		defer wg.Done()
 		result, _ := client.QueryCtx(ctx, "vip_list_guests", map[string]interface{}{
-			"select":   "id,is_checked_in,checked_in_at",
-			"event_id": eventID,
+			"select": "id,checked_in_at",
+			"where": map[string]interface{}{
+				"event_id": eventID,
+			},
+			"limit": maxVenueScanRows,
 		})
 		mu.Lock()
 		vipGuests = result
@@ -1395,9 +1548,12 @@ func GetCheckInAnalytics(c *gin.Context) {
 	go func() {
 		defer wg.Done()
 		result, _ := client.QueryCtx(ctx, "guest_list_signups", map[string]interface{}{
-			"select":   "id,is_checked_in,checked_in_at",
-			"event_id": eventID,
-			"status":   "approved",
+			"select": "id,checked_in_at",
+			"where": map[string]interface{}{
+				"event_id": eventID,
+				"status":   "approved",
+			},
+			"limit": maxVenueScanRows,
 		})
 		mu.Lock()
 		guestListSignups = result
@@ -1413,8 +1569,11 @@ func GetCheckInAnalytics(c *gin.Context) {
 	checkedIn := 0
 	checkInsByHour := make(map[int]int, 24)
 
+	// El check-in es `checked_in_at` NOT NULL, no un booleano `is_checked_in`
+	// (columna que no existe). GetBool sobre una clave ausente devolvía
+	// siempre false: el endpoint reportaba 0 check-ins pasara lo que pasara.
 	for _, ticket := range tickets {
-		if services.GetBool(ticket, "is_checked_in") {
+		if services.GetString(ticket, "checked_in_at") != "" {
 			checkedIn++
 			checkedInAt := services.GetString(ticket, "checked_in_at")
 			if t, err := time.Parse(time.RFC3339, checkedInAt); err == nil {
@@ -1427,7 +1586,7 @@ func GetCheckInAnalytics(c *gin.Context) {
 	totalVIP := len(vipGuests)
 	vipCheckedIn := 0
 	for _, vg := range vipGuests {
-		if services.GetBool(vg, "is_checked_in") {
+		if services.GetString(vg, "checked_in_at") != "" {
 			vipCheckedIn++
 			checkedInAt := services.GetString(vg, "checked_in_at")
 			if t, err := time.Parse(time.RFC3339, checkedInAt); err == nil {
@@ -1440,7 +1599,7 @@ func GetCheckInAnalytics(c *gin.Context) {
 	totalGuestList := len(guestListSignups)
 	guestListCheckedIn := 0
 	for _, gls := range guestListSignups {
-		if services.GetBool(gls, "is_checked_in") {
+		if services.GetString(gls, "checked_in_at") != "" {
 			guestListCheckedIn++
 			checkedInAt := services.GetString(gls, "checked_in_at")
 			if t, err := time.Parse(time.RFC3339, checkedInAt); err == nil {

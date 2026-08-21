@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -568,8 +569,53 @@ func (s *SupabaseClient) setHeaders(req *http.Request) {
 	// Note: gzip disabled - Go's http.Client handles it automatically via Transport
 }
 
+// knownQueryParamKeys son las ÚNICAS claves que buildQueryParams interpreta.
+// Cualquier otra se ignora en silencio — ver el aviso de abajo.
+var knownQueryParamKeys = map[string]bool{
+	"select": true,
+	"where":  true,
+	"order":  true,
+	"limit":  true,
+	"offset": true,
+}
+
+// warnedQueryParamKeys evita inundar los logs: cada clave desconocida se avisa
+// UNA vez por proceso. Sin esto, las llamadas que quedan mal en rutas calientes
+// (registro de push token en cada arranque de la app) escribirían una línea por
+// request en Fly.
+var warnedQueryParamKeys sync.Map
+
+// warnUnknownQueryParam avisa una sola vez por clave.
+func warnUnknownQueryParam(key string) {
+	if _, seen := warnedQueryParamKeys.LoadOrStore(key, struct{}{}); seen {
+		return
+	}
+	log.Printf("[supabase] AVISO: parámetro de consulta %q ignorado — los "+
+		"filtros van dentro de \"where\", no a nivel raíz. La consulta sale SIN "+
+		"filtrar. (este aviso sale una vez por clave)", key)
+}
+
 // buildQueryParams builds URL query parameters (optimized)
+//
+// ⚠️ TRAMPA: los filtros SOLO se aplican si van dentro de "where". Una clave a
+// nivel raíz —p.ej. map[string]interface{}{"venue_id": x, "status": "y"}— se
+// DESCARTA sin error y la consulta sale sin filtrar, devolviendo la tabla
+// entera. En la BD central (compartida por todos los venues) eso es una fuga
+// de datos entre clientes, no solo un bug de rendimiento. En julio de 2026
+// había 15 llamadas así en analytics_controller.go.
+//
+// Se avisa por log, NO se devuelve error: fallar aquí podría romper código que
+// hoy funciona en producción. Correcto:
+//
+//	{"select": "id,name", "where": {"venue_id": x}, "limit": 100}
 func (s *SupabaseClient) buildQueryParams(params map[string]interface{}) url.Values {
+	// Aviso (no bloqueante) de claves que se van a ignorar.
+	for k := range params {
+		if !knownQueryParamKeys[k] {
+			warnUnknownQueryParam(k)
+		}
+	}
+
 	// Pre-allocate with estimated capacity
 	queryParams := make(url.Values, len(params)+1)
 

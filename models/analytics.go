@@ -259,6 +259,13 @@ type PlatformDashboard struct {
 	// Trends
 	RevenueTrend      []DailyPlatformRevenue `json:"revenue_trend,omitempty"`
 	TransactionsTrend []DailyTransactions    `json:"transactions_trend,omitempty"`
+
+	// WindowDays es la ventana en días sobre la que se calcularon los totales
+	// de transacciones. Los campos Total* NO son "desde siempre": son "en esta
+	// ventana". Antes el handler leía la tabla `transactions` entera en cada
+	// request; ahora acota por fecha y publica aquí el rango para que el panel
+	// lo pueda rotular.
+	WindowDays int `json:"window_days,omitempty"`
 }
 
 // VenueRevenueSummary for platform top venues

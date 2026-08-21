@@ -245,6 +245,10 @@ func setupAuthRoutes(v1 *gin.RouterGroup) {
 		auth.GET("/verify-token", middleware.AuthenticateStaff(), controllers.VerifyToken) // Alias for mobile app
 		auth.POST("/refresh", middleware.AuthenticateStaff(), controllers.RefreshToken)
 		auth.POST("/refresh-staff-token", middleware.AuthenticateStaff(), controllers.RefreshToken) // Alias for mobile app
+		// Self-service: el staff cambia SU PROPIA contraseña (pide la actual).
+		// RateLimitAuth para que no se use como oráculo de fuerza bruta de la
+		// contraseña actual con un token robado.
+		auth.POST("/change-password", middleware.RateLimitAuth(), middleware.AuthenticateStaff(), controllers.ChangeOwnPassword)
 	}
 
 	// User authentication (email code-based)

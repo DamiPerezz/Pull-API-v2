@@ -343,13 +343,19 @@ func PlatformGetSessions(c *gin.Context) {
 }
 
 // PlatformRevokeSession revokes a specific session
-// DELETE /api/v1/platform/auth/sessions/:id
+// DELETE /api/v1/platform/auth/sessions/:session_id
 func PlatformRevokeSession(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
 	staffID := c.GetString("staff_id")
-	targetSessionID := c.Param("id")
+	// La ruta registra `:session_id` (main.go), pero esto leía `:id` y salía
+	// siempre vacío → 400 "Invalid request" pasara lo que pasara. Leemos los
+	// dos nombres, como hace el resto del repo con eventId/event_id.
+	targetSessionID := c.Param("session_id")
+	if targetSessionID == "" {
+		targetSessionID = c.Param("id")
+	}
 
 	if staffID == "" || targetSessionID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})

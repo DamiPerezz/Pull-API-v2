@@ -13,6 +13,11 @@ import (
 	"time"
 )
 
+// venueConfigMisses recuerda por que venues ya avisamos de que no tienen
+// configuracion de BD, para que el aviso salga UNA vez por venue y no una por
+// peticion: ForVenue esta en el camino caliente de todo el trafico del staff.
+var venueConfigMisses sync.Map
+
 // =============================================
 // OPTIMIZED DATABASE ROUTER
 // Ultra-fast routing with connection pooling
@@ -224,6 +229,29 @@ func (r *DatabaseRouter) ForVenue(venueID string) *SupabaseClient {
 	// Slow path: load config and create connection
 	cfg := r.getVenueConfig(venueID)
 	if cfg == nil || !cfg.IsActive {
+		// ⚠️ CAER AQUI ES PELIGROSO EN CUANTO HAYA MAS DE UN CLIENTE.
+		//
+		// `defaultDB` es la BD que apuntan las variables DEFAULT_*, que en
+		// produccion es la del venue de 511. Si a este venue no se le encuentra
+		// configuracion, sus eventos y pedidos acaban DENTRO de los datos de
+		// 511, sin error visible para nadie.
+		//
+		// Hoy es inofensivo porque solo hay un cliente y ese cliente ES el
+		// default. Por eso NO se convierte en error todavia: varios handlers
+		// dan por hecho que esto nunca devuelve nil, y romperlos a dos semanas
+		// del evento del 6-sep es peor que el riesgo que evita.
+		//
+		// ANTES DE DAR DE ALTA AL CLIENTE NUMERO 2: cambiar esto por
+		// `return nil` y revisar que TODOS los llamantes comprueban el nil
+		// (el patron correcto ya existe, p.ej. en MobileResetEmployeePassword).
+		// Mientras tanto, al menos que se vea en los logs.
+		if _, avisado := venueConfigMisses.LoadOrStore(venueID, struct{}{}); !avisado {
+			log.Printf("[DatabaseRouter] ⚠️ venue=%s SIN configuracion de BD "+
+				"utilizable (existe=%v) — se devuelve la BD POR DEFECTO. Si este "+
+				"venue NO es el venue por defecto, sus datos se estan escribiendo "+
+				"en la BD de otro cliente. Revisa venue_database_configs. "+
+				"(este aviso sale una vez por venue)", venueID, cfg != nil)
+		}
 		return r.defaultDB
 	}
 
