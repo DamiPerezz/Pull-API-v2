@@ -386,16 +386,45 @@ func PayOrder(c *gin.Context) {
 	if parts := strings.SplitN(userName, " ", 2); len(parts) == 2 {
 		firstName, lastName = parts[0], parts[1]
 	}
+	// PAÍS DEL COMPRADOR, deducido de su propio prefijo telefónico.
+	//
+	// Antes aquí había "GT" fijo para TODO el mundo. Para un comprador
+	// guatemalteco eso acierta —y sigue aciertando, porque +502 da GT— pero
+	// para cualquier otro le estábamos jurando a Cybersource un país que no era
+	// el suyo. Y eso no es inocuo: en el rechazo del 22-ago saltaron
+	// `MM-BIN: Card BIN inconsistent with country` y `MM-EMBCO: Email address
+	// inconsistent with billing country`. Los provocábamos nosotros, diciendo
+	// "este señor es de Guatemala" sobre una tarjeta española.
+	//
+	// El prefijo no es la dirección de facturación de la tarjeta, y por eso no
+	// es perfecto. Pero es un dato REAL que el comprador nos dio, y sustituye a
+	// una constante inventada: para el +502 el resultado es idéntico al de
+	// antes, y solo cambia donde antes fallábamos seguro.
+	pais := orDefault(req.BillTo.Country, paisDelComprador(order))
+
 	billTo := services.CybsBillTo{
-		FirstName:  firstName,
-		LastName:   lastName,
-		Email:      services.GetString(order, "user_email"),
-		Phone:      telefonoDelComprador(order),
-		Address1:   orDefault(req.BillTo.Address1, "Ciudad de Guatemala"),
-		Locality:   orDefault(req.BillTo.City, "Guatemala"),
-		AdminArea:  orDefault(req.BillTo.State, "GT"),
-		PostalCode: orDefault(req.BillTo.PostalCode, "01001"),
-		Country:    orDefault(req.BillTo.Country, "GT"),
+		FirstName: firstName,
+		LastName:  lastName,
+		Email:     services.GetString(order, "user_email"),
+		Phone:     telefonoDelComprador(order),
+		Country:   pais,
+	}
+	// La dirección la sigue rellenando el backend porque el formulario no la
+	// pide. Pero SOLO tiene sentido inventar una guatemalteca si el comprador
+	// es de Guatemala: mandar "Ciudad de Guatemala, 01001" junto a country=ES
+	// es una incoherencia que el antifraude lee como dato falso. Para el resto
+	// se manda solo lo que sabemos de verdad, y los campos que no sabemos no
+	// viajan.
+	if pais == "GT" {
+		billTo.Address1 = orDefault(req.BillTo.Address1, "Ciudad de Guatemala")
+		billTo.Locality = orDefault(req.BillTo.City, "Guatemala")
+		billTo.AdminArea = orDefault(req.BillTo.State, "GT")
+		billTo.PostalCode = orDefault(req.BillTo.PostalCode, "01001")
+	} else {
+		billTo.Address1 = req.BillTo.Address1
+		billTo.Locality = req.BillTo.City
+		billTo.AdminArea = req.BillTo.State
+		billTo.PostalCode = req.BillTo.PostalCode
 	}
 
 	// ===== SEÑALES DE DISPOSITIVO PARA DECISION MANAGER =====
@@ -938,6 +967,74 @@ func orDefault(v, def string) string {
 		return def
 	}
 	return v
+}
+
+// prefijosPais traduce el prefijo telefónico internacional al código de país
+// de dos letras (ISO 3166-1) que espera Cybersource.
+//
+// Es una lista corta a propósito: cubre Centroamérica (de donde son los
+// compradores), el resto de Latinoamérica, España, y los sitios desde los que
+// de verdad se compra. Lo que no esté aquí cae al país del local, que es la
+// suposición menos mala.
+//
+// ⚠️ +1 es AMBIGUO: es Estados Unidos, Canadá y buena parte del Caribe. Se
+// mapea a US porque es el caso dominante con diferencia. No es exacto, pero
+// para un número +1 acertar "US" falla mucho menos que asumir "GT".
+var prefijosPais = map[string]string{
+	"502": "GT", // Guatemala — el nuestro
+	"503": "SV", "504": "HN", "505": "NI", "506": "CR", "507": "PA", "501": "BZ",
+	"52": "MX", "57": "CO", "51": "PE", "54": "AR", "56": "CL", "58": "VE",
+	"593": "EC", "591": "BO", "598": "UY", "595": "PY", "55": "BR",
+	"34": "ES", "1": "US",
+	"44": "GB", "33": "FR", "39": "IT", "49": "DE", "351": "PT",
+}
+
+// paisDelComprador deduce el país a partir del prefijo que eligió el comprador
+// en el formulario. Devuelve "GT" cuando no hay prefijo o no lo reconocemos:
+// el local es guatemalteco y sus compradores también, así que ese es el
+// respaldo correcto.
+//
+// El emparejado va de MÁS LARGO A MÁS CORTO, y eso importa: "+502" tiene que
+// dar Guatemala, no Estados Unidos por empezar por "5"... ni "+1" comerse a
+// "+52". Con un mapa hay que ordenar la búsqueda a mano.
+func paisDelComprador(order map[string]interface{}) string {
+	const respaldo = "GT"
+
+	md, ok := order["metadata"].(map[string]interface{})
+	if !ok {
+		return respaldo
+	}
+	raw, ok := md["tickets_data"].([]interface{})
+	if !ok || len(raw) == 0 {
+		return respaldo
+	}
+	primero, ok := raw[0].(map[string]interface{})
+	if !ok {
+		return respaldo
+	}
+
+	// "+502", "502", "+502 " — todo vale; nos quedamos con los dígitos.
+	var digitos strings.Builder
+	for _, r := range services.GetString(primero, "owner_phone_prefix") {
+		if r >= '0' && r <= '9' {
+			digitos.WriteRune(r)
+		}
+	}
+	prefijo := digitos.String()
+	if prefijo == "" {
+		return respaldo
+	}
+
+	// De 3 dígitos a 1: el más específico gana.
+	for n := 3; n >= 1; n-- {
+		if len(prefijo) < n {
+			continue
+		}
+		if pais, ok := prefijosPais[prefijo[:n]]; ok {
+			return pais
+		}
+	}
+	return respaldo
 }
 
 // telefonoDelComprador saca el teléfono REAL de quien está pagando.
