@@ -144,11 +144,41 @@ func PayOrder(c *gin.Context) {
 		SecurityCode: req.Card.CVV,
 	}
 	if transientToken == "" {
-		// --- CARRIL DE TARJETA: intacto, línea por línea ---
+		// --- CARRIL DE TARJETA ---
 		if len(card.Number) < 12 || card.ExpMonth == "" || card.ExpYear == "" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Datos de tarjeta incompletos"})
 			return
 		}
+		// EL CVV ES OBLIGATORIO AQUÍ. Añadido el 2026-08-22.
+		//
+		// Antes NO se comprobaba. La web no deja pulsar "Pagar" sin CVV, pero
+		// eso es validación de navegador: un atacante hace POST directo a
+		// /orders/pay. Con el campo vacío, `Sale()` montaba
+		// `securityCode: ""` y la petición salía igual a la pasarela.
+		//
+		// Y aquí está lo importante: lo único que hoy impedía que eso acabara
+		// en carding es LA REGLA "CVN no enviado" DEL PERFIL DE NEONET — la
+		// misma que estamos pidiendo que relajen para que funcionen los
+		// wallets. Su regla nos estaba tapando un agujero nuestro.
+		//
+		// Con esto arreglado, la petición se invierte y deja de ser peligrosa:
+		// si ningún pago con tarjeta puede salir ya sin CVV, esa regla solo
+		// puede dispararse en el carril de wallet —el único que estructuralmente
+		// no tiene ese dato— y relajarla no abre nada.
+		//
+		// 3 dígitos, o 4 en American Express.
+		cvv := strings.TrimSpace(card.SecurityCode)
+		if len(cvv) < 3 || len(cvv) > 4 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Falta el código de seguridad de la tarjeta"})
+			return
+		}
+		for _, r := range cvv {
+			if r < '0' || r > '9' {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "El código de seguridad solo puede tener números"})
+				return
+			}
+		}
+		card.SecurityCode = cvv
 		if len(card.ExpYear) == 2 {
 			card.ExpYear = "20" + card.ExpYear
 		}
