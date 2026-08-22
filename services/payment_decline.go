@@ -51,11 +51,23 @@ func DeclineMessage(reason, raw string) string {
 	switch strings.ToUpper(strings.TrimSpace(reason)) {
 
 	// --- Filtro antifraude ---------------------------------------------
-	// Deliberadamente sin detalle. Ver regla 4.
+	// Deliberadamente sin detalle del MOTIVO. Ver regla 4.
+	//
+	// Pero SÍ se le dice que cambiar de tarjeta no sirve, y eso es un cambio
+	// deliberado del 2026-08-22. Antes ponía "Prueba con otra": es el consejo
+	// exactamente equivocado. Las reglas que rechazan aquí agrupan por CORREO,
+	// no por tarjeta (está probado: "Mismo EM > 8 x 3 meses" rechazando, y
+	// "Mismo EM > 3 x semana" en el catálogo de NeoNet). Un comprador honesto
+	// que siga ese consejo quema tres tarjetas suyas, sube el contador con cada
+	// intento —la velocidad se evalúa en modo "early", o sea que cuenta también
+	// los fallos— y acaba autobloqueándose. Le hacíamos daño con nuestra propia
+	// ayuda.
+	//
+	// Sigue sin decir POR QUÉ, que es lo que protege la regla.
 	case "DECISION_PROFILE_REJECT", "DECISION_PROFILE_REVIEW",
 		"BLACKLISTED_CUSTOMER", "SCORE_EXCEEDS_THRESHOLD", "DENIED":
-		return "No pudimos completar el pago con esta tarjeta. Prueba con otra " +
-			"o escríbenos y lo resolvemos contigo."
+		return "No pudimos completar el pago. Reintentarlo con otra tarjeta no " +
+			"va a ayudar: escríbenos y lo resolvemos contigo enseguida."
 
 	// --- El banco dice que no, y sabemos por qué ------------------------
 	case "INSUFFICIENT_FUND", "EXCEEDS_CREDIT_LIMIT":

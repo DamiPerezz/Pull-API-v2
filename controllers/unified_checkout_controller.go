@@ -107,7 +107,25 @@ const (
 	// Se puede mover con UNIFIED_CHECKOUT_CLIENT_VERSION sin desplegar.
 	defaultUCClientVersion = "0.26"
 	defaultUCCountry       = "GT"
-	defaultUCLocale        = "es_GT"
+	// ⚠️ NO PONGAS "es_GT" AQUÍ. Parece lo correcto —el país es GT y el idioma
+	// español— pero es_GT NO EXISTE en la lista de locales de Unified Checkout.
+	// Los españoles que admite son, y solo estos:
+	//
+	//	es_AR  es_CL  es_CO  es_ES  es_MX  es_PE  es_US
+	//
+	// Y aquí está la trampa: Cybersource ACEPTA es_GT sin dar error y lo
+	// devuelve tal cual dentro del JWT de la sesión, así que desde el servidor
+	// todo parece bien. Lo que falla es el widget, que al no reconocerlo cae a
+	// INGLÉS. Se veía en producción: un checkout en español pintaba el botón
+	// "Checkout With Card" a compradores guatemaltecos.
+	//
+	// es_MX es el español de Latinoamérica más cercano de los soportados. El
+	// país sigue siendo GT (ese sí es correcto y va aparte): el locale es el
+	// idioma de la interfaz, no dónde está el comercio.
+	//
+	// Si alguien prefiere otro, UNIFIED_CHECKOUT_LOCALE lo cambia sin desplegar
+	// — pero que sea uno de los siete de arriba.
+	defaultUCLocale = "es_MX"
 	// Wallets ÚNICAMENTE. PANENTRY (formulario de tarjeta de Cybersource) se
 	// deja fuera a propósito: la tarjeta ya se cobra por nuestro formulario, y
 	// meter un segundo carril de tarjeta duplicaría la superficie de la única
