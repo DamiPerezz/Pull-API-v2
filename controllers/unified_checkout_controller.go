@@ -79,9 +79,33 @@ func unifiedCheckoutEnabled() bool {
 // Valores por defecto de la sesión. Todos configurables porque los fija
 // Cybersource/NeoNet, no nosotros.
 const (
-	// Versión del SDK de Unified Checkout. Si NeoNet pide otra, se cambia por
-	// env sin tocar código.
-	defaultUCClientVersion = "0.24"
+	// Versión del SDK de Unified Checkout.
+	//
+	// ⚠️ 0.26 ES UN MÍNIMO, NO UNA PREFERENCIA. La tabla de versiones del
+	// manual (Capture Context API, pág. 41-42) dice literalmente:
+	//
+	//	0.26 — "Support for the complete mandate."
+	//
+	// Hasta el 2026-08-22 esto valía "0.24" Y ADEMÁS mandábamos
+	// `completeMandate`. Una versión vieja no da error con un campo que no
+	// conoce: LO IGNORA EN SILENCIO. O sea que durante todo ese tiempo:
+	//
+	//	- `completeMandate.decisionManager: true` no encendía nada. Es el campo
+	//	  con el que creíamos haber activado el perfilado de dispositivo dentro
+	//	  del widget, y el panel de Decision Manager seguía diciendo
+	//	  "Device Fingerprint: Not Submitted" también en los pagos por wallet.
+	//	- `completeMandate.type` (CAPTURE / AUTH) tampoco se declaraba.
+	//
+	// POR QUÉ 0.26 Y NO 0.28, que es la más nueva del manual: 0.28 cambia
+	// además el comportamiento de la entrada manual de tarjeta (añade Payer
+	// Authentication y quita pantallas de confirmación "para ciertos casos").
+	// Ese es el carril que HOY cobra dinero de verdad y que hay que vender el
+	// 6-sep, así que no se toca a ciegas. 0.26 es la versión mínima que hace
+	// funcionar lo que ya mandábamos, y sus otros cambios son de Click to Pay
+	// (que no usamos) y campos añadidos a la respuesta del token.
+	//
+	// Se puede mover con UNIFIED_CHECKOUT_CLIENT_VERSION sin desplegar.
+	defaultUCClientVersion = "0.26"
 	defaultUCCountry       = "GT"
 	defaultUCLocale        = "es_GT"
 	// Wallets ÚNICAMENTE. PANENTRY (formulario de tarjeta de Cybersource) se
@@ -130,6 +154,14 @@ func ucEnvString(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// ucEnvBool lee una variable booleana que por defecto está APAGADA. Solo un
+// "true" explícito la enciende: cualquier otra cosa —vacía, basura, "1"— deja
+// el comportamiento de siempre. En el carril del dinero, un valor mal escrito
+// tiene que ser inofensivo.
+func ucEnvBool(key string) bool {
+	return strings.EqualFold(strings.TrimSpace(os.Getenv(key)), "true")
 }
 
 // unifiedCheckoutTargetOrigins devuelve los orígenes donde se puede embeber el
@@ -412,6 +444,31 @@ func PaymentsCaptureContext(c *gin.Context) {
 		ReferenceCode:       orderNumber + "-UC",
 		CompleteMandateType: completeMandate,
 		DecisionManager:     decisionManager,
+
+		// Palancas nuevas (2026-08-22), todas APAGADAS por defecto: sin
+		// ponerlas, el cuerpo que sale es idéntico al de antes. Existen porque
+		// las tres salieron de releer el manual y ninguna se puede ensayar
+		// contra el sandbox —el perfil de NeoNet solo está publicado en
+		// producción—, así que se prueban de una en una con un secret.
+		//
+		//	UNIFIED_CHECKOUT_GOOGLEPAY_AUTH=PAN_ONLY
+		//	  Google devuelve el número real en vez del token del dispositivo.
+		//	  NO arregla "CVN no enviado" (Google Pay no pide CVV nunca). Sirve
+		//	  para que Cybersource vea el BIN real: con el token vio uno español
+		//	  y saltó "MM-BIN: Card BIN inconsistent with country".
+		//	  ⚠️ Puede hacer que Google Pay DESAPAREZCA si la tarjeta del
+		//	  comprador solo está tokenizada en el dispositivo.
+		//
+		//	UNIFIED_CHECKOUT_BILLING_TYPE=FULL
+		//	  El widget le pide la dirección real al comprador. Arregla que hoy
+		//	  las 200 compras de una noche lleven la MISMA dirección fija, que
+		//	  es justo lo que buscan las reglas GVEL de velocidad por dirección.
+		//	  ⚠️ Añade fricción al carril que hoy cobra. Es decisión de
+		//	  producto, no técnica.
+		GooglePayAuthMethods: ucEnvString("UNIFIED_CHECKOUT_GOOGLEPAY_AUTH", ""),
+		BillingType:          ucEnvString("UNIFIED_CHECKOUT_BILLING_TYPE", "NONE"),
+		RequestEmail:         ucEnvBool("UNIFIED_CHECKOUT_REQUEST_EMAIL"),
+		RequestPhone:         ucEnvBool("UNIFIED_CHECKOUT_REQUEST_PHONE"),
 	})
 	if err != nil {
 		log.Printf("[UnifiedCheckout] no se pudo abrir la sesión order=%s: %v", orderNumber, err)

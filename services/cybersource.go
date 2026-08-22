@@ -547,7 +547,48 @@ type CaptureContextParams struct {
 	AllowedCardNetworks []string
 	// ClientVersion es la versión del SDK de Unified Checkout. Configurable
 	// porque la fija Cybersource/NeoNet, no nosotros.
+	//
+	// ⚠️ NO ES UN NÚMERO COSMÉTICO: cada versión habilita campos del cuerpo, y
+	// una versión vieja IGNORA EN SILENCIO los que no conoce. Ver
+	// defaultUCClientVersion en unified_checkout_controller.go — mandar
+	// `completeMandate` con clientVersion 0.24 fue exactamente eso.
 	ClientVersion string
+
+	// GooglePayAuthMethods restringe qué credenciales devuelve Google Pay
+	// (manual de Unified Checkout, pág. 73-74):
+	//
+	//	"PAN_ONLY"        → Google devuelve el número de tarjeta real
+	//	"CRYPTOGRAM_3DS"  → Google devuelve el token de red del dispositivo
+	//	""                → las dos, y elige Google. ES EL POR DEFECTO.
+	//
+	// Vacío = GOOGLEPAY viaja como texto suelto, igual que siempre. Con valor,
+	// se emite en su forma de objeto.
+	//
+	// NO sirve para esquivar la regla "CVN no enviado" de NeoNet: Google Pay no
+	// pide CVV en ninguno de los dos modos. Sirve para el BIN — con PAN_ONLY,
+	// Cybersource ve el BIN real de la tarjeta en vez del del token, que es lo
+	// que hizo saltar `MM-BIN: Card BIN inconsistent with country`.
+	GooglePayAuthMethods string
+
+	// BillingType dice QUÉ DATOS le pide el widget al comprador: "NONE" (nada),
+	// "PARTIAL" o "FULL" (dirección de facturación completa).
+	//
+	// Está en NONE porque nombre, correo y dirección ya viajan en Sale() desde
+	// la orden, y pedírselos otra vez es fricción en el peor momento.
+	//
+	// PERO hay un motivo real para subirlo a FULL: hoy la dirección que
+	// mandamos es FIJA para todos los compradores ("Ciudad de Guatemala",
+	// "01001"). Con FULL, el comprador teclea la suya y esa repetición
+	// desaparece — que importa porque el perfil de NeoNet lleva reglas de
+	// velocidad por dirección (GVEL-R5038 "Misma Direccion Ent > 2 x 1 semana").
+	//
+	// Vacío = "NONE".
+	BillingType string
+	// RequestEmail / RequestPhone: mismo razonamiento que BillingType. El
+	// ejemplo oficial de "Unified Checkout with Sale and Decision Manager"
+	// (pág. 119) los pone a true; nosotros a false porque ya los tenemos.
+	RequestEmail bool
+	RequestPhone bool
 	// ReferenceCode se guarda en la sesión para poder conciliar en el Business
 	// Center qué orden abrió cada capture context.
 	ReferenceCode string
@@ -595,6 +636,41 @@ type CaptureContextParams struct {
 	DecisionManager bool
 }
 
+// allowedPaymentTypesPayload monta el array `allowedPaymentTypes`.
+//
+// Normalmente cada método es un texto suelto ("APPLEPAY", "GOOGLEPAY"). Pero
+// Google Pay admite una forma expandida de objeto para restringir qué
+// credenciales devuelve (manual pág. 73):
+//
+//	{ "type": "GOOGLEPAY", "options": { "allowedAuthMethods": "PAN_ONLY" } }
+//
+// Solo GOOGLEPAY se expande, y solo si se pidió: sin `authMethods` el array
+// sale exactamente igual que antes de que esta función existiera, que es la
+// condición para que esto no pueda romper el carril que hoy cobra.
+//
+// ⚠️ El ejemplo del manual está mal escrito (le falta una coma después de
+// "PANENTRY"). La forma correcta es la de aquí: elementos del array separados
+// por comas, unos texto y otros objeto.
+func allowedPaymentTypesPayload(types []string, googlePayAuthMethods string) []interface{} {
+	authMethods := strings.ToUpper(strings.TrimSpace(googlePayAuthMethods))
+	out := make([]interface{}, 0, len(types))
+	for _, t := range types {
+		t = strings.ToUpper(strings.TrimSpace(t))
+		if t == "" {
+			continue
+		}
+		if t == "GOOGLEPAY" && authMethods != "" {
+			out = append(out, map[string]interface{}{
+				"type":    "GOOGLEPAY",
+				"options": map[string]interface{}{"allowedAuthMethods": authMethods},
+			})
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
+}
+
 // CaptureContext abre una sesión de Unified Checkout.
 //
 // ⚠️ LA RESPUESTA NO ES JSON. Cybersource contesta con el JWT en texto plano
@@ -608,22 +684,31 @@ func (c *CybersourceClient) CaptureContext(ctx context.Context, p CaptureContext
 		return "", fmt.Errorf("capture context: importe inválido")
 	}
 
+	billingType := strings.ToUpper(strings.TrimSpace(p.BillingType))
+	if billingType == "" {
+		billingType = "NONE"
+	}
+
 	payload := map[string]interface{}{
 		"clientVersion":       p.ClientVersion,
 		"targetOrigins":       p.TargetOrigins,
 		"allowedCardNetworks": p.AllowedCardNetworks,
-		"allowedPaymentTypes": p.AllowedPaymentTypes,
+		"allowedPaymentTypes": allowedPaymentTypesPayload(p.AllowedPaymentTypes, p.GooglePayAuthMethods),
 		"country":             p.Country,
 		"locale":              p.Locale,
-		// captureMandate = qué datos le PIDE el componente al comprador.
-		// Todo a false a propósito: nombre, correo y dirección de facturación
-		// ya están en la orden y son los que mandamos en Sale(). Pedírselos
-		// otra vez en la hoja del wallet añade fricción y abre la puerta a que
-		// el comprador mande unos datos distintos de los de su reserva.
+		// captureMandate = qué datos le PIDE el componente al comprador. Por
+		// defecto no pide nada: nombre, correo y dirección ya están en la orden
+		// y son los que mandamos en Sale(). Pedírselos otra vez en la hoja del
+		// wallet añade fricción y abre la puerta a que el comprador mande unos
+		// datos distintos de los de su reserva.
+		//
+		// Configurable porque la dirección que mandamos hoy es la MISMA para
+		// todos, y eso alimenta las reglas de velocidad por dirección del
+		// perfil de NeoNet. Ver CaptureContextParams.BillingType.
 		"captureMandate": map[string]interface{}{
-			"billingType":              "NONE",
-			"requestEmail":             false,
-			"requestPhone":             false,
+			"billingType":              billingType,
+			"requestEmail":             p.RequestEmail,
+			"requestPhone":             p.RequestPhone,
 			"requestShipping":          false,
 			"showAcceptedNetworkIcons": true,
 		},
