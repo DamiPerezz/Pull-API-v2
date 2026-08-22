@@ -409,18 +409,43 @@ func PayOrder(c *gin.Context) {
 		Phone:     telefonoDelComprador(order),
 		Country:   pais,
 	}
-	// La dirección la sigue rellenando el backend porque el formulario no la
-	// pide. Pero SOLO tiene sentido inventar una guatemalteca si el comprador
-	// es de Guatemala: mandar "Ciudad de Guatemala, 01001" junto a country=ES
-	// es una incoherencia que el antifraude lee como dato falso. Para el resto
-	// se manda solo lo que sabemos de verdad, y los campos que no sabemos no
-	// viajan.
-	if pais == "GT" {
+	// ¿NOS LA VA A DAR EL WIDGET? Si el pago viene por Unified Checkout Y la
+	// sesión se abrió pidiendo datos de facturación (billingType PARTIAL/FULL),
+	// entonces el comprador —o su wallet, que la lleva guardada con la
+	// tarjeta— ya entregó su dirección REAL dentro del transient token.
+	//
+	// En ese caso NO mandamos la nuestra. Si la mandásemos, la inventada
+	// pisaría a la verdadera y habríamos añadido un paso al checkout para
+	// tirar el dato a la basura. La guía lo dice al revés y con las mismas
+	// palabras: "cuando billingType es NONE, TÚ tienes que incluir los campos
+	// requeridos" — o sea que cuando no es NONE, los pone el widget.
+	//
+	// Solo aplica al carril del widget. El formulario de tarjeta de respaldo no
+	// recoge dirección de nadie, así que ahí se sigue rellenando como siempre.
+	laDaElWidget := transientToken != "" &&
+		!strings.EqualFold(strings.TrimSpace(os.Getenv("UNIFIED_CHECKOUT_BILLING_TYPE")), "NONE") &&
+		strings.TrimSpace(os.Getenv("UNIFIED_CHECKOUT_BILLING_TYPE")) != ""
+
+	// La dirección la rellena el backend porque nuestro formulario no la pide.
+	// Pero SOLO tiene sentido inventar una guatemalteca si el comprador es de
+	// Guatemala: mandar "Ciudad de Guatemala, 01001" junto a country=ES es una
+	// incoherencia que el antifraude lee como dato falso. Para el resto se
+	// manda solo lo que sabemos de verdad.
+	switch {
+	case laDaElWidget:
+		// Nada nuestro: manda la del comprador, que es la buena.
+		billTo.Address1 = req.BillTo.Address1
+		billTo.Locality = req.BillTo.City
+		billTo.AdminArea = req.BillTo.State
+		billTo.PostalCode = req.BillTo.PostalCode
+	case pais == "GT":
 		billTo.Address1 = orDefault(req.BillTo.Address1, "Ciudad de Guatemala")
 		billTo.Locality = orDefault(req.BillTo.City, "Guatemala")
 		billTo.AdminArea = orDefault(req.BillTo.State, "GT")
 		billTo.PostalCode = orDefault(req.BillTo.PostalCode, "01001")
-	} else {
+	default:
+		// Comprador de fuera y sin widget que le pregunte: no hay dirección
+		// que mandar. Mejor vacío que una inventada del país equivocado.
 		billTo.Address1 = req.BillTo.Address1
 		billTo.Locality = req.BillTo.City
 		billTo.AdminArea = req.BillTo.State
