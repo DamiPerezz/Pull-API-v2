@@ -10,10 +10,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // =============================================
@@ -196,6 +198,169 @@ type CybsBillTo struct {
 	AdminArea  string
 	PostalCode string
 	Country    string
+}
+
+// =============================================
+// SEÑALES DE DISPOSITIVO — lo que Decision Manager necesita para juzgar
+//
+// Hasta el 22-ago-2026 NO se mandaba ninguna. En el panel de Decision Manager
+// las columnas IP Address, IP Country y Device Fingerprint salían VACÍAS en el
+// 100% de nuestras transacciones: el antifraude estaba juzgando a ciegas, y las
+// reglas de velocidad de NeoNet —que son compartidas con el resto de sus
+// comercios y agrupan por IP y por huella— no tenían con qué distinguir a 200
+// compradores distintos.
+//
+// NOMBRES Y LÍMITES sacados del "REST API Field Reference" que NeoNet nos pasó
+// (apartado deviceInformation, págs. 285-297). NO son intercambiables, y dos de
+// ellos se confunden con facilidad:
+//
+//	ipAddress              (45)   IP del comprador. 45 = IPv6 con zona.
+//	fingerprintSessionId   (—)    huella del dispositivo. Ver el campo.
+//	userAgent              (40)   el TIPO de navegador ("Chrome"), NO la cadena
+//	                              User-Agent entera. Mandar la cadena aquí la
+//	                              trunca a 40 y ensucia el dato.
+//	userAgentBrowserValue  (2048) la cabecera User-Agent ENTERA. Es esta.
+//	httpAcceptBrowserValue (255)  la cabecera Accept entera.
+//	httpBrowserLanguage    (8)    BCP47 ("es-GT"), NO la cabecera Accept-Language
+//	                              entera ("es-GT,es;q=0.9,en;q=0.8" no cabe).
+//
+// REGLA DE ORO de este bloque: un campo que no venga informado, o que no pase
+// su validación, NO VIAJA. Si no viaja ninguno, `deviceInformation` no se añade
+// al cuerpo y el pago sale byte a byte como salía antes de que esto existiera.
+// Eso es lo que hace que este añadido no pueda romper el carril de tarjeta —
+// el único que hoy cobra dinero real. Lo fija TestSaleCardBodyByteIdenticalToLegacy.
+// =============================================
+
+// CybsDeviceInfo son las señales del dispositivo del comprador. Todos los
+// campos son OPCIONALES y se validan antes de enviarse.
+type CybsDeviceInfo struct {
+	// IPAddress es la IP REAL del comprador (middleware.GetRealIP). Se descarta
+	// si no parsea como IP: mandar basura aquí es peor que no mandar nada,
+	// porque Decision Manager la usaría para geolocalizar y decidir.
+	IPAddress string
+
+	// FingerprintSessionID es el identificador de la huella de dispositivo
+	// (deviceInformation.fingerprintSessionId).
+	//
+	// ⚠️ NO SE INVENTA AQUÍ, Y ESO ES DELIBERADO. La huella la produce el
+	// NAVEGADOR: o bien el script de profiling de Cybersource, que necesita el
+	// `org_id` del comercio (NeoNet aún no nos lo ha dado), o bien Unified
+	// Checkout cuando la sesión se abre con completeMandate.decisionManager=true
+	// —ahí la huella viaja YA DENTRO del transient token, sin pasar por este
+	// campo—. Generar un id al azar en el servidor rellenaría la columna del
+	// panel con un valor que nunca se perfiló: le estaríamos dando al antifraude
+	// un dato falso sobre un dispositivo que no existe. Prefiero la columna
+	// vacía a la columna mentirosa.
+	//
+	// El campo existe para que, en cuanto NeoNet dé el org_id, la web solo tenga
+	// que mandarlo en `device_fingerprint_id` (ver payOrderRequest) y esto ya
+	// esté enchufado y validado.
+	FingerprintSessionID string
+
+	// UserAgent es la cabecera User-Agent ENTERA → userAgentBrowserValue.
+	UserAgent string
+	// AcceptHeader es la cabecera Accept entera → httpAcceptBrowserValue.
+	AcceptHeader string
+	// Language es la cabecera Accept-Language cruda; se recorta a la etiqueta
+	// BCP47 principal antes de viajar → httpBrowserLanguage.
+	Language string
+}
+
+// LooksLikeFingerprintSessionID comprueba la FORMA del id de huella antes de
+// reenviarlo a la pasarela. Mismo criterio que LooksLikeJWT y por el mismo
+// motivo: este valor entra por la petición de pago, o sea que lo escribe el
+// navegador, y no vamos a hacer de eco de cualquier cadena hacia Cybersource.
+// No valida que la huella EXISTA —eso solo lo sabe quien la perfiló—, solo que
+// sea un identificador acotado y sin caracteres raros.
+func LooksLikeFingerprintSessionID(s string) bool {
+	if len(s) < 8 || len(s) > 64 {
+		return false
+	}
+	for _, r := range s {
+		ok := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '-' || r == '_'
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// cybsHeaderValue deja una cabecera HTTP en condiciones de viajar dentro de un
+// JSON hacia la pasarela: fuera los caracteres de control (un \n o un \r
+// colados en un User-Agent no tienen nada que hacer en un campo de antifraude)
+// y recorte al límite del campo SIN partir un carácter multibyte por la mitad.
+func cybsHeaderValue(v string, max int) string {
+	var b strings.Builder
+	for _, r := range v {
+		if r < 0x20 || r == 0x7f {
+			continue
+		}
+		if b.Len()+utf8.RuneLen(r) > max {
+			break
+		}
+		b.WriteRune(r)
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// cybsBrowserLanguage saca la etiqueta BCP47 principal de una cabecera
+// Accept-Language. El campo admite 8 caracteres y una cabecera real trae varias
+// etiquetas con pesos ("es-GT,es;q=0.9,en;q=0.8"): mandarla entera la truncaría
+// a "es-GT,es" —que no es un idioma— así que se coge solo la primera y se
+// comprueba la forma. Si no encaja, no viaja.
+func cybsBrowserLanguage(v string) string {
+	tag := strings.TrimSpace(v)
+	if i := strings.IndexByte(tag, ','); i >= 0 {
+		tag = tag[:i]
+	}
+	if i := strings.IndexByte(tag, ';'); i >= 0 {
+		tag = tag[:i]
+	}
+	tag = strings.TrimSpace(tag)
+	if tag == "" || len(tag) > 8 {
+		return ""
+	}
+	// Forma: subetiquetas alfanuméricas separadas por guiones ("es", "es-GT").
+	// Descarta de paso el comodín "*" y cualquier cosa con caracteres raros.
+	for _, part := range strings.Split(tag, "-") {
+		if part == "" {
+			return ""
+		}
+		for _, r := range part {
+			ok := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+			if !ok {
+				return ""
+			}
+		}
+	}
+	return tag
+}
+
+// payload construye el bloque `deviceInformation` SOLO con los campos que vengan
+// informados y pasen su validación. Devuelve nil cuando no queda ninguno — y ese
+// nil es lo que garantiza que el cuerpo del pago no cambie si no hay señales.
+func (d CybsDeviceInfo) payload() map[string]interface{} {
+	out := map[string]interface{}{}
+	if ip := strings.TrimSpace(d.IPAddress); len(ip) <= 45 && net.ParseIP(ip) != nil {
+		out["ipAddress"] = ip
+	}
+	if fp := strings.TrimSpace(d.FingerprintSessionID); LooksLikeFingerprintSessionID(fp) {
+		out["fingerprintSessionId"] = fp
+	}
+	if ua := cybsHeaderValue(d.UserAgent, 2048); ua != "" {
+		out["userAgentBrowserValue"] = ua
+	}
+	if ac := cybsHeaderValue(d.AcceptHeader, 255); ac != "" {
+		out["httpAcceptBrowserValue"] = ac
+	}
+	if lang := cybsBrowserLanguage(d.Language); lang != "" {
+		out["httpBrowserLanguage"] = lang
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // CybsSaleResult is the outcome of a sale (auth+capture).
@@ -407,6 +572,27 @@ type CaptureContextParams struct {
 	// Vacío = no se manda el bloque, y el cuerpo queda idéntico al de antes de
 	// que este campo existiera.
 	CompleteMandateType string
+
+	// DecisionManager enciende el antifraude Y —lo que de verdad nos importa—
+	// LA HUELLA DE DISPOSITIVO dentro del componente de Unified Checkout.
+	//
+	// CONFIRMADO EN LA DOCUMENTACIÓN QUE NEONET NOS PASÓ, no deducido: "Unified
+	// Checkout" (completeMandate.decisionManager) y "Digital Accept Secure
+	// Integration" dicen lo mismo con las mismas palabras — "When this field is
+	// set to true, both Decision Manager and device fingerprinting services are
+	// run. [...] When this field is set to false or is not included in the
+	// request, Decision Manager and device fingerprinting services do not run."
+	//
+	// O sea que hasta hoy, en el carril de wallet, NO se ejecutaba el
+	// fingerprinting: por eso la columna Device Fingerprint del panel sale vacía
+	// también ahí. Con esto encendido, Unified Checkout perfila el dispositivo y
+	// mete el `fingerprintSessionId` DENTRO del transient token (se ve en el
+	// ejemplo de token descifrado del manual), así que llega a la pasarela solo
+	// —no hace falta que la web nos lo mande ni que nosotros lo reenviemos.
+	//
+	// La misma documentación exige que, para usar este campo, vaya acompañado de
+	// completeMandate.type. Por eso solo se emite cuando hay mandato.
+	DecisionManager bool
 }
 
 // CaptureContext abre una sesión de Unified Checkout.
@@ -452,7 +638,14 @@ func (c *CybersourceClient) CaptureContext(ctx context.Context, p CaptureContext
 	// AUTH = autorizar y capturar después). La pone el llamador leyendo el
 	// evento, para que no pueda divergir de lo que después se le pide a Sale().
 	if t := strings.ToUpper(strings.TrimSpace(p.CompleteMandateType)); t != "" {
-		payload["completeMandate"] = map[string]interface{}{"type": t}
+		mandate := map[string]interface{}{"type": t}
+		// La doc condiciona decisionManager a que exista `type`, así que vive
+		// dentro de este if a propósito: fuera, un DecisionManager=true sin
+		// mandato produciría un cuerpo que la pasarela no acepta.
+		if p.DecisionManager {
+			mandate["decisionManager"] = true
+		}
+		payload["completeMandate"] = mandate
 	}
 	if p.ReferenceCode != "" {
 		payload["clientReferenceInformation"] = map[string]interface{}{"code": p.ReferenceCode}
@@ -493,7 +686,30 @@ func (c *CybersourceClient) CaptureContext(ctx context.Context, p CaptureContext
 // vacío —el 100% del tráfico de hoy— el cuerpo enviado es EXACTAMENTE el de
 // siempre. Esa es la condición de que este añadido no pueda romper el único
 // carril que hoy cobra de verdad.
-func (c *CybersourceClient) Sale(ctx context.Context, referenceCode string, amount float64, currency string, card CybsCard, billTo CybsBillTo, capture bool, transientToken string) (*CybsSaleResult, error) {
+//
+// device (señales de dispositivo para Decision Manager): mismo contrato. Cada
+// campo viaja solo si viene informado Y pasa su validación; si no queda
+// ninguno, `deviceInformation` NO se añade al cuerpo. Ver CybsDeviceInfo.
+func (c *CybersourceClient) Sale(ctx context.Context, referenceCode string, amount float64, currency string, card CybsCard, billTo CybsBillTo, capture bool, transientToken string, device CybsDeviceInfo) (*CybsSaleResult, error) {
+	bill := map[string]interface{}{
+		"firstName":          billTo.FirstName,
+		"lastName":           billTo.LastName,
+		"email":              billTo.Email,
+		"address1":           billTo.Address1,
+		"locality":           billTo.Locality,
+		"administrativeArea": billTo.AdminArea,
+		"postalCode":         billTo.PostalCode,
+		"country":            billTo.Country,
+	}
+	// El teléfono viaja SOLO si lo tenemos de verdad. Antes se mandaba un
+	// literal ("502" + ocho ceros) idéntico en todas las compras de todos los
+	// venues; ver `telefonoDelComprador` en pay_controller.go. Un campo ausente
+	// es un dato que no tenemos; un campo con un número inventado y compartido
+	// es una firma de fraude que le regalábamos al antifraude de NeoNet.
+	if p := strings.TrimSpace(billTo.Phone); p != "" {
+		bill["phoneNumber"] = p
+	}
+
 	payload := map[string]interface{}{
 		"clientReferenceInformation": map[string]interface{}{"code": referenceCode},
 		"processingInformation": map[string]interface{}{
@@ -505,18 +721,16 @@ func (c *CybersourceClient) Sale(ctx context.Context, referenceCode string, amou
 				"totalAmount": fmt.Sprintf("%.2f", amount),
 				"currency":    currency,
 			},
-			"billTo": map[string]interface{}{
-				"firstName":          billTo.FirstName,
-				"lastName":           billTo.LastName,
-				"email":              billTo.Email,
-				"phoneNumber":        billTo.Phone,
-				"address1":           billTo.Address1,
-				"locality":           billTo.Locality,
-				"administrativeArea": billTo.AdminArea,
-				"postalCode":         billTo.PostalCode,
-				"country":            billTo.Country,
-			},
+			"billTo": bill,
 		},
+	}
+
+	// SEÑALES DE DISPOSITIVO. Se añaden ANTES de elegir el medio de pago porque
+	// aplican a los dos carriles por igual: la regla de velocidad que rechaza no
+	// distingue entre tarjeta y wallet. Si no hay ninguna señal válida, esta
+	// clave no aparece y el cuerpo es el de siempre.
+	if dev := device.payload(); dev != nil {
+		payload["deviceInformation"] = dev
 	}
 
 	// EL MEDIO DE PAGO: token O tarjeta, nunca los dos. Mandar ambos hace que

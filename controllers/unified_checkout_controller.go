@@ -92,6 +92,25 @@ const (
 	defaultUCCardNetworks = "VISA,MASTERCARD,AMEX"
 )
 
+// ucDecisionManagerEnabled dice si la sesión de Unified Checkout pide correr
+// Decision Manager Y —lo que aquí importa— el perfilado del dispositivo.
+//
+// POR DEFECTO SÍ. Es el motivo de que este campo exista: sin él, la propia
+// documentación de NeoNet dice que "Decision Manager and device fingerprinting
+// services do not run", que es justo la ceguera que estamos arreglando. Con él,
+// Unified Checkout perfila el dispositivo y mete el `fingerprintSessionId`
+// dentro del transient token, así que la huella llega a la pasarela sin que la
+// web ni nosotros tengamos que generarla.
+//
+// Se puede APAGAR con UNIFIED_CHECKOUT_DECISION_MANAGER=false. La válvula existe
+// porque encender el antifraude dentro del widget es un cambio de
+// comportamiento del lado de NeoNet que no podemos ensayar solos: si el día del
+// evento resultara que Decision Manager rechaza en la sesión del wallet, se
+// apaga con un secret y un reinicio, sin desplegar código.
+func ucDecisionManagerEnabled() bool {
+	return !strings.EqualFold(strings.TrimSpace(os.Getenv("UNIFIED_CHECKOUT_DECISION_MANAGER")), "false")
+}
+
 func ucEnvList(key, def string) []string {
 	raw := strings.TrimSpace(os.Getenv(key))
 	if raw == "" {
@@ -378,6 +397,9 @@ func PaymentsCaptureContext(c *gin.Context) {
 	}
 
 	orderNumber := services.GetString(order, "order_number")
+	// decisionManager=true es lo que hace que Unified Checkout PERFILE EL
+	// DISPOSITIVO. Ver ucDecisionManagerEnabled y CaptureContextParams.
+	decisionManager := ucDecisionManagerEnabled()
 	jwt, err := provider.CaptureContext(ctx, services.CaptureContextParams{
 		TargetOrigins:       origins,
 		Amount:              total,
@@ -389,6 +411,7 @@ func PaymentsCaptureContext(c *gin.Context) {
 		ClientVersion:       ucEnvString("UNIFIED_CHECKOUT_CLIENT_VERSION", defaultUCClientVersion),
 		ReferenceCode:       orderNumber + "-UC",
 		CompleteMandateType: completeMandate,
+		DecisionManager:     decisionManager,
 	})
 	if err != nil {
 		log.Printf("[UnifiedCheckout] no se pudo abrir la sesión order=%s: %v", orderNumber, err)
@@ -396,8 +419,8 @@ func PaymentsCaptureContext(c *gin.Context) {
 		return
 	}
 
-	log.Printf("[UnifiedCheckout] sesión abierta order=%s total=%.2f %s mandato=%s origins=%v",
-		orderNumber, total, currency, completeMandate, origins)
+	log.Printf("[UnifiedCheckout] sesión abierta order=%s total=%.2f %s mandato=%s decisionManager=%v origins=%v",
+		orderNumber, total, currency, completeMandate, decisionManager, origins)
 
 	// El JWT viaja tal cual: el SDK lo verifica y saca de dentro la URL de la
 	// librería y su hash de integridad. Importe y moneda se devuelven solo para

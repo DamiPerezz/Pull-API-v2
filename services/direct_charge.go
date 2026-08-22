@@ -26,6 +26,19 @@ type ChargeParams struct {
 	// Cuando viene informado SUSTITUYE a Card: el PAN no existe en ese flujo.
 	// Vacío = carril de tarjeta de siempre, sin ningún cambio de comportamiento.
 	TransientTokenJWT string
+
+	// Device son las señales del dispositivo del comprador (IP, User-Agent,
+	// huella) que necesita el antifraude Decision Manager para distinguir a un
+	// comprador de otro.
+	//
+	// ⚠️ APLICA A LOS DOS CARRILES, tarjeta incluida. No es una mejora del carril
+	// de wallet: las reglas de velocidad de NeoNet que rechazan pagos agrupan por
+	// IP y por huella sin mirar el medio de pago, así que un cobro con tarjeta
+	// sin estas señales es exactamente igual de ciego.
+	//
+	// Todos sus campos son opcionales y se validan en services/cybersource.go. Un
+	// ChargeParams sin Device produce el mismo cuerpo de siempre.
+	Device CybsDeviceInfo
 }
 
 // ChargeResult is the outcome of one sale.

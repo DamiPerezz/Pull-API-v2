@@ -33,7 +33,11 @@ func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { retu
 
 // captureSaleBody ejecuta un Sale() contra un transporte falso y devuelve el
 // cuerpo crudo que se habría enviado a la pasarela.
-func captureSaleBody(t *testing.T, card CybsCard, billTo CybsBillTo, capture bool, token string, respBody string) (*CybsSaleResult, []byte, string) {
+//
+// device se añadió cuando Sale() aprendió a mandar señales de dispositivo. El
+// valor CERO (CybsDeviceInfo{}) es el que reproduce el comportamiento anterior,
+// y es el que usan los tests de identidad byte a byte.
+func captureSaleBody(t *testing.T, card CybsCard, billTo CybsBillTo, capture bool, token string, device CybsDeviceInfo, respBody string) (*CybsSaleResult, []byte, string) {
 	t.Helper()
 
 	var sent []byte
@@ -52,7 +56,7 @@ func captureSaleBody(t *testing.T, card CybsCard, billTo CybsBillTo, capture boo
 		}),
 	}
 
-	res, err := cli.Sale(context.Background(), "ORD-1-VENUE", 350.75, "GTQ", card, billTo, capture, token)
+	res, err := cli.Sale(context.Background(), "ORD-1-VENUE", 350.75, "GTQ", card, billTo, capture, token, device)
 	if err != nil {
 		t.Fatalf("Sale devolvió error: %v", err)
 	}
@@ -114,28 +118,52 @@ func legacySalePayload(referenceCode string, amount float64, currency string, ca
 // Con transientToken vacío (el 100% del tráfico con el interruptor apagado) el
 // cuerpo tiene que salir idéntico al de antes del cambio, en los dos modos:
 // capture=true (público, se cobra) y capture=false (privado, se retiene).
+//
+// AMPLIADA (22-ago-2026) cuando Sale() aprendió a mandar `deviceInformation`:
+// sigue demostrando exactamente lo mismo —el cuerpo del pago con tarjeta no
+// cambió— y ahora además fija la condición que lo hace cierto: si no hay
+// señales de dispositivo VÁLIDAS, la clave `deviceInformation` NO aparece.
+// Por eso se prueban dos formas de "sin señales":
+//
+//	· el valor cero, que es lo que se manda desde cualquier llamador que no las
+//	  rellene;
+//	· un struct LLENO DE BASURA, porque un campo informado pero inválido tiene
+//	  que descartarse — si se colara, el cuerpo cambiaría y además le estaríamos
+//	  dando datos falsos al antifraude.
 func TestSaleCardBodyByteIdenticalToLegacy(t *testing.T) {
-	for _, capture := range []bool{true, false} {
-		name := "capture=false (privado, retencion)"
-		if capture {
-			name = "capture=true (publico, cobro)"
+	sinSenales := map[string]CybsDeviceInfo{
+		"sin señales (valor cero)": {},
+		"señales informadas pero TODAS inválidas": {
+			IPAddress:            "no-es-una-ip",
+			FingerprintSessionID: "corta", // < 8 caracteres
+			UserAgent:            "\x00\x01\x02",
+			AcceptHeader:         "   ",
+			Language:             "*",
+		},
+	}
+	for devName, device := range sinSenales {
+		for _, capture := range []bool{true, false} {
+			name := devName + " / capture=false (privado, retencion)"
+			if capture {
+				name = devName + " / capture=true (publico, cobro)"
+			}
+			t.Run(name, func(t *testing.T) {
+				_, sent, path := captureSaleBody(t, testCard(), testBillTo(), capture, "", device,
+					`{"id":"tx1","status":"AUTHORIZED","_links":{"capture":{"href":"/x"}}}`)
+
+				want, err := json.Marshal(legacySalePayload("ORD-1-VENUE", 350.75, "GTQ", testCard(), testBillTo(), capture))
+				if err != nil {
+					t.Fatalf("no se pudo serializar el payload de referencia: %v", err)
+				}
+
+				if path != "/pts/v2/payments" {
+					t.Fatalf("la ruta cambió: %q (esperada /pts/v2/payments)", path)
+				}
+				if string(sent) != string(want) {
+					t.Fatalf("EL CUERPO DEL PAGO CON TARJETA CAMBIÓ.\n esperado: %s\n obtenido: %s", want, sent)
+				}
+			})
 		}
-		t.Run(name, func(t *testing.T) {
-			_, sent, path := captureSaleBody(t, testCard(), testBillTo(), capture, "",
-				`{"id":"tx1","status":"AUTHORIZED","_links":{"capture":{"href":"/x"}}}`)
-
-			want, err := json.Marshal(legacySalePayload("ORD-1-VENUE", 350.75, "GTQ", testCard(), testBillTo(), capture))
-			if err != nil {
-				t.Fatalf("no se pudo serializar el payload de referencia: %v", err)
-			}
-
-			if path != "/pts/v2/payments" {
-				t.Fatalf("la ruta cambió: %q (esperada /pts/v2/payments)", path)
-			}
-			if string(sent) != string(want) {
-				t.Fatalf("EL CUERPO DEL PAGO CON TARJETA CAMBIÓ.\n esperado: %s\n obtenido: %s", want, sent)
-			}
-		})
 	}
 }
 
@@ -144,7 +172,7 @@ func TestSaleCardBodyByteIdenticalToLegacy(t *testing.T) {
 // VACÍA (la marca la sigue calculando brandFor() a partir del número, como
 // siempre). Si CardBrand se rellenara aquí, machacaría a brandFor().
 func TestSaleCardResultUnchanged(t *testing.T) {
-	res, _, _ := captureSaleBody(t, testCard(), testBillTo(), true, "",
+	res, _, _ := captureSaleBody(t, testCard(), testBillTo(), true, "", CybsDeviceInfo{},
 		`{"id":"tx1","status":"AUTHORIZED",
 		  "paymentInformation":{"card":{"suffix":"9999","type":"002"}},
 		  "_links":{"void":{"href":"/x"}}}`)
@@ -165,7 +193,7 @@ func TestSaleCardResultUnchanged(t *testing.T) {
 // rechace la petición por ambigua.
 func TestSaleTokenBodyExcludesCard(t *testing.T) {
 	token := "aaa.bbb.ccc"
-	res, sent, _ := captureSaleBody(t, testCard(), testBillTo(), false, token,
+	res, sent, _ := captureSaleBody(t, testCard(), testBillTo(), false, token, CybsDeviceInfo{},
 		`{"id":"tx1","status":"AUTHORIZED",
 		  "paymentInformation":{"tokenizedCard":{"suffix":"4242","type":"002"}},
 		  "_links":{"capture":{"href":"/x"},"authReversal":{"href":"/y"}}}`)

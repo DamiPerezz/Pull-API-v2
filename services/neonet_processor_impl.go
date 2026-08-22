@@ -57,12 +57,16 @@ func brandFor(number string) string {
 // Si params.TransientTokenJWT viene informado (Apple/Google Pay vía Unified
 // Checkout), el medio de pago es ese token y params.Card se ignora. Vacío =
 // carril de tarjeta de siempre.
+//
+// params.Device (IP, User-Agent, huella) viaja SIEMPRE que venga informado, por
+// los dos carriles: es lo que Decision Manager usa para no confundir a 200
+// compradores con un solo dispositivo.
 func (p *NeoNetProcessor) ChargeCard(ctx context.Context, params ChargeParams) (*ChargeResult, error) {
 	cli, err := p.client()
 	if err != nil {
 		return nil, err
 	}
-	sale, err := cli.Sale(ctx, params.ReferenceCode, params.Amount, params.Currency, params.Card, params.BillTo, params.Capture, params.TransientTokenJWT)
+	sale, err := cli.Sale(ctx, params.ReferenceCode, params.Amount, params.Currency, params.Card, params.BillTo, params.Capture, params.TransientTokenJWT, params.Device)
 	if err != nil {
 		return nil, err
 	}
@@ -72,6 +76,21 @@ func (p *NeoNetProcessor) ChargeCard(ctx context.Context, params ChargeParams) (
 	if sale.CardBrand != "" {
 		brand = sale.CardBrand
 	}
+
+	// El mensaje de rechazo se TRADUCE aquí, en la frontera con la pasarela, y
+	// no en cada sitio que lo enseña. Lo que sale de Cybersource viene en
+	// inglés y nombrando sus sistemas internos ("The order has been rejected by
+	// Decision Manager"), y `pay_controller` lo mandaba tal cual al navegador
+	// del comprador. Traducir en el borde garantiza que ningún camino futuro se
+	// olvide de hacerlo.
+	//
+	// El original NO se pierde: `Sale()` ya lo registra con su código en el log
+	// (`[Cybersource] sale NOT approved ... reason=...`), que es donde sirve.
+	humano := sale.ErrorMessage
+	if !sale.Success {
+		humano = DeclineMessage(sale.ErrorReason, sale.ErrorMessage)
+	}
+
 	return &ChargeResult{
 		Success:          sale.Success,
 		TransactionID:    sale.PaymentID,
@@ -79,7 +98,7 @@ func (p *NeoNetProcessor) ChargeCard(ctx context.Context, params ChargeParams) (
 		CardLast4:        sale.CardLast4,
 		CardBrand:        brand,
 		AuthorizedAmount: sale.AuthorizedAmount,
-		ErrorMessage:     sale.ErrorMessage,
+		ErrorMessage:     humano,
 		// Lo que la pasarela dice que hizo con el dinero (retener o cobrar),
 		// que el llamador contrasta con lo que pidió.
 		CaptureState:    sale.CaptureState,

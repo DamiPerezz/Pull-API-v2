@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"net/url"
 	"pull-api-v2/config"
 	"pull-api-v2/models"
@@ -96,6 +97,16 @@ func (p *MockProcessor) ChargeCard(ctx context.Context, params ChargeParams) (*C
 	b := make([]byte, 12)
 	if _, err := rand.Read(b); err != nil {
 		return nil, err
+	}
+	// SEÑALES DE DISPOSITIVO: el simulador no tiene antifraude, pero sí puede
+	// DEMOSTRAR que llegaron. Sin esto, comprobar que la IP del comprador viaja
+	// de verdad exigiría un cobro real contra NeoNet; con esto basta un pago en
+	// DEMO_MODE y mirar el log. Se imprime lo que la pasarela vería —el bloque ya
+	// validado y recortado—, no lo que se pidió mandar.
+	if dev := params.Device.payload(); dev != nil {
+		log.Printf("[MockProcessor] deviceInformation ref=%s %v", params.ReferenceCode, dev)
+	} else {
+		log.Printf("[MockProcessor] SIN señales de dispositivo ref=%s — Decision Manager las vería vacías", params.ReferenceCode)
 	}
 	last4 := "0000"
 	if n := len(params.Card.Number); n >= 4 {

@@ -844,6 +844,35 @@ func LegacyCreatePendingOrder(c *gin.Context) {
 		userID = services.GetString(user, "id")
 	}
 
+	// (definición de expirarPendientesDelComprador al final del fichero)
+
+	// UN COMPRADOR, UNA PLAZA RETENIDA. Antes de reservar otra, se caducan las
+	// órdenes que esa misma persona dejó a medias en ESTE mismo tipo de entrada.
+	//
+	// POR QUÉ: cada intento fallido reservaba una plaza y la retenía 30 minutos.
+	// Alguien a quien le rechazan la tarjeta y vuelve a empezar tres veces
+	// bloqueaba TRES plazas siendo una sola persona; el día de un evento que se
+	// llena, eso le dice "agotado" a gente que sí podía pagar. Visto en
+	// producción el 2026-08-22: 7 intentos seguidos retuvieron 7 de 10 plazas.
+	//
+	// Solo se tocan órdenes `pending` (nunca las pagadas, ni las retenidas de
+	// eventos privados, ni las confirmadas) y solo del MISMO correo y el MISMO
+	// tipo de entrada. Reintentar sobre la MISMA orden —que es lo que hace la
+	// web— no pasa por aquí, así que el comprador no pierde su plaza mientras
+	// reintenta: solo se libera lo que abandonó.
+	//
+	// Si esto falla, no se aborta la compra: se sigue y la plaza vieja caducará
+	// sola a los 30 minutos, que es el comportamiento de antes.
+	if req.UserEmail != "" {
+		liberadas, err := expirarPendientesDelComprador(ctx, venueDB, req.UserEmail, req.TicketTypeID)
+		if err != nil {
+			log.Printf("[CreatePendingOrder] no se pudieron caducar pedidos previos de %s: %v", req.UserEmail, err)
+		} else if liberadas > 0 {
+			log.Printf("[CreatePendingOrder] liberadas %d plaza(s) de pedidos abandonados por %s en ticket_type=%s",
+				liberadas, req.UserEmail, req.TicketTypeID)
+		}
+	}
+
 	// RESERVA ATÓMICA del aforo ANTES de crear la orden. La RPC hace el
 	// check+incremento de quantity_reserved en una sola sentencia Postgres →
 	// imposible sobrevender aunque N compradores lleguen a la vez. Devuelve las
@@ -2134,4 +2163,77 @@ func LegacyGetOrderDetails(c *gin.Context) {
 	// de una ruta de staff autenticada, no de esta.
 
 	c.JSON(http.StatusOK, resp)
+}
+
+// expirarPendientesDelComprador caduca las órdenes `pending` que ese mismo
+// correo dejó a medias en ese mismo tipo de entrada, y devuelve su aforo.
+// Devuelve cuántas plazas se liberaron.
+//
+// POR QUÉ EXISTE: crear una orden RESERVA la plaza de forma atómica antes de
+// cobrar, y esa reserva vive 30 minutos. Quien abandona el checkout y vuelve a
+// empezar —porque le rechazaron la tarjeta, porque se equivocó, o porque se lo
+// pensó— deja una plaza bloqueada en cada intento. Con el aforo justo, una
+// sola persona indecisa puede hacer que la web diga "agotado".
+//
+// Reproducido en producción el 2026-08-22: 7 intentos seguidos retuvieron 7 de
+// 10 plazas, todas de la misma persona.
+//
+// GARANTÍAS:
+//   - Solo toca `status = "pending"`. Nunca una compra confirmada, ni una
+//     retención de evento privado (`payment_authorized`), ni nada cobrado.
+//   - Solo del MISMO correo y el MISMO tipo de entrada. No puede afectar a
+//     otro comprador.
+//   - Claim atómico `pending → expired` en el WHERE del UPDATE: si el barrido
+//     de fondo o un pago concurrente se le adelanta, esta función no libera
+//     nada. Sin eso, dos caminos podrían devolver la misma plaza dos veces y
+//     el aforo crecería solo.
+//   - Reintentar sobre la MISMA orden (lo que hace la web) no pasa por aquí,
+//     así que nadie pierde su plaza mientras reintenta.
+func expirarPendientesDelComprador(ctx context.Context, venueDB *services.SupabaseClient, email, ticketTypeID string) (int, error) {
+	if venueDB == nil || email == "" || ticketTypeID == "" {
+		return 0, nil
+	}
+	previas, err := venueDB.QueryCtx(ctx, "orders", map[string]interface{}{
+		"select": "id,order_number,ticket_type_id,quantity",
+		"where": map[string]interface{}{
+			"status":         "pending",
+			"user_email":     email,
+			"ticket_type_id": ticketTypeID,
+		},
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	ahora := time.Now()
+	liberadas := 0
+	for _, o := range previas {
+		id := services.GetString(o, "id")
+		qty := services.GetInt(o, "quantity")
+		if id == "" || qty <= 0 {
+			continue
+		}
+		// El `status: "pending"` del WHERE es el claim: si otro proceso ya la
+		// cambió, `res` viene vacío y no se libera nada.
+		res, uerr := venueDB.UpdateCtx(ctx, "orders", map[string]interface{}{
+			"status":              "expired",
+			"cancelled_at":        ahora.Format(time.RFC3339),
+			"cancellation_reason": "Reemplazada por un pedido nuevo del mismo comprador",
+		}, map[string]interface{}{"id": id, "status": "pending"})
+		if uerr != nil || len(res) == 0 {
+			continue
+		}
+		if _, e := venueDB.CallRPC(ctx, "release_ticket_type", map[string]interface{}{
+			"p_id": ticketTypeID, "p_qty": qty,
+		}); e != nil {
+			// La orden ya quedó caducada; si el release falla, la plaza se
+			// queda retenida hasta que alguien concilie. Es recuperable, pero
+			// hay que enterarse.
+			log.Printf("[CreatePendingOrder] ALERT: no se pudo devolver el aforo de la orden %s (tt=%s qty=%d): %v",
+				services.GetString(o, "order_number"), ticketTypeID, qty, e)
+			continue
+		}
+		liberadas += qty
+	}
+	return liberadas, nil
 }

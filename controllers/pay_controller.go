@@ -6,9 +6,11 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
+	"pull-api-v2/middleware"
 	"pull-api-v2/models"
 	"pull-api-v2/services"
 
@@ -48,7 +50,29 @@ type payOrderRequest struct {
 	// Cuando viene informado, `card` se ignora por completo — en ese flujo el
 	// PAN no llega nunca al servidor. Ver unified_checkout_controller.go.
 	TransientToken string `json:"transient_token"`
-	BillTo struct {
+	// DeviceFingerprintID (OPCIONAL) es el identificador de la huella de
+	// dispositivo que haya generado el NAVEGADOR. Es el único campo de las
+	// señales de dispositivo que no podemos observar nosotros: la IP y las
+	// cabeceras las leemos de la propia petición, pero la huella la produce el
+	// script de profiling de Cybersource dentro de la página.
+	//
+	// CONTRATO CON LA WEB — cuando esté disponible:
+	//	1. La web carga el script de profiling con el `org_id` del comercio y un
+	//	   `session_id` que ELLA genera (un UUID por intento de pago).
+	//	2. Manda ese MISMO valor aquí, en `device_fingerprint_id`.
+	//	3. Aquí se valida la FORMA (LooksLikeFingerprintSessionID) y se reenvía
+	//	   como deviceInformation.fingerprintSessionId.
+	//
+	// HOY LA WEB NO LO MANDA, y es correcto que no lo haga: NeoNet todavía no nos
+	// ha dado el `org_id`, y sin él el script no perfila nada — el id viajaría
+	// apuntando a una huella inexistente. El campo se deja definido y validado
+	// para que ese día sea un cambio de una línea en la web y ninguno aquí.
+	//
+	// El carril de wallet no lo necesita: con completeMandate.decisionManager
+	// encendido, Unified Checkout perfila el dispositivo él mismo y mete la
+	// huella dentro del transient token.
+	DeviceFingerprintID string `json:"device_fingerprint_id"`
+	BillTo              struct {
 		Address1   string `json:"address1"`
 		City       string `json:"city"`
 		State      string `json:"state"`
@@ -59,6 +83,20 @@ type payOrderRequest struct {
 
 func round2(v float64) float64 {
 	return math.Round(v*100) / 100
+}
+
+// deviceSignalsEnabled dice si el cobro lleva señales de dispositivo (IP,
+// User-Agent, huella) para Decision Manager. ENCENDIDO por defecto: no mandarlas
+// es lo que dejó al antifraude decidiendo a ciegas.
+//
+// Apagar SOLO como marcha atrás de emergencia:
+//
+//	flyctl secrets set PAYMENT_DEVICE_SIGNALS=false -a pull-api-v2-prod
+//
+// Con eso el cuerpo que se le manda a la pasarela vuelve a ser exactamente el
+// de antes de este cambio.
+func deviceSignalsEnabled() bool {
+	return !strings.EqualFold(strings.TrimSpace(os.Getenv("PAYMENT_DEVICE_SIGNALS")), "false")
 }
 
 // PayOrder charges a pending order: venue share + service fee, atomically.
@@ -352,12 +390,70 @@ func PayOrder(c *gin.Context) {
 		FirstName:  firstName,
 		LastName:   lastName,
 		Email:      services.GetString(order, "user_email"),
-		Phone:      "50200000000",
+		Phone:      telefonoDelComprador(order),
 		Address1:   orDefault(req.BillTo.Address1, "Ciudad de Guatemala"),
 		Locality:   orDefault(req.BillTo.City, "Guatemala"),
 		AdminArea:  orDefault(req.BillTo.State, "GT"),
 		PostalCode: orDefault(req.BillTo.PostalCode, "01001"),
 		Country:    orDefault(req.BillTo.Country, "GT"),
+	}
+
+	// ===== SEÑALES DE DISPOSITIVO PARA DECISION MANAGER =====
+	// Hasta hoy no se mandaba NINGUNA: en el panel de Decision Manager las
+	// columnas IP Address, IP Country y Device Fingerprint salían vacías en el
+	// 100% de nuestras transacciones. El antifraude estaba decidiendo sobre
+	// pagos sin saber desde dónde ni desde qué se pagaba.
+	//
+	// ⚠️ ESTO SE APLICA A LOS DOS CARRILES, TARJETA INCLUIDA, Y ES DELIBERADO.
+	// No es una mejora del carril de wallet que se cuela en el de tarjeta por
+	// descuido: las reglas de velocidad de NeoNet —compartidas con el resto de
+	// sus comercios— agrupan por IP y por huella sin mirar el medio de pago, así
+	// que el carril que hoy cobra dinero real es justo el que está ciego. Meter
+	// esto solo en wallet no arreglaría nada de lo que se rechazó en producción.
+	//
+	// La IP sale de GetRealIP, NO de c.ClientIP(): detrás del proxy de Cloudflare
+	// esta última es la IP de SALIDA de Cloudflare, la misma para todos los
+	// compradores. Mandar esa sería peor que no mandar ninguna — le estaríamos
+	// diciendo al antifraude que las 200 compras de la noche del evento salen de
+	// una sola máquina, que es exactamente el patrón que sus reglas de velocidad
+	// buscan para rechazar. GetRealIP valida la cabecera del proxy con un secreto
+	// compartido, así que tampoco es falsificable desde fuera.
+	//
+	// VÁLVULA DE EMERGENCIA: PAYMENT_DEVICE_SIGNALS=false deja el struct a cero y
+	// con él el cuerpo del cobro vuelve a ser byte a byte el de antes de este
+	// cambio (lo fija TestSaleCardBodyByteIdenticalToLegacy con el valor cero).
+	// Existe por un riesgo concreto: mandar la IP puede ACTIVAR reglas de
+	// Decision Manager que hasta ahora no podían dispararse porque el dato no
+	// llegaba —una regla de país de IP, por ejemplo, con compradores usando VPN—.
+	// Si eso apareciera la noche del evento, se apaga con un secret y un
+	// reinicio, sin desplegar código y sin tocar el carril del dinero.
+	// Encendido por defecto: la ceguera actual es el problema que se está
+	// arreglando, no el estado seguro.
+	device := services.CybsDeviceInfo{}
+	if deviceSignalsEnabled() {
+		device = services.CybsDeviceInfo{
+			IPAddress:    middleware.GetRealIP(c),
+			UserAgent:    c.GetHeader("User-Agent"),
+			AcceptHeader: c.GetHeader("Accept"),
+			Language:     c.GetHeader("Accept-Language"),
+		}
+	}
+	// La huella la manda la web (ver payOrderRequest.DeviceFingerprintID). Se
+	// comprueba la FORMA antes de reenviarla: este valor lo escribe el navegador
+	// y no vamos a usar la pasarela como eco de cualquier cadena.
+	//
+	// Si viene MALFORMADA se DESCARTA y se avisa, en vez de responder 400 como se
+	// hace con el transient token. La diferencia es a propósito: sin token no hay
+	// medio de pago y el cobro no puede seguir, pero la huella es una señal
+	// auxiliar del antifraude. Tumbar una compra real la noche del evento porque
+	// un script cacheado mandó un id raro sería peor que la ceguera que estamos
+	// arreglando. Lo que NO se hace en ningún caso es reenviarla sin validar.
+	if fp := strings.TrimSpace(req.DeviceFingerprintID); fp != "" && deviceSignalsEnabled() {
+		if services.LooksLikeFingerprintSessionID(fp) {
+			device.FingerprintSessionID = fp
+		} else {
+			log.Printf("[PayOrder] huella de dispositivo con forma inválida (descartada) order=%s len=%d", req.OrderID, len(fp))
+		}
 	}
 
 	orderNumber := services.GetString(order, "order_number")
@@ -407,6 +503,8 @@ func PayOrder(c *gin.Context) {
 		// Vacío en el carril de tarjeta: el cuerpo que se manda a la pasarela
 		// es entonces idéntico al de siempre.
 		TransientTokenJWT: transientToken,
+		// Señales de dispositivo: van por los DOS carriles. Ver arriba.
+		Device: device,
 	})
 	if err != nil {
 		log.Printf("[PayOrder] charge1 error order=%s: %v", orderNumber, err)
@@ -840,6 +938,60 @@ func orDefault(v, def string) string {
 		return def
 	}
 	return v
+}
+
+// telefonoDelComprador saca el teléfono REAL de quien está pagando.
+//
+// Hasta el 2026-08-22 aquí había un literal: "50200000000". O sea 502 (el
+// prefijo de Guatemala) seguido de ocho ceros. TODAS las transacciones de
+// Pull, de todos los venues y de todos los compradores, llegaban a
+// Cybersource con ese mismo número de teléfono inventado.
+//
+// Eso no es un detalle cosmético del panel, es munición para el antifraude:
+//
+//   - Las reglas de velocidad de NeoNet agrupan por dato repetido. Ya sabemos
+//     que una salta con "mismo email > 8 en 3 meses". Si existe la gemela por
+//     teléfono —y con 150 reglas activas es lo más probable— nuestras compras
+//     la revientan por definición: comparten el número las 200.
+//   - Un teléfono acabado en ocho ceros es, por sí solo, un patrón de datos
+//     falsos. Es exactamente lo que un filtro de fraude busca.
+//
+// El teléfono de verdad SÍ lo tenemos: el formulario de la web lo exige y
+// viaja en metadata.tickets_data[0] (owner_phone + owner_phone_prefix). El
+// comprador es siempre el primer asistente. Solo había que leerlo.
+//
+// Si por lo que sea no está, se devuelve "" y `Sale()` omite la clave: mandar
+// un teléfono vacío es honesto, mandar uno falso compartido por todos es lo
+// que nos estaba haciendo daño.
+func telefonoDelComprador(order map[string]interface{}) string {
+	md, ok := order["metadata"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	raw, ok := md["tickets_data"].([]interface{})
+	if !ok || len(raw) == 0 {
+		return ""
+	}
+	primero, ok := raw[0].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	numero := strings.TrimSpace(services.GetString(primero, "owner_phone"))
+	if numero == "" {
+		return ""
+	}
+	prefijo := strings.TrimSpace(services.GetString(primero, "owner_phone_prefix"))
+
+	// Cybersource quiere dígitos. El prefijo llega como "+502" y el número
+	// puede traer espacios o guiones de cómo lo escribió la persona.
+	junto := prefijo + numero
+	var b strings.Builder
+	for _, r := range junto {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // claimHeldOrder atomically claims a held (payment_authorized) order for
