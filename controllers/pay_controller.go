@@ -421,11 +421,23 @@ func PayOrder(c *gin.Context) {
 	// menos → se trata como rechazo y se libera lo retenido.
 	venuePartial := charge1.Success && charge1.AuthorizedAmount > 0 && charge1.AuthorizedAmount < chargeAmount-0.005
 	if !charge1.Success || venuePartial {
-		if charge1.TransactionID != "" {
+		// SOLO se reversa la autorización PARCIAL. En un rechazo liso no hay
+		// nada que liberar —la pasarela no llegó a autorizar— y pedir la
+		// reversa devolvía `INVALID_REQUEST`, que se registraba como ALERT.
+		//
+		// Parecía inofensivo y no lo es: cada tarjeta rechazada dejaba una
+		// alerta falsa en los logs y una llamada de más a la pasarela. El día
+		// del evento, con rechazos normales de tarjeta, esas alertas falsas
+		// enterrarían a las de verdad — que son las que avisan de dinero
+		// atrapado. Una alerta que salta cuando no pasa nada acaba ignorándose.
+		//
+		// Visto en producción el 2026-08-22 con los rechazos de Decision
+		// Manager (`DECISION_PROFILE_REJECT`).
+		if venuePartial && charge1.TransactionID != "" {
 			rbCtx, rbCancel := context.WithTimeout(context.Background(), 25*time.Second)
 			defer rbCancel()
 			if revErr := charger.ReverseCharge(rbCtx, charge1.TransactionID, orderNumber+"-VENUE-PARB", chargeAmount, currency); revErr != nil {
-				log.Printf("[PayOrder] ALERT: venue partial/declined reversal failed order=%s tx=%s: %v", orderNumber, charge1.TransactionID, revErr)
+				log.Printf("[PayOrder] ALERT: liberación de autorización PARCIAL fallida order=%s tx=%s: %v — puede haber importe retenido en la tarjeta del comprador", orderNumber, charge1.TransactionID, revErr)
 			}
 		}
 		recordDeclinedAttempt()
