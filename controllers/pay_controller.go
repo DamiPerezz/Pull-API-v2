@@ -43,6 +43,11 @@ type payOrderRequest struct {
 		ExpYear  string `json:"exp_year"`
 		CVV      string `json:"cvv"`
 	} `json:"card"`
+	// ALTERNATIVA a `card` (Unified Checkout: Apple Pay / Google Pay). Es el
+	// "transient token" de un solo uso que devuelve el SDK en el navegador.
+	// Cuando viene informado, `card` se ignora por completo — en ese flujo el
+	// PAN no llega nunca al servidor. Ver unified_checkout_controller.go.
+	TransientToken string `json:"transient_token"`
 	BillTo struct {
 		Address1   string `json:"address1"`
 		City       string `json:"city"`
@@ -72,6 +77,27 @@ func PayOrder(c *gin.Context) {
 		return
 	}
 
+	// WALLET (Unified Checkout) vs TARJETA. Son excluyentes: si llega token, la
+	// tarjeta ni se mira. Con el interruptor apagado el token se rechaza y el
+	// handler se comporta exactamente igual que antes de que esto existiera.
+	transientToken := strings.TrimSpace(req.TransientToken)
+	if transientToken != "" {
+		if !unifiedCheckoutEnabled() {
+			c.JSON(http.StatusNotImplemented, gin.H{
+				"error":   "Unified Checkout no está habilitado en este entorno.",
+				"enabled": false,
+			})
+			return
+		}
+		// El token es un JWT emitido por Cybersource. Comprobar la FORMA antes
+		// de reenviarlo evita usar la pasarela como eco de cualquier cadena que
+		// nos manden.
+		if !services.LooksLikeJWT(transientToken) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Token de pago inválido"})
+			return
+		}
+	}
+
 	// Never log or echo card data anywhere in this handler.
 	card := services.CybsCard{
 		Number:       strings.ReplaceAll(req.Card.Number, " ", ""),
@@ -79,12 +105,28 @@ func PayOrder(c *gin.Context) {
 		ExpYear:      req.Card.ExpYear,
 		SecurityCode: req.Card.CVV,
 	}
-	if len(card.Number) < 12 || card.ExpMonth == "" || card.ExpYear == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Datos de tarjeta incompletos"})
-		return
+	if transientToken == "" {
+		// --- CARRIL DE TARJETA: intacto, línea por línea ---
+		if len(card.Number) < 12 || card.ExpMonth == "" || card.ExpYear == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Datos de tarjeta incompletos"})
+			return
+		}
+		if len(card.ExpYear) == 2 {
+			card.ExpYear = "20" + card.ExpYear
+		}
+	} else {
+		// Con wallet no hay tarjeta que mandar: se vacía por si el navegador
+		// mandó ambos campos, para que no viaje un PAN a la pasarela junto al
+		// token (Cybersource rechazaría la petición) ni quede en memoria.
+		card = services.CybsCard{}
 	}
-	if len(card.ExpYear) == 2 {
-		card.ExpYear = "20" + card.ExpYear
+
+	// Etiqueta para los logs de intentos. Con tarjeta es el hash del PAN; con
+	// wallet no hay PAN, y publicar el hash de la cadena vacía (que sería el
+	// mismo para todos) solo confundiría al leer los logs.
+	attemptLabel := cardAttemptKey(card.Number)
+	if transientToken != "" {
+		attemptLabel = "wallet"
 	}
 
 	// Anti-carding: CAPTCHA (si está activado) y límite por tarjeta, antes de
@@ -93,10 +135,18 @@ func PayOrder(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Verificación de seguridad fallida. Recarga la página."})
 		return
 	}
-	if !allowCardAttempt(cardAttemptKey(card.Number)) {
-		log.Printf("[PayOrder] card attempt limit hit cardkey=%s", cardAttemptKey(card.Number))
-		c.JSON(http.StatusTooManyRequests, gin.H{"error": "Demasiados intentos con esta tarjeta. Espera unos minutos."})
-		return
+	// El tope por HASH DE PAN no aplica al wallet: no hay PAN que hashear, y
+	// aplicarlo sobre la cadena vacía metería TODOS los pagos con wallet en el
+	// mismo cubo, tumbando compradores legítimos en cuanto hubiera 10 seguidos.
+	// El tope POR ORDEN (más abajo) sí sigue aplicando, que es el que de verdad
+	// impide usar esto como oráculo de tarjetas. Además, con wallet el medio de
+	// pago lo autentica Apple/Google: no se puede iterar sobre tarjetas ajenas.
+	if transientToken == "" {
+		if !allowCardAttempt(cardAttemptKey(card.Number)) {
+			log.Printf("[PayOrder] card attempt limit hit cardkey=%s", cardAttemptKey(card.Number))
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": "Demasiados intentos con esta tarjeta. Espera unos minutos."})
+			return
+		}
 	}
 
 	// Resolve venue: explicit id > slug > first active (single-venue deploys).
@@ -132,6 +182,13 @@ func PayOrder(c *gin.Context) {
 	// event) needs staff approval before charging. For those we AUTHORIZE only
 	// (hold the funds) and settle on approval / reverse on rejection. Public
 	// events capture immediately.
+	//
+	// ⚠️ orderRequiresApproval() (unified_checkout_controller.go) hace ESTA
+	// MISMA lectura para declarar el completeMandate de la sesión de wallet
+	// (CAPTURE en público, AUTH en privado). Las dos tienen que decir lo mismo:
+	// si divergen, la sesión y el cobro estarían hablando de operaciones
+	// distintas sobre el mismo dinero. Si cambian aquí las columnas que definen
+	// "privado", hay que cambiarlas allí también.
 	needsApproval := false
 	if eventID := services.GetString(order, "event_id"); eventID != "" {
 		if ev, _ := venueDB.QueryOne(ctx, "events", map[string]interface{}{
@@ -141,6 +198,26 @@ func PayOrder(c *gin.Context) {
 			needsApproval = services.GetBool(ev, "is_private") || services.GetBool(ev, "require_approval")
 		}
 	}
+
+	// WALLET + EVENTO PRIVADO = SÍ (agosto 2026). Aquí había un rechazo: el
+	// wallet solo se aceptaba en eventos de compra directa, porque no estaba
+	// confirmado que una retención de 48 h se pudiera capturar sobre un pago
+	// con Apple/Google Pay. Ya lo está:
+	//
+	//	· La doc de NeoNet (Payments Developer Guide — REST API, Visa Platform
+	//	  Connect, pág. 36) da completeMandate.type = AUTH, "Authorize the
+	//	  payment and capture the funds at a later date", y la pág. 31 el
+	//	  ejemplo de autorización CON transient token.
+	//	· La retención de 48 h ya está probada contra NeoNet y bancos
+	//	  guatemaltecos por el carril de tarjeta.
+	//	· Apple Pay y Google Pay son tarjetas (pág. 84): mismo carril, mismos
+	//	  parámetros, solo cambia que el PAN llega tokenizado.
+	//
+	// El `capture` de abajo sigue saliendo del EVENTO, no del medio de pago:
+	// el token sustituye a la tarjeta dentro de los mismos parámetros. Y lo que
+	// la pasarela conteste NO se da por bueno — ver el guard de verificación
+	// después del cobro.
+
 	status := services.GetString(order, "status")
 	if status == "confirmed" {
 		c.JSON(http.StatusOK, gin.H{"success": true, "message": "Order already confirmed",
@@ -170,6 +247,12 @@ func PayOrder(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Código de pago inválido para esta orden."})
 		return
 	}
+	// TOPE POR ORDEN. Aplica igual con tarjeta que con wallet: se cuenta sobre
+	// la orden, no sobre el medio de pago. Es el único tope que le queda al
+	// carril de wallet (el de hash de PAN no puede aplicarse: no hay PAN), y el
+	// que de verdad impide usar esto como oráculo de tarjetas. El contador lo
+	// incrementa recordDeclinedAttempt, que se llama en TODA declinada, venga
+	// del carril que venga.
 	priorAttempts := services.GetInt(orderMeta, "payment_attempts")
 	if priorAttempts >= maxAttemptsPerOrder {
 		c.JSON(http.StatusTooManyRequests, gin.H{"error": "Demasiados intentos de pago para esta orden. Crea una nueva."})
@@ -188,7 +271,7 @@ func PayOrder(c *gin.Context) {
 			"status":   "pending",
 		}, map[string]interface{}{"id": req.OrderID})
 		log.Printf("[PayOrder] DECLINED order=%s attempts=%d cardkey=%s",
-			services.GetString(order, "order_number"), priorAttempts, cardAttemptKey(card.Number))
+			services.GetString(order, "order_number"), priorAttempts, attemptLabel)
 	}
 
 	total := services.GetFloat64(order, "total")
@@ -321,6 +404,9 @@ func PayOrder(c *gin.Context) {
 		Card:          card,
 		BillTo:        billTo,
 		Capture:       capture,
+		// Vacío en el carril de tarjeta: el cuerpo que se manda a la pasarela
+		// es entonces idéntico al de siempre.
+		TransientTokenJWT: transientToken,
 	})
 	if err != nil {
 		log.Printf("[PayOrder] charge1 error order=%s: %v", orderNumber, err)
@@ -349,6 +435,44 @@ func PayOrder(c *gin.Context) {
 		}
 		c.JSON(http.StatusPaymentRequired, gin.H{"error": msg, "declined": true})
 		return
+	}
+
+	// ===== GUARD: ¿DE VERDAD QUEDÓ RETENIDO? =====
+	// Pedir capture=false NO garantiza que el dinero se quede retenido. Un
+	// perfil de merchant configurado como venta forzada, un cambio del lado de
+	// NeoNet, o un wallet que complete la sesión con otro mandato, pueden
+	// liquidar el cobro igualmente. Hasta ahora dábamos por hecho que la
+	// pasarela obedecía y anotábamos `captured` = lo que PEDIMOS.
+	//
+	// El daño de equivocarse ahí es silencioso y caro: con la orden marcada
+	// "retenida" pero el dinero ya cobrado, al aprobar se intentaría capturar
+	// algo ya capturado y al rechazar se reversaría una venta liquidada (que en
+	// Cybersource no hace nada). El comprador se queda cobrado y sin entrada, y
+	// nadie se entera.
+	//
+	// Así que se COMPRUEBA en la respuesta y se anota lo que PASÓ. Lo que NO se
+	// hace es fallar el pago: el dinero ya se movió, y devolver un error aquí
+	// dejaría al comprador cobrado, sin entrada y creyendo que no pagó.
+	// Registrar la verdad es lo correcto — con ella, aprobar no recaptura de
+	// más y rechazar DEVUELVE en vez de reversar en balde.
+	captured := capture
+	captureUnrequested := false
+	if !capture {
+		switch charge1.CaptureState {
+		case services.CybsCaptureHeld:
+			// Retención verificada. Camino normal, nada que anotar aparte.
+		case services.CybsCaptureSettled:
+			captured = true
+			captureUnrequested = true
+			log.Printf("[PayOrder] ALERTA — COBRO NO PEDIDO order=%s tx=%s: se pidió RETENER %.2f %s y la pasarela LIQUIDÓ el cobro (%s). La orden se anota como COBRADA: al aprobar no se recapturará, y al rechazar se DEVOLVERÁ el dinero.",
+				orderNumber, charge1.TransactionID, chargeAmount, currency, charge1.CaptureEvidence)
+		default:
+			// Sin señal fiable. Nos quedamos con lo pedido —es exactamente lo
+			// que hacía este código antes del guard— pero dejando rastro para
+			// poder conciliarlo contra el Business Center.
+			log.Printf("[PayOrder] retención SIN VERIFICAR order=%s tx=%s (%s) — se anota captured=false; si en el Business Center aparece liquidada, corregir la orden a mano",
+				orderNumber, charge1.TransactionID, charge1.CaptureEvidence)
+		}
 	}
 
 	// (Aquí iba la SEGUNDA transacción, la del fee, con su rollback: si el
@@ -393,7 +517,33 @@ func PayOrder(c *gin.Context) {
 		"fee_transaction":   feeTxID, // siempre "" desde el cobro único
 		"gateway":           gatewayName,
 		"fee_gateway_venue": "", // una sola cuenta: la del venue
-		"captured":          capture, // false = funds held, awaiting approval
+		// `captured` = lo que PASÓ, no lo que se pidió (ver el guard de arriba).
+		// De esta clave dependen los carriles de aprobar (capturar o no) y
+		// rechazar (reversar o devolver), así que tiene que ser la verdad.
+		"captured": captured,
+	}
+	// Auditoría del guard. Solo en las órdenes donde se pidió RETENER: las de
+	// compra directa no ganan ninguna clave nueva y su metadata queda idéntica
+	// a la de siempre.
+	if !capture {
+		if split, ok := metadata["payment_split"].(map[string]interface{}); ok {
+			split["capture_requested"] = false
+			split["capture_verified"] = string(charge1.CaptureState) // held | settled | unknown
+			split["capture_evidence"] = charge1.CaptureEvidence
+			if captureUnrequested {
+				// MARCA EXPLÍCITA de "se cobró sin haberlo pedido". Es la que
+				// hace que el rechazo DEVUELVA el dinero en vez de no hacer
+				// nada: una orden capturada por la vía normal (aprobación del
+				// local) no la lleva, y su rechazo sigue bloqueado como antes.
+				split["capture_unrequested"] = true
+			}
+		}
+	}
+	// Trazabilidad: por dónde entró el pago. Solo se anota en el carril de
+	// wallet — las órdenes pagadas con tarjeta siguen sin esta clave, como
+	// todas las anteriores, y nada la exige.
+	if transientToken != "" {
+		metadata["checkout_mode"] = "unified_checkout"
 	}
 
 	// --- PRIVATE: funds are HELD. Leave the order awaiting staff approval,
@@ -414,18 +564,28 @@ func PayOrder(c *gin.Context) {
 			"payment_gateway": gatewayName,
 			"metadata":        metadata,
 		}, map[string]interface{}{"id": req.OrderID}); err != nil {
-			log.Printf("[PayOrder] ALERT: hold persist FAILED order=%s venueTx=%s feeTx=%s: %v — reversing",
-				orderNumber, charge1.TransactionID, feeTxID, err)
+			log.Printf("[PayOrder] ALERT: hold persist FAILED order=%s venueTx=%s feeTx=%s captured=%v: %v — deshaciendo",
+				orderNumber, charge1.TransactionID, feeTxID, captured, err)
 			rbCtx, rbCancel := context.WithTimeout(context.Background(), 25*time.Second)
 			defer rbCancel()
-			if revErr := charger.ReverseCharge(rbCtx, charge1.TransactionID, orderNumber+"-VENUE-RB", chargeAmount, currency); revErr != nil {
-				log.Printf("[PayOrder] ALERT: hold reversal ALSO failed order=%s tx=%s: %v", orderNumber, charge1.TransactionID, revErr)
+			// Deshacer POR EL CAMINO QUE CORRESPONDA: si la pasarela liquidó el
+			// cobro pese al capture=false, un authReversal no hace nada y el
+			// comprador se quedaría cobrado — ahí toca REEMBOLSO.
+			if revErr := undoVenueCharge(rbCtx, charger, captured, charge1.TransactionID, orderNumber+"-VENUE-RB", chargeAmount, currency); revErr != nil {
+				log.Printf("[PayOrder] ALERT: hold undo ALSO failed order=%s tx=%s captured=%v: %v", orderNumber, charge1.TransactionID, captured, revErr)
 			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "No se pudo registrar el pago. No se ha realizado ningún cargo — intenta de nuevo."})
 			return
 		}
-		log.Printf("[PayOrder] RETENIDO (pendiente de aprobación) order=%s total=%.2f (fee incluido %.2f) %s deadline=%s",
-			orderNumber, chargeAmount, feeIncluded, currency, deadline.Format(time.RFC3339))
+		// El texto dice lo que pasó con el dinero, no lo que se pidió: si la
+		// pasarela liquidó pese al capture=false, poner "RETENIDO" en el log
+		// mandaría a conciliar por el camino equivocado.
+		estado := "RETENIDO"
+		if captured {
+			estado = "COBRADO (la pasarela no retuvo — ver ALERTA arriba)"
+		}
+		log.Printf("[PayOrder] %s (pendiente de aprobación) order=%s total=%.2f (fee incluido %.2f) %s deadline=%s",
+			estado, orderNumber, chargeAmount, feeIncluded, currency, deadline.Format(time.RFC3339))
 
 		// Notify staff (push) + email the buyer the "pending approval" notice
 		// (NO ticket/QR yet — that only goes out on approval).
@@ -522,6 +682,13 @@ func captureHeldOrder(ctx context.Context, venueID string, order map[string]inte
 	if venueTx == "" {
 		return "", notHeld
 	}
+	// Ya capturada: o es un approve reintentado, o el guard de PayOrder detectó
+	// que la pasarela liquidó el cobro sin habérselo pedido
+	// (`capture_unrequested`). En los dos casos NO hay que volver a capturar
+	// —sería un segundo cobro— y el camino correcto es el mismo: registrar la
+	// sesión y emitir las entradas, que es justo lo que el local acaba de
+	// aprobar.
+	//
 	// Already captured (e.g. a retried approve) — nothing to settle, but the
 	// session MUST re-registrarse en el mapa en memoria: es por-máquina y
 	// por-proceso, y ConfirmPayment lo consume (LoadAndDelete). Sin esto un
@@ -574,7 +741,11 @@ func captureHeldOrder(ctx context.Context, venueID string, order map[string]inte
 }
 
 // reverseHeldOrder releases the two held authorizations of a private-event
-// order (on staff rejection). Returns (held, released): held=false si no hay
+// order (on staff rejection). Si el guard de PayOrder detectó que la pasarela
+// COBRÓ pese a habérsele pedido retención (`capture_unrequested`), deshace por
+// REEMBOLSO en vez de por reversa — ver dentro.
+//
+// Returns (held, released): held=false si no hay
 // autorizaciones que liberar; released=false si ALGUNA reversa falló en la
 // pasarela (queda released_ok=false en metadata y ALERT en logs — la
 // autorización caducará sola del lado del emisor, pero no digas "liberada").
@@ -584,8 +755,20 @@ func reverseHeldOrder(ctx context.Context, venueID string, order map[string]inte
 	if split == nil || services.GetString(split, "gateway") != "neonet" {
 		return false, false
 	}
-	// If already captured, a reversal won't work — would need a refund.
-	if captured, _ := split["captured"].(bool); captured {
+	// Ya capturada: una reversa no sirve, haría falta un reembolso.
+	//
+	// EXCEPCIÓN — `capture_unrequested`: la orden pidió RETENER y la pasarela
+	// liquidó el cobro igualmente (lo detecta el guard de PayOrder). Ahí el
+	// dinero salió de la cuenta del comprador sin que nadie lo aprobara, así
+	// que rechazar SÍ tiene que deshacerlo, y la forma correcta es un
+	// REEMBOLSO. Sin esta rama el rechazo se retiraba en silencio y el
+	// comprador se quedaba cobrado y sin entrada.
+	//
+	// Las órdenes capturadas por la vía normal (el local aprobó) NO llevan esa
+	// marca: para ellas el comportamiento es exactamente el de siempre.
+	alreadyCaptured, _ := split["captured"].(bool)
+	unrequested, _ := split["capture_unrequested"].(bool)
+	if alreadyCaptured && !unrequested {
 		return false, false
 	}
 	venueTx := services.GetString(split, "venue_transaction")
@@ -606,9 +789,17 @@ func reverseHeldOrder(ctx context.Context, venueID string, order map[string]inte
 		currency = "GTQ"
 	}
 	released = true
-	if err := charger.ReverseCharge(ctx, venueTx, orderNumber+"-VENUE-REL", services.GetFloat64(split, "venue_amount"), currency); err != nil {
-		log.Printf("[Reject] venue auth reversal failed order=%s: %v", orderNumber, err)
+	// undoVenueCharge elige reversa o REEMBOLSO según cómo quedó el dinero de
+	// verdad: `alreadyCaptured` aquí solo puede ser true en el caso
+	// `capture_unrequested` (cobro que la pasarela liquidó sin pedírselo).
+	if err := undoVenueCharge(ctx, charger, alreadyCaptured, venueTx, orderNumber+"-VENUE-REL", services.GetFloat64(split, "venue_amount"), currency); err != nil {
+		log.Printf("[Reject] venue undo failed (captured=%v) order=%s: %v", alreadyCaptured, orderNumber, err)
 		released = false
+	} else if alreadyCaptured {
+		// Deja constancia de que esto fue una DEVOLUCIÓN, no una liberación de
+		// retención: en el extracto del comprador se ve distinto y tarda días.
+		split["refunded_unrequested_capture"] = true
+		log.Printf("[Reject] REEMBOLSADO (la pasarela había cobrado pese a la retención) order=%s tx=%s", orderNumber, venueTx)
 	}
 	if feeTx := services.GetString(split, "fee_transaction"); feeTx != "" {
 		if err := feeChargerForSplit(ctx, venueID, split, charger).ReverseCharge(ctx, feeTx, orderNumber+"-FEE-REL", services.GetFloat64(split, "fee_amount"), currency); err != nil {

@@ -104,12 +104,22 @@ func (p *MockProcessor) ChargeCard(ctx context.Context, params ChargeParams) (*C
 	if last4 == "0002" {
 		return &ChargeResult{Success: false, ErrorMessage: "Tarjeta rechazada (simulación)"}, nil
 	}
+	// El mock hace EXACTAMENTE lo que se le pide, así que puede afirmarlo: con
+	// Capture=false el dinero queda "retenido" y con true, "cobrado". Sin esto
+	// DEMO_MODE saldría como "no verificado" en cada compra y llenaría los logs
+	// de una alerta que en la demo no significa nada.
+	state := CybsCaptureSettled
+	if !params.Capture {
+		state = CybsCaptureHeld
+	}
 	return &ChargeResult{
-		Success:       true,
-		TransactionID: "mock_charge_" + hex.EncodeToString(b),
-		AuthCode:      "DEMO-" + hex.EncodeToString(b[:3]),
-		CardLast4:     last4,
-		CardBrand:     "demo",
+		Success:         true,
+		TransactionID:   "mock_charge_" + hex.EncodeToString(b),
+		AuthCode:        "DEMO-" + hex.EncodeToString(b[:3]),
+		CardLast4:       last4,
+		CardBrand:       "demo",
+		CaptureState:    state,
+		CaptureEvidence: "mock: el simulador obedece lo pedido",
 	}, nil
 }
 

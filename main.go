@@ -784,6 +784,16 @@ func setupLegacyRoutes(v1 *gin.RouterGroup) {
 	}
 	// Direct-card payment (NeoNet/Cybersource): two atomic sales per purchase.
 	v1.POST("/orders/pay", middleware.RateLimitPayment(), controllers.PayOrder)
+	// Unified Checkout (Apple Pay / Google Pay). Abre la sesión firmada que
+	// necesita el SDK del navegador; el cobro sigue saliendo por /orders/pay,
+	// con `transient_token` en lugar de `card`.
+	// Públicos Y privados: la sesión declara completeMandate CAPTURE (cobro al
+	// momento) o AUTH (retención de 48 h) según el evento, y después del cobro
+	// se VERIFICA que la pasarela hiciera lo pedido. SOLO con
+	// UNIFIED_CHECKOUT_ENABLED=true: sin el interruptor responde 501 y no toca
+	// la pasarela. Se registra siempre para que encenderlo sea cambiar un
+	// secreto, no desplegar código.
+	v1.POST("/payments/capture-context", middleware.RateLimitPayment(), controllers.PaymentsCaptureContext)
 	// SmartFields (checkout transparente de dLocal): la ÚNICA vía con tarjeta
 	// en Guatemala — el checkout alojado solo ofrece efectivo allí.
 	// La tarjeta se tokeniza en el navegador; aquí solo llega un cardToken.

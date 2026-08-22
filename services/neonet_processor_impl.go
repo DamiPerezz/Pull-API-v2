@@ -53,24 +53,48 @@ func brandFor(number string) string {
 }
 
 // ChargeCard performs one Cybersource sale (auth+capture).
+//
+// Si params.TransientTokenJWT viene informado (Apple/Google Pay vía Unified
+// Checkout), el medio de pago es ese token y params.Card se ignora. Vacío =
+// carril de tarjeta de siempre.
 func (p *NeoNetProcessor) ChargeCard(ctx context.Context, params ChargeParams) (*ChargeResult, error) {
 	cli, err := p.client()
 	if err != nil {
 		return nil, err
 	}
-	sale, err := cli.Sale(ctx, params.ReferenceCode, params.Amount, params.Currency, params.Card, params.BillTo, params.Capture)
+	sale, err := cli.Sale(ctx, params.ReferenceCode, params.Amount, params.Currency, params.Card, params.BillTo, params.Capture, params.TransientTokenJWT)
 	if err != nil {
 		return nil, err
+	}
+	// La marca sale del número cuando hay número. Con token no lo hay, así que
+	// se usa la que devolvió la pasarela (brandFor("") daría "card").
+	brand := brandFor(params.Card.Number)
+	if sale.CardBrand != "" {
+		brand = sale.CardBrand
 	}
 	return &ChargeResult{
 		Success:          sale.Success,
 		TransactionID:    sale.PaymentID,
 		AuthCode:         sale.AuthCode,
 		CardLast4:        sale.CardLast4,
-		CardBrand:        brandFor(params.Card.Number),
+		CardBrand:        brand,
 		AuthorizedAmount: sale.AuthorizedAmount,
 		ErrorMessage:     sale.ErrorMessage,
+		// Lo que la pasarela dice que hizo con el dinero (retener o cobrar),
+		// que el llamador contrasta con lo que pidió.
+		CaptureState:    sale.CaptureState,
+		CaptureEvidence: sale.CaptureEvidence,
 	}, nil
+}
+
+// CaptureContext abre una sesión de Unified Checkout con las credenciales del
+// venue. Implementa UnifiedCheckoutProvider.
+func (p *NeoNetProcessor) CaptureContext(ctx context.Context, params CaptureContextParams) (string, error) {
+	cli, err := p.client()
+	if err != nil {
+		return "", err
+	}
+	return cli.CaptureContext(ctx, params)
 }
 
 // CapturePayment settles a held authorization (private-event approval).

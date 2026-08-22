@@ -20,6 +20,12 @@ type ChargeParams struct {
 	Card          CybsCard
 	BillTo        CybsBillTo
 	Capture       bool
+
+	// TransientTokenJWT (OPCIONAL) es el token de un solo uso que devuelve
+	// Unified Checkout cuando el comprador paga con Apple Pay o Google Pay.
+	// Cuando viene informado SUSTITUYE a Card: el PAN no existe en ese flujo.
+	// Vacío = carril de tarjeta de siempre, sin ningún cambio de comportamiento.
+	TransientTokenJWT string
 }
 
 // ChargeResult is the outcome of one sale.
@@ -31,6 +37,31 @@ type ChargeResult struct {
 	CardBrand        string
 	AuthorizedAmount float64 // < Amount pedido si la autorización fue parcial
 	ErrorMessage     string
+
+	// CaptureState es lo que la PASARELA dice que pasó con el dinero, que no
+	// tiene por qué coincidir con el Capture que se pidió:
+	//
+	//	CybsCaptureHeld    → autorizado y sin cobrar (se puede capturar/reversar)
+	//	CybsCaptureSettled → ya cobrado (deshacerlo exige REEMBOLSO)
+	//	CybsCaptureUnknown → la respuesta no lo dice; quédate con lo que pediste
+	//
+	// Existe porque en una retención de evento privado la diferencia decide si
+	// al aprobar hay que capturar o no, y si al rechazar hay que reversar o
+	// devolver. Ver captureStateFromResponse en cybersource.go.
+	CaptureState CybsCaptureState
+	// CaptureEvidence: la señal concreta que dio ese veredicto, para logs.
+	CaptureEvidence string
+}
+
+// UnifiedCheckoutProvider lo implementan las pasarelas capaces de abrir una
+// sesión de Unified Checkout (los botones de Apple Pay / Google Pay). Va
+// aparte de DirectCardCharger a propósito: una pasarela puede saber cobrar una
+// tarjeta y no ofrecer wallets, y el controlador tiene que poder distinguirlo
+// para responder algo útil en vez de un 500.
+type UnifiedCheckoutProvider interface {
+	// CaptureContext devuelve el JWT de sesión que consume el SDK del
+	// navegador. Es texto plano: se devuelve tal cual, sin reserializar.
+	CaptureContext(ctx context.Context, params CaptureContextParams) (string, error)
 }
 
 // DirectCardCharger is implemented by processors that can charge a raw card.
