@@ -7,6 +7,7 @@ import (
 	"pull-api-v2/services"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -1400,15 +1401,30 @@ func GetSalesByPeriod(c *gin.Context) {
 	//     (pending|processing|confirmed|payment_authorized|payment_failed|
 	//     checked_in|cancelled|refunded|expired). El estado pagado es
 	//     "confirmed", que es el que escribe order_controller.go al cobrar.
+	// event_id opcional: sin él, la serie es de TODO el local; con él, la curva
+	// de venta de un evento concreto, que es lo que de verdad mira la dueña
+	// ("¿voy a llenar?"). Se valida como los demás ids para no dejar pasar
+	// operadores de PostgREST por la query.
+	eventoID := strings.TrimSpace(c.Query("event_id"))
+	if eventoID != "" && !safeLookupCode(eventoID) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "event_id inválido"})
+		return
+	}
+
+	where := map[string]interface{}{
+		// Ver estados_orden.go: con "confirmed" a secas, las ventas
+		// DESAPARECÍAN de la serie según la gente entraba por la puerta.
+		"status":     estadosCobrados,
+		"created_at": "gte." + startDate.Format(time.RFC3339),
+	}
+	if eventoID != "" {
+		where["event_id"] = eventoID
+	}
+
 	orders, _ := client.QueryCtx(ctx, "orders", map[string]interface{}{
-		"select": "quantity,total,status,created_at",
-		"where": map[string]interface{}{
-			// Ver estados_orden.go: con "confirmed" a secas, las ventas
-			// DESAPARECÍAN de la serie según la gente entraba por la puerta.
-			"status":     estadosCobrados,
-			"created_at": "gte." + startDate.Format(time.RFC3339),
-		},
-		"limit": maxVenueScanRows,
+		"select": "quantity,total,subtotal,status,created_at",
+		"where":  where,
+		"limit":  maxVenueScanRows,
 	})
 
 	salesMap := make(map[string]*models.DailySales)
@@ -1439,17 +1455,49 @@ func GetSalesByPeriod(c *gin.Context) {
 		// `total`, no `total_amount`: esa columna no existe en `orders` y
 		// GetFloat64 devolvía 0, así que la facturación salía plana a cero.
 		salesMap[key].Revenue += services.GetFloat64(order, "total")
+		// Lo que se lleva el local, sin la comisión de Pull. Ver
+		// event_stats_controller.go: `total` es el bruto.
+		if sub := services.GetFloat64(order, "subtotal"); sub > 0 {
+			salesMap[key].RevenueNet += sub
+		} else {
+			salesMap[key].RevenueNet += services.GetFloat64(order, "total")
+		}
 	}
 
-	// Convert to slice
-	sales := make([]models.DailySales, 0)
-	for _, s := range salesMap {
-		sales = append(sales, *s)
+	// --- La serie, ORDENADA Y SIN HUECOS -------------------------------------
+	//
+	// Antes se devolvía recorriendo el mapa: orden ALEATORIO en cada llamada.
+	// Para una tabla da igual; para dibujar una línea es fatal — sale un
+	// garabato distinto en cada recarga.
+	//
+	// Y los días sin ventas sencillamente no venían. Una línea que une el día 3
+	// con el día 7 dibuja una pendiente suave donde en realidad hubo cuatro
+	// días planos: le hace creer que la venta va progresando cuando está
+	// parada. Los ceros se rellenan aquí, que es donde se sabe qué días cubre
+	// el rango.
+	sales := make([]models.DailySales, 0, len(salesMap))
+	if groupBy == "day" {
+		for d := startDate; !d.After(now); d = d.AddDate(0, 0, 1) {
+			key := d.Format("2006-01-02")
+			if s := salesMap[key]; s != nil {
+				sales = append(sales, *s)
+			} else {
+				sales = append(sales, models.DailySales{Date: key})
+			}
+		}
+	} else {
+		// Semana y mes: no se rellenan huecos (calcular las claves ISO de un
+		// rango es otra pelea), pero al menos se ordenan.
+		for _, s := range salesMap {
+			sales = append(sales, *s)
+		}
+		sort.Slice(sales, func(i, j int) bool { return sales[i].Date < sales[j].Date })
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"group_by": groupBy,
 		"days":     days,
+		"event_id": eventoID,
 		"sales":    sales,
 	})
 }
