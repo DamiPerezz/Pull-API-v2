@@ -186,17 +186,41 @@ func ucEnvBool(key string) bool {
 // componente. NO es cosmético: Cybersource ata la sesión a esos orígenes, así
 // que es lo que impide que un clon del sitio abra cobros con nuestra cuenta.
 //
-// Se sacan del entorno (ALLOWED_ORIGINS / FRONTEND_URL, que ya distinguen demo,
-// staging y producción) y se normalizan a esquema+host+puerto sin ruta, que es
-// lo único que Cybersource acepta. Override explícito:
-// UNIFIED_CHECKOUT_TARGET_ORIGINS.
+// ⚠️ TRAMPA QUE NOS COSTÓ UN DÍA (2026-08-22): ESTA LISTA NO ES LA DE CORS.
+//
+// Por defecto se hereda de ALLOWED_ORIGINS/FRONTEND_URL, y suena razonable:
+// una sola configuración, un sitio menos donde olvidarse. Pero son dos listas
+// con reglas OPUESTAS:
+//
+//	CORS          → cuantos más orígenes, mejor. Es permitir llamadas.
+//	targetOrigins → APPLE PAY EXIGE QUE **TODOS** ESTÉN VERIFICADOS EN SU
+//	                PANEL. Si UNO SOLO no lo está, Cybersource elimina
+//	                APPLEPAY de la sesión entera. Sin error, sin aviso.
+//
+// Lo vivimos: Apple Pay estaba ENABLED y el dominio verificado, y el botón no
+// salía en el iPhone. La sesión devolvía ["GOOGLEPAY","PANENTRY"] porque de
+// los cuatro orígenes heredados de CORS —pull-511-events.pages.dev,
+// 511events.pullevents.com, pullevents.com, www.pullevents.com— dos no estaban
+// verificados en Apple. Con UNIFIED_CHECKOUT_TARGET_ORIGINS reducido al dominio
+// del checkout, APPLEPAY volvió al instante.
+//
+// Por eso, si la lista trae más de un origen, se avisa en el log: casi siempre
+// significa que se está heredando la de CORS y que Apple Pay va a desaparecer
+// en silencio.
+//
+// REGLA: aquí van SOLO los dominios verificados en
+// Payment Configuration > Unified Checkout > Apple Pay > Manage.
+// Y los subdominios NO heredan: pullevents.com verificado no sirve para
+// 511events.pullevents.com.
 func unifiedCheckoutTargetOrigins() []string {
 	candidates := []string{}
+	heredadaDeCORS := false
 	if raw := strings.TrimSpace(os.Getenv("UNIFIED_CHECKOUT_TARGET_ORIGINS")); raw != "" {
 		candidates = append(candidates, strings.Split(raw, ",")...)
 	} else if config.App != nil {
 		candidates = append(candidates, config.App.AllowedOrigins...)
 		candidates = append(candidates, config.App.FrontendURL)
+		heredadaDeCORS = true
 	}
 
 	seen := map[string]bool{}
@@ -208,6 +232,19 @@ func unifiedCheckoutTargetOrigins() []string {
 		}
 		seen[origin] = true
 		out = append(out, origin)
+	}
+
+	// AVISO RUIDOSO. Este es el fallo que no da error: con más de un origen,
+	// basta que uno no esté verificado en Apple para que APPLEPAY desaparezca
+	// de la sesión y el botón no salga en ningún iPhone. Si además la lista se
+	// heredó de CORS, es casi seguro que está pasando.
+	if len(out) > 1 {
+		aviso := "revisa que TODOS estén verificados en Apple Pay"
+		if heredadaDeCORS {
+			aviso = "y encima vienen de ALLOWED_ORIGINS — fija UNIFIED_CHECKOUT_TARGET_ORIGINS con solo los dominios verificados en Apple Pay"
+		}
+		log.Printf("[UnifiedCheckout] AVISO: %d targetOrigins (%v) — Apple Pay se elimina EN SILENCIO de la sesión si alguno no está verificado; %s",
+			len(out), out, aviso)
 	}
 	return out
 }
