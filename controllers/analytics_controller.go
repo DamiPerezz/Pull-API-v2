@@ -1403,7 +1403,9 @@ func GetSalesByPeriod(c *gin.Context) {
 	orders, _ := client.QueryCtx(ctx, "orders", map[string]interface{}{
 		"select": "quantity,total,status,created_at",
 		"where": map[string]interface{}{
-			"status":     "confirmed",
+			// Ver estados_orden.go: con "confirmed" a secas, las ventas
+			// DESAPARECÍAN de la serie según la gente entraba por la puerta.
+			"status":     estadosCobrados,
 			"created_at": "gte." + startDate.Format(time.RFC3339),
 		},
 		"limit": maxVenueScanRows,

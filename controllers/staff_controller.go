@@ -70,7 +70,9 @@ func GetDashboard(c *gin.Context) {
 		result, err := venueDB.QueryCtx(ctx, "orders", map[string]interface{}{
 			"select": "total,quantity,created_at",
 			"where": map[string]interface{}{
-				"status":     "confirmed",
+				// Ver estados_orden.go: sin checked_in, los ingresos de hoy /
+				// semana / mes BAJABAN según la gente entraba al local.
+				"status":     estadosCobrados,
 				"created_at": "gte." + monthStart.Format(time.RFC3339),
 			},
 		})
@@ -219,7 +221,8 @@ func GetAnalytics(c *gin.Context) {
 		result, err := venueDB.QueryCtx(ctx, "orders", map[string]interface{}{
 			"select": "total,created_at",
 			"where": map[string]interface{}{
-				"status":     "confirmed",
+				// Ver estados_orden.go.
+				"status":     estadosCobrados,
 				"created_at": dateFilter,
 			},
 		})

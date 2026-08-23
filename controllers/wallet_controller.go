@@ -129,7 +129,9 @@ func GetUserVenueSpending(c *gin.Context) {
 
 	orders, _ := venueDB.QueryCtx(ctx, "orders", map[string]interface{}{
 		"select": "total,quantity,currency",
-		"where":  map[string]interface{}{"user_id": userID, "status": "confirmed"},
+		// Ver estados_orden.go: al cliente le desaparecía del historial lo que
+		// ya se había gastado, en cuanto entraba al evento.
+		"where": map[string]interface{}{"user_id": userID, "status": estadosCobrados},
 	})
 	if len(orders) == 0 {
 		c.JSON(http.StatusOK, gin.H{"spending": []interface{}{}})
