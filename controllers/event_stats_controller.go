@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"time"
 
@@ -19,9 +20,15 @@ import (
 //
 // OJO con el dinero: volvimos a NeoNet/Cybersource y con ellos a la RETENCIÓN.
 // En un evento privado el importe se bloquea en la tarjeta al solicitar
-// (`payment_authorized`) y solo se cobra al aprobar. Por eso "cobrado" es
-// EXCLUSIVAMENTE `confirmed`, y lo retenido va aparte: es dinero comprometido
-// que TODAVÍA no ha entrado y que se libera solo si nadie decide en 48 h.
+// (`payment_authorized`) y solo se cobra al aprobar. Por eso "cobrado" son
+// SOLO las órdenes ya cobradas —`confirmed` y `checked_in`— y lo retenido va
+// aparte: es dinero comprometido que TODAVÍA no ha entrado y que se libera
+// solo si nadie decide en 48 h.
+//
+// Y dos cifras distintas del mismo cobro, que no hay que confundir:
+//
+//	collected      lo que se le cobró a la TARJETA (lleva dentro el 8% de Pull)
+//	collected_net  lo que se lleva EL LOCAL — es la que ve la dueña
 //
 // Los estados `awaiting_approval` / `approved_unpaid` son del desvío de dLocal
 // (retirado en agosto 2026). Ya no se generan, pero se siguen contando porque
@@ -70,19 +77,51 @@ func MobileGetEventStats(c *gin.Context) {
 	const statsRowLimit = 5000
 	currency := "GTQ"
 	type orderBucket struct {
-		total  float64 // dinero de esas órdenes (con fee)
-		people int     // suma de quantity = personas
-		orders int
+		total    float64 // lo que se le cobró a la tarjeta (subtotal + fee)
+		subtotal float64 // lo que es del LOCAL, sin la comisión de Pull
+		people   int     // suma de quantity = personas
+		orders   int
 	}
 	buckets := map[string]*orderBucket{}
-	rows, _ := venueDB.QueryCtx(ctx, "orders", map[string]interface{}{
-		"select": "status,total,quantity,currency",
+	rows, err := venueDB.QueryCtx(ctx, "orders", map[string]interface{}{
+		// subtotal viaja además de total: total lleva DENTRO la comisión de
+		// Pull (legacy_compat_controller.go monta total = subtotal * 1,08).
+		// Enseñarle el bruto a la dueña como "cobrado" le infla el ingreso un
+		// 8% justo en la cifra con la que calcula su margen.
+		"select": "status,total,subtotal,quantity,currency",
 		"where": map[string]interface{}{
 			"event_id": eventID,
-			"status":   "in.(confirmed,payment_authorized,awaiting_approval,approved_unpaid,cancelled,expired)",
+			// ⚠️ checked_in TIENE que estar aquí. No es un estado aparte: es
+			// una orden CONFIRMADA cuya última entrada ya se escaneó en la
+			// puerta (mobile_compat_controller.go la mueve al escanear).
+			//
+			// Sin él pasaba esto: la noche del evento, según la gente entraba,
+			// "Cobrado" iba BAJANDO. Con todo el mundo dentro, el panel de la
+			// dueña marcaba Cobrado Q0,00 y aforo vacío, mientras "ya están
+			// dentro" subía. La pantalla se contradecía a sí misma y el
+			// histórico del evento quedaba falseado para siempre.
+			//
+			// La consulta hermana de personas (event_people_controller.go) SÍ
+			// lo incluía desde el principio. Se olvidó solo aquí.
+			"status": "in.(confirmed,checked_in,payment_authorized,awaiting_approval,approved_unpaid,cancelled,expired)",
 		},
 		"limit": statsRowLimit,
 	})
+	// ANTES ESTE ERROR SE TIRABA (`rows, _ :=`). Si la consulta fallaba, rows
+	// quedaba vacío, todos los contadores a cero, y se respondía HTTP 200 con
+	// la mentira — cacheada 20 s, así que pulsar "Actualizar" la repetía.
+	//
+	// Para la dueña, un cero por avería y un cero real se veían EXACTAMENTE
+	// igual: "0 de 300 entradas (0%)" seis horas antes de abrir puertas. Puede
+	// dar por muerto un evento que está vendiendo. Mejor un error honesto que
+	// un cero falso.
+	if err != nil {
+		log.Printf("[EventStats] no se pudieron leer las órdenes del evento %s: %v", eventID, err)
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error": "No se pudieron cargar las cifras de este evento. Vuelve a intentarlo.",
+		})
+		return
+	}
 	for _, r := range rows {
 		status := services.GetString(r, "status")
 		b := buckets[status]
@@ -91,6 +130,14 @@ func MobileGetEventStats(c *gin.Context) {
 			buckets[status] = b
 		}
 		b.total += services.GetFloat64(r, "total")
+		// Si por lo que sea no hay subtotal guardado, se cae al total: es
+		// preferible pasarse (enseñarle de más) a que aparezca un cero que
+		// parezca una venta perdida.
+		if sub := services.GetFloat64(r, "subtotal"); sub > 0 {
+			b.subtotal += sub
+		} else {
+			b.subtotal += services.GetFloat64(r, "total")
+		}
 		b.people += services.GetInt(r, "quantity")
 		b.orders++
 		if cur := services.GetString(r, "currency"); cur != "" {
@@ -103,7 +150,21 @@ func MobileGetEventStats(c *gin.Context) {
 		}
 		return orderBucket{}
 	}
-	paid := bucketOf("confirmed")                 // pagadas: dinero YA en caja
+	// Pagadas = dinero YA en caja. SON LOS DOS ESTADOS: confirmed es "pagó y
+	// no ha llegado", checked_in es "pagó y ya está dentro". El dinero es el
+	// mismo; lo único que cambia es que alguien escaneó su QR en la puerta.
+	sumaDe := func(estados ...string) orderBucket {
+		var b orderBucket
+		for _, estado := range estados {
+			parcial := bucketOf(estado)
+			b.total += parcial.total
+			b.subtotal += parcial.subtotal
+			b.people += parcial.people
+			b.orders += parcial.orders
+		}
+		return b
+	}
+	paid := sumaDe("confirmed", "checked_in")
 	held := bucketOf("payment_authorized")        // RETENIDO en tarjeta, esperando decisión
 	awaiting := bucketOf("awaiting_approval")     // LEGACY dLocal: sin decidir y SIN dinero
 	approvedUnpaid := bucketOf("approved_unpaid") // LEGACY dLocal: aprobada, aún sin pagar
@@ -124,7 +185,9 @@ func MobileGetEventStats(c *gin.Context) {
 
 	payload := map[string]interface{}{
 		"revenue": gin.H{
-			// Cobrado de verdad. Solo `confirmed`: retener ≠ cobrar.
+			// Cobrado de verdad: `confirmed` + `checked_in`. Retener ≠ cobrar,
+			// pero escanear en la puerta tampoco descobra nada.
+			// Es el BRUTO — lleva dentro la comisión. Ver collected_net.
 			"collected": round2(paid.total),
 			// Alias legacy para builds móviles anteriores al cambio de flujo,
 			// que leen revenue.captured. Mismo valor que collected.
@@ -136,7 +199,21 @@ func MobileGetEventStats(c *gin.Context) {
 			// enlace. Se mantiene la clave porque las builds móviles viejas
 			// la leen como "pendiente de cobro" y quitarla les pondría 0.
 			"pending_payment": round2(approvedUnpaid.total),
-			"currency":        currency,
+
+			// --- LO QUE DE VERDAD SE LLEVA EL LOCAL -----------------------
+			// `collected` es el BRUTO: lo que se le cobró a la tarjeta, con la
+			// comisión de Pull dentro. Se deja como estaba porque las builds
+			// móviles ya publicadas leen esa clave y cambiarla les movería los
+			// números sin avisar.
+			//
+			// Estas dos son nuevas y son las honestas: net es el dinero de la
+			// dueña, fee es lo que se queda Pull. La diferencia es el 7,4074%
+			// del cobro (8% sobre la base), que en un mes de Q40.000 son unos
+			// Q2.963 que ella creía tener.
+			"collected_net":          round2(paid.subtotal),
+			"collected_platform_fee": round2(paid.total - paid.subtotal),
+			"pending_capture_net":    round2(held.subtotal),
+			"currency":               currency,
 		},
 		"people": gin.H{
 			"scanned":            scanned,               // ya dentro (QR escaneado)
