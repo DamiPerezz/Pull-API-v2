@@ -49,7 +49,14 @@ type ChargeResult struct {
 	CardLast4        string
 	CardBrand        string
 	AuthorizedAmount float64 // < Amount pedido si la autorización fue parcial
-	ErrorMessage     string
+	// ErrorMessage es el mensaje PARA EL COMPRADOR, ya traducido al español
+	// en la frontera con la pasarela (ver neonet_processor_impl.go).
+	ErrorMessage string
+	// ErrorReason es el codigo CRUDO de la pasarela ("DECISION_PROFILE_REJECT",
+	// "INSUFFICIENT_FUND"...). No se le enseña nunca al comprador, pero se
+	// guarda en la orden: sin el, un rechazo en el panel es solo "no se pudo"
+	// y no hay forma de saber si fue el antifraude, el banco o la tarjeta.
+	ErrorReason string
 
 	// CaptureState es lo que la PASARELA dice que pasó con el dinero, que no
 	// tiene por qué coincidir con el Capture que se pidió:

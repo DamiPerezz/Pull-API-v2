@@ -331,15 +331,40 @@ func PayOrder(c *gin.Context) {
 	// Al declinar: incrementa el contador Y devuelve la orden a 'pending'
 	// (liberando el claim atómico) para que el comprador pueda reintentar con
 	// otra tarjeta.
-	recordDeclinedAttempt := func() {
+	//
+	// ⚠️ Y GUARDA POR QUÉ FALLÓ. Añadido el 2026-08-23.
+	//
+	// Antes solo se guardaba el CONTADOR, así que en el panel del local una
+	// compra rechazada por el antifraude quedaba en 'pending' — exactamente
+	// igual que un carrito que nadie tocó. Y cuando vencía el plazo pasaba a
+	// 'expired', igual que un carrito abandonado.
+	//
+	// Para la dueña eran indistinguibles, y no lo son en absoluto: una es
+	// alguien que se fue, y la otra es alguien que QUIERE PAGAR Y NO PUEDE. La
+	// segunda necesita que la llamen; la primera no.
+	//
+	// El estado sigue siendo 'pending' a propósito: es lo que permite
+	// reintentar (el claim atómico exige pending). Lo que cambia es que ahora
+	// queda registrado el intento, y el panel puede distinguirlos.
+	//
+	// NO se guarda nada de la tarjeta: solo el código del motivo, el mensaje
+	// que se le enseñó al comprador, el carril y la hora.
+	registrarRechazo := func(motivo, mensaje string) {
 		priorAttempts++
 		orderMeta["payment_attempts"] = priorAttempts
+		orderMeta["ultimo_rechazo"] = map[string]interface{}{
+			"cuando":  time.Now().UTC().Format(time.RFC3339),
+			"motivo":  motivo,  // código de la pasarela, para depurar
+			"mensaje": mensaje, // lo que leyó el comprador, ya en español
+			"medio":   attemptLabel,
+			"intento": priorAttempts,
+		}
 		venueDB.UpdateNoReturn(ctx, "orders", map[string]interface{}{
 			"metadata": orderMeta,
 			"status":   "pending",
 		}, map[string]interface{}{"id": req.OrderID})
-		log.Printf("[PayOrder] DECLINED order=%s attempts=%d cardkey=%s",
-			services.GetString(order, "order_number"), priorAttempts, attemptLabel)
+		log.Printf("[PayOrder] DECLINED order=%s attempts=%d cardkey=%s motivo=%s",
+			services.GetString(order, "order_number"), priorAttempts, attemptLabel, motivo)
 	}
 
 	total := services.GetFloat64(order, "total")
@@ -622,11 +647,19 @@ func PayOrder(c *gin.Context) {
 				log.Printf("[PayOrder] ALERT: liberación de autorización PARCIAL fallida order=%s tx=%s: %v — puede haber importe retenido en la tarjeta del comprador", orderNumber, charge1.TransactionID, revErr)
 			}
 		}
-		recordDeclinedAttempt()
 		msg := charge1.ErrorMessage
+		motivo := charge1.ErrorReason
 		if venuePartial {
 			msg = "Tu tarjeta no autorizó el importe completo. Usa otra tarjeta."
+			// La autorización parcial no trae código de la pasarela —es una
+			// lectura nuestra del importe aprobado— así que se etiqueta a mano
+			// para que en el panel no salga un rechazo sin motivo.
+			motivo = "PARTIAL_AUTH"
 		}
+		if motivo == "" {
+			motivo = "DESCONOCIDO"
+		}
+		registrarRechazo(motivo, msg)
 		c.JSON(http.StatusPaymentRequired, gin.H{"error": msg, "declined": true})
 		return
 	}

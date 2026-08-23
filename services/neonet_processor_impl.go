@@ -99,6 +99,7 @@ func (p *NeoNetProcessor) ChargeCard(ctx context.Context, params ChargeParams) (
 		CardBrand:        brand,
 		AuthorizedAmount: sale.AuthorizedAmount,
 		ErrorMessage:     humano,
+		ErrorReason:      sale.ErrorReason,
 		// Lo que la pasarela dice que hizo con el dinero (retener o cobrar),
 		// que el llamador contrasta con lo que pidió.
 		CaptureState:    sale.CaptureState,
