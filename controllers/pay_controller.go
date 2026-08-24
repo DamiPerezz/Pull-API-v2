@@ -464,48 +464,34 @@ func PayOrder(c *gin.Context) {
 		Phone:     telefonoDelComprador(order),
 		Country:   pais,
 	}
-	// ¿NOS LA VA A DAR EL WIDGET? Si el pago viene por Unified Checkout Y la
-	// sesión se abrió pidiendo datos de facturación (billingType PARTIAL/FULL),
-	// entonces el comprador —o su wallet, que la lleva guardada con la
-	// tarjeta— ya entregó su dirección REAL dentro del transient token.
+	// LA DIRECCIÓN SIEMPRE VIAJA COMPLETA. No es una preferencia: Cybersource
+	// la EXIGE, y lo aprendimos rompiendo los cobros en producción el
+	// 2026-08-24.
 	//
-	// En ese caso NO mandamos la nuestra. Si la mandásemos, la inventada
-	// pisaría a la verdadera y habríamos añadido un paso al checkout para
-	// tirar el dato a la basura. La guía lo dice al revés y con las mismas
-	// palabras: "cuando billingType es NONE, TÚ tienes que incluir los campos
-	// requeridos" — o sea que cuando no es NONE, los pone el widget.
+	// El intento anterior fue "si no sabemos la dirección, no la mandamos".
+	// Sonaba honesto y era exactamente lo contrario de lo que la pasarela
+	// acepta. Sus dos respuestas, las dos con HTTP 400:
 	//
-	// Solo aplica al carril del widget. El formulario de tarjeta de respaldo no
-	// recoge dirección de nadie, así que ahí se sigue rellenando como siempre.
-	laDaElWidget := transientToken != "" &&
-		!strings.EqualFold(strings.TrimSpace(os.Getenv("UNIFIED_CHECKOUT_BILLING_TYPE")), "NONE") &&
-		strings.TrimSpace(os.Getenv("UNIFIED_CHECKOUT_BILLING_TYPE")) != ""
-
-	// La dirección la rellena el backend porque nuestro formulario no la pide.
-	// Pero SOLO tiene sentido inventar una guatemalteca si el comprador es de
-	// Guatemala: mandar "Ciudad de Guatemala, 01001" junto a country=ES es una
-	// incoherencia que el antifraude lee como dato falso. Para el resto se
-	// manda solo lo que sabemos de verdad.
-	switch {
-	case laDaElWidget:
-		// Nada nuestro: manda la del comprador, que es la buena.
-		billTo.Address1 = req.BillTo.Address1
-		billTo.Locality = req.BillTo.City
-		billTo.AdminArea = req.BillTo.State
-		billTo.PostalCode = req.BillTo.PostalCode
-	case pais == "GT":
-		billTo.Address1 = orDefault(req.BillTo.Address1, "Ciudad de Guatemala")
-		billTo.Locality = orDefault(req.BillTo.City, "Guatemala")
-		billTo.AdminArea = orDefault(req.BillTo.State, "GT")
-		billTo.PostalCode = orDefault(req.BillTo.PostalCode, "01001")
-	default:
-		// Comprador de fuera y sin widget que le pregunte: no hay dirección
-		// que mandar. Mejor vacío que una inventada del país equivocado.
-		billTo.Address1 = req.BillTo.Address1
-		billTo.Locality = req.BillTo.City
-		billTo.AdminArea = req.BillTo.State
-		billTo.PostalCode = req.BillTo.PostalCode
-	}
+	//	address1: ""   → INVALID_DATA    (cadena vacía)
+	//	address1 ausente → MISSING_FIELD  ("Declined - The request is missing
+	//	                                    one or more fields")
+	//
+	// O sea que hay que mandar algo. Y como nuestro formulario no pide
+	// dirección, ese algo es un valor por defecto — pero COHERENTE CON EL PAÍS
+	// que declaramos: decir country=ES junto a "Ciudad de Guatemala" es un
+	// dato contradictorio, y el antifraude lee las contradicciones.
+	//
+	// Por eso hay una capital por país. Para un comprador guatemalteco —que es
+	// el 99%— sale exactamente lo de siempre.
+	//
+	// ⚠️ Lo que el comprador mande de verdad (req.BillTo) SIEMPRE gana. Y si
+	// algún día el formulario pide dirección, esto se queda como respaldo y
+	// deja de usarse solo.
+	porDefecto := direccionPorDefecto(pais)
+	billTo.Address1 = orDefault(req.BillTo.Address1, porDefecto.calle)
+	billTo.Locality = orDefault(req.BillTo.City, porDefecto.ciudad)
+	billTo.AdminArea = orDefault(req.BillTo.State, porDefecto.region)
+	billTo.PostalCode = orDefault(req.BillTo.PostalCode, porDefecto.postal)
 
 	// ===== SEÑALES DE DISPOSITIVO PARA DECISION MANAGER =====
 	// Hasta hoy no se mandaba NINGUNA: en el panel de Decision Manager las
@@ -1055,6 +1041,54 @@ func orDefault(v, def string) string {
 		return def
 	}
 	return v
+}
+
+// direccion es el bloque que Cybersource exige sí o sí en billTo.
+type direccion struct {
+	calle  string
+	ciudad string
+	region string
+	postal string
+}
+
+// direccionesPorPais son los valores por defecto cuando el comprador no nos ha
+// dado dirección — que hoy es SIEMPRE, porque el formulario no la pide.
+//
+// ⚠️ NO son datos reales de nadie: son la capital del país que hemos deducido
+// de su prefijo telefónico. Existen porque Cybersource rechaza la petición
+// entera (HTTP 400) si faltan `address1` o `locality`, así que la alternativa
+// no es "mandar menos", es "no cobrar".
+//
+// Se elige por país para que el bloque sea COHERENTE: declarar country=ES y
+// mandar "Ciudad de Guatemala" es un dato contradictorio, y las
+// contradicciones son justo lo que puntúa un antifraude.
+//
+// La forma de quitar esto de en medio es pedirle la dirección al comprador —
+// en nuestro formulario, o poniendo UNIFIED_CHECKOUT_BILLING_TYPE=FULL para
+// que se la pida el widget. Mientras tanto, esto es el respaldo.
+var direccionesPorPais = map[string]direccion{
+	"GT": {"Ciudad de Guatemala", "Guatemala", "GT", "01001"},
+	"ES": {"Madrid", "Madrid", "M", "28001"},
+	"MX": {"Ciudad de Mexico", "Ciudad de Mexico", "DF", "06000"},
+	"US": {"New York", "New York", "NY", "10001"},
+	"SV": {"San Salvador", "San Salvador", "SS", "01101"},
+	"HN": {"Tegucigalpa", "Tegucigalpa", "FM", "11101"},
+	"NI": {"Managua", "Managua", "MN", "11001"},
+	"CR": {"San Jose", "San Jose", "SJ", "10101"},
+	"PA": {"Panama", "Panama", "PA", "07096"},
+	"CO": {"Bogota", "Bogota", "DC", "110111"},
+	"PE": {"Lima", "Lima", "LIM", "15001"},
+	"CL": {"Santiago", "Santiago", "RM", "8320000"},
+	"AR": {"Buenos Aires", "Buenos Aires", "C", "1001"},
+}
+
+// direccionPorDefecto devuelve el bloque del país, o el de Guatemala si no lo
+// conocemos: el local es guatemalteco y sus compradores también.
+func direccionPorDefecto(pais string) direccion {
+	if d, ok := direccionesPorPais[pais]; ok {
+		return d
+	}
+	return direccionesPorPais["GT"]
 }
 
 // prefijosPais traduce el prefijo telefónico internacional al código de país
