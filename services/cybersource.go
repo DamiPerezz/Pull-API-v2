@@ -181,9 +181,9 @@ func (c *CybersourceClient) do(ctx context.Context, method, path string, payload
 
 // CybsCard holds raw card data collected by our payment page.
 type CybsCard struct {
-	Number     string
-	ExpMonth   string // "12"
-	ExpYear    string // "2031"
+	Number       string
+	ExpMonth     string // "12"
+	ExpYear      string // "2031"
 	SecurityCode string
 }
 
@@ -365,11 +365,11 @@ func (d CybsDeviceInfo) payload() map[string]interface{} {
 
 // CybsSaleResult is the outcome of a sale (auth+capture).
 type CybsSaleResult struct {
-	Success          bool
-	PaymentID        string // Cybersource transaction id (used for reversal/refund)
-	Status           string // AUTHORIZED | DECLINED | ...
-	AuthCode         string
-	CardLast4        string
+	Success   bool
+	PaymentID string // Cybersource transaction id (used for reversal/refund)
+	Status    string // AUTHORIZED | DECLINED | ...
+	AuthCode  string
+	CardLast4 string
 	// CardBrand solo se rellena en el carril de token (Apple/Google Pay), donde
 	// no hay PAN del que deducirla. En el carril de tarjeta queda vacía y la
 	// marca la sigue calculando brandFor() a partir del número, como siempre.
@@ -776,24 +776,43 @@ func (c *CybersourceClient) CaptureContext(ctx context.Context, p CaptureContext
 // campo viaja solo si viene informado Y pasa su validación; si no queda
 // ninguno, `deviceInformation` NO se añade al cuerpo. Ver CybsDeviceInfo.
 func (c *CybersourceClient) Sale(ctx context.Context, referenceCode string, amount float64, currency string, card CybsCard, billTo CybsBillTo, capture bool, transientToken string, device CybsDeviceInfo) (*CybsSaleResult, error) {
-	bill := map[string]interface{}{
-		"firstName":          billTo.FirstName,
-		"lastName":           billTo.LastName,
-		"email":              billTo.Email,
-		"address1":           billTo.Address1,
-		"locality":           billTo.Locality,
-		"administrativeArea": billTo.AdminArea,
-		"postalCode":         billTo.PostalCode,
-		"country":            billTo.Country,
+	// ⛔ NINGÚN CAMPO VACÍO. Cybersource devuelve HTTP 400 INVALID_REQUEST si le
+	// llega `"address1": ""` — y lo hace SIN decir qué campo, con
+	// `orderInformation: null` y `reason` en blanco.
+	//
+	// ESTO ROMPIÓ LOS COBROS EN PRODUCCIÓN el 2026-08-24, y el fallo fue mío:
+	// el día antes hice que la dirección guatemalteca solo se rellenara para
+	// compradores de Guatemala (correcto) y que la pusiera el widget cuando
+	// billingType != NONE (también correcto). Pero en los dos casos los campos
+	// quedaban como CADENA VACÍA en vez de desaparecer, y este mapa los mandaba
+	// igual. Tres intentos de compra seguidos con 400.
+	//
+	// Lo más engañoso: Decision Manager pasaba ("Early Success") y era la
+	// AUTORIZACIÓN la que salía "Failed", así que parecía problema del banco.
+	// No llegó a haber banco: la petición murió en la puerta de Cybersource.
+	//
+	// La regla, ahora sin excepciones: un campo que no tenemos NO VIAJA. Ya se
+	// aplicaba al teléfono; faltaba aplicarla a todo lo demás.
+	bill := map[string]interface{}{}
+	poner := func(clave, valor string) {
+		if v := strings.TrimSpace(valor); v != "" {
+			bill[clave] = v
+		}
 	}
-	// El teléfono viaja SOLO si lo tenemos de verdad. Antes se mandaba un
-	// literal ("502" + ocho ceros) idéntico en todas las compras de todos los
-	// venues; ver `telefonoDelComprador` en pay_controller.go. Un campo ausente
-	// es un dato que no tenemos; un campo con un número inventado y compartido
-	// es una firma de fraude que le regalábamos al antifraude de NeoNet.
-	if p := strings.TrimSpace(billTo.Phone); p != "" {
-		bill["phoneNumber"] = p
-	}
+	poner("firstName", billTo.FirstName)
+	poner("lastName", billTo.LastName)
+	poner("email", billTo.Email)
+	poner("address1", billTo.Address1)
+	poner("locality", billTo.Locality)
+	poner("administrativeArea", billTo.AdminArea)
+	poner("postalCode", billTo.PostalCode)
+	poner("country", billTo.Country)
+	// El teléfono, igual: antes se mandaba un literal ("502" + ocho ceros)
+	// idéntico en todas las compras de todos los venues; ver
+	// `telefonoDelComprador` en pay_controller.go. Un campo ausente es un dato
+	// que no tenemos; uno inventado y compartido es una firma de fraude que le
+	// regalábamos al antifraude de NeoNet.
+	poner("phoneNumber", billTo.Phone)
 
 	payload := map[string]interface{}{
 		"clientReferenceInformation": map[string]interface{}{"code": referenceCode},
@@ -906,6 +925,26 @@ func (c *CybersourceClient) Sale(ctx context.Context, referenceCode string, amou
 		procJSON, _ := json.Marshal(resp["processorInformation"])
 		log.Printf("[Cybersource] status=%s ref=%s orderInformation=%s processorInformation=%s",
 			result.Status, referenceCode, oiJSON, procJSON)
+
+		// QUÉ CAMPO LE MOLESTÓ. En un INVALID_REQUEST, Cybersource manda un
+		// array `details` con el campo exacto y el motivo:
+		//
+		//	[{"field":"orderInformation.billTo.address1","reason":"INVALID_DATA"}]
+		//
+		// No se registraba, y por eso el 400 del 24-ago (un `address1: ""`)
+		// costó media hora de logs: se veía "INVALID_REQUEST reason=" con todo
+		// null y no había forma de saber qué campo era. Con esta línea habría
+		// sido inmediato.
+		//
+		// `details` NO lleva datos de tarjeta — son nombres de campo y códigos.
+		if detalles, ok := resp["details"]; ok {
+			if d, err := json.Marshal(detalles); err == nil {
+				log.Printf("[Cybersource] CAMPOS RECHAZADOS ref=%s details=%s", referenceCode, d)
+			}
+		}
+		if msg := GetString(resp, "message"); msg != "" {
+			log.Printf("[Cybersource] mensaje ref=%s: %s", referenceCode, msg)
+		}
 	}
 
 	// 201 + AUTHORIZED es el caso normal; el sandbox de VisaNet GT devuelve
