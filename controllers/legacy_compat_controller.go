@@ -2125,7 +2125,17 @@ func LegacyGetOrderDetails(c *gin.Context) {
 	event := map[string]interface{}{}
 	if eid := services.GetString(order, "event_id"); eid != "" {
 		if ev, _ := venueDB.QueryOne(ctx, "events", map[string]interface{}{
-			"select": "id,name,slug,start_datetime,end_datetime,image,location",
+			// is_private / require_approval viajan para que el panel del local
+			// pueda decir QUÉ CLASE de pedido está mirando. Sin ellos pintaba
+			// "Solicitado" también en un evento público, donde no se solicita
+			// nada: se paga al momento. El "solicitado" de ahí es un artefacto
+			// de cómo lo monta el backend (crea la orden y después cobra), y
+			// enseñárselo a la dueña como si fuera un paso del negocio la
+			// confunde.
+			//
+			// Añadir columnas al select es seguro para la app móvil, que lee
+			// campos concretos. Quitar o renombrar, no.
+			"select": "id,name,slug,start_datetime,end_datetime,image,location,is_private,require_approval",
 			"where":  map[string]interface{}{"id": eid},
 		}); ev != nil {
 			services.EnrichEvent(ev)

@@ -236,7 +236,7 @@
                           <tbody>
                             <tr>
                               <td style="width:454px;">
-                                <img alt="{{.event_name}}" src="{{.event_image}}" style="border:0;border-radius:12px;display:block;outline:none;text-decoration:none;height:auto;width:100%;font-size:13px;" width="454" height="auto" />
+                                <img alt="{{.event_name}}" src="{{.event_image}}" style="border:0;border-radius:0;display:block;outline:none;text-decoration:none;height:auto;width:100%;font-size:13px;" width="454" height="auto" />
                               </td>
                             </tr>
                           </tbody>
@@ -265,7 +265,7 @@
                 <table border="0" cellpadding="0" cellspacing="0" role="presentation" width="100%" style="border-collapse:separate;">
                   <tbody>
                     <tr>
-                      <td style="background-color:rgba(52, 211, 153, 0.08);border:1px solid rgba(52, 211, 153, 0.2);border-radius:16px;vertical-align:top;border-collapse:separate;padding:24px;">
+                      <td style="background-color:rgba(52, 211, 153, 0.08);border:1px solid rgba(52, 211, 153, 0.2);border-radius:0;vertical-align:top;border-collapse:separate;padding:24px;">
                         <table border="0" cellpadding="0" cellspacing="0" role="presentation" style="" width="100%">
                           <tbody>
                             <tr>
@@ -336,7 +336,14 @@
             <td style="direction:ltr;font-size:0px;padding:0 48px 28px;text-align:center;">
               <div style="font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;font-size:14px;line-height:1.6;color:#bfbfc6;color:rgba(255,255,255,0.75);margin-bottom:14px;">¿iPhone? Añade tu entrada a Apple Wallet:</div>
               {{range .tickets}}{{if .WalletURL}}
-              <a href="{{.WalletURL}}" style="display:inline-block;background:#000000;color:#ffffff;text-decoration:none;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;font-size:14px;font-weight:600;padding:12px 22px;border-radius:10px;border:1px solid rgba(255,255,255,0.25);margin:5px;">Añadir a Apple Wallet{{if .OwnerName}} · {{.OwnerName}}{{end}}</a>
+              <!-- El icono va como <img>, NO como SVG ni emoji: Gmail elimina
+                   los SVG y el emoji se pinta distinto en cada cliente. Es un
+                   PNG de 246 bytes servido desde nuestro propio dominio.
+                   alt="" a proposito: si el cliente bloquea imagenes, el texto
+                   del boton ya dice lo que hace y un alt seria redundante.
+                   vertical-align:-3px lo alinea con la linea base del texto en
+                   Outlook, que no respeta flex ni middle. -->
+              <a href="{{.WalletURL}}" style="display:inline-block;background:#000000;color:#ffffff;text-decoration:none;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;font-size:14px;font-weight:600;padding:12px 22px;border-radius:0;border:1px solid rgba(255,255,255,0.25);margin:5px;"><img src="https://511events.pullevents.com/icono-wallet.png" alt="" width="16" height="16" style="width:16px;height:16px;vertical-align:-3px;margin-right:8px;border:0;" />Añadir a Apple Wallet{{if .OwnerName}} · {{.OwnerName}}{{end}}</a>
               {{end}}{{end}}
             </td>
           </tr>
@@ -356,7 +363,7 @@
                 <table border="0" cellpadding="0" cellspacing="0" role="presentation" width="100%" style="border-collapse:separate;">
                   <tbody>
                     <tr>
-                      <td style="background-color:rgba(139, 92, 246, 0.05);border:1px solid rgba(139, 92, 246, 0.15);border-radius:14px;vertical-align:top;border-collapse:separate;padding:24px;">
+                      <td style="background-color:rgba(139, 92, 246, 0.05);border:1px solid rgba(139, 92, 246, 0.15);border-radius:0;vertical-align:top;border-collapse:separate;padding:24px;">
                         <table border="0" cellpadding="0" cellspacing="0" role="presentation" style="" width="100%">
                           <tbody>
                             <tr>
